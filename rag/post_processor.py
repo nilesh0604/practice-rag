@@ -1,0 +1,164 @@
+"""Post-processor — citation extraction + groundedness/confidence scoring.
+
+Runs after generation completes. Two responsibilities:
+
+1. **Citation extraction** — parse ``[Source: title]`` markers from the
+   generated answer and match them to retrieved documents by title
+   (case-insensitive). Only citations that match a retrieved doc become
+   ``Citation`` objects (with a clickable ``source_url``); hallucinated
+   titles with no matching doc are dropped so the UI never links to a
+   non-existent source.
+
+2. **Groundedness score** — per the architecture doc's Confidence Score
+   section, embed the answer and each retrieved chunk, then take the max
+   cosine similarity between the answer embedding and any chunk embedding.
+   This measures how well the answer is supported by the retrieved context.
+   Below ``CONFIDENCE_THRESHOLD`` (0.65 per the doc) the UI shows a
+   low-confidence warning.
+
+The embedder is injected so the score is unit-testable with a mock.
+"""
+
+from __future__ import annotations
+
+import logging
+import math
+import re
+from dataclasses import dataclass, field
+
+from ingestion.embedder import Embedder
+from schemas.chat import Citation
+from schemas.documents import RetrievedDoc
+
+logger = logging.getLogger(__name__)
+
+# ── constants ──────────────────────────────────────────────────────────
+
+CONFIDENCE_THRESHOLD: float = 0.65
+"""Below this groundedness score the UI shows a low-confidence warning
+(from the architecture doc's Security & Responsible AI section)."""
+
+_CITATION_RE = re.compile(r"\[Source:\s*(.+?)\]")
+"""Matches ``[Source: title]`` markers in generated answers (non-greedy title)."""
+
+
+@dataclass
+class PostProcessResult:
+    """Output of the post-processor — the final, persisted answer shape.
+
+    The FastAPI layer adds ``session_id`` to produce a ``ChatResponse``.
+    """
+
+    answer: str
+    citations: list[Citation] = field(default_factory=list)
+    confidence: float = 0.0
+    low_confidence: bool = False
+
+
+class PostProcessor:
+    """Extracts citations and computes a groundedness score for an answer."""
+
+    def __init__(self, embedder: Embedder) -> None:
+        self.embedder = embedder
+
+    def post_process(
+        self,
+        answer: str,
+        retrieved_docs: list[RetrievedDoc],
+    ) -> PostProcessResult:
+        """Run citation extraction + groundedness scoring on a completed answer."""
+        citations = extract_citations(answer, retrieved_docs)
+        confidence = compute_groundedness(answer, retrieved_docs, self.embedder)
+        result = PostProcessResult(
+            answer=answer,
+            citations=citations,
+            confidence=confidence,
+            low_confidence=confidence < CONFIDENCE_THRESHOLD,
+        )
+        logger.info(
+            "Post-process: %d citations, confidence=%.3f (%s)",
+            len(citations),
+            confidence,
+            "low" if result.low_confidence else "ok",
+        )
+        return result
+
+
+# ── citation extraction (pure functions, no embedder needed) ───────────
+
+
+def extract_citations(
+    answer: str,
+    retrieved_docs: list[RetrievedDoc],
+) -> list[Citation]:
+    """Parse ``[Source: title]`` markers and match them to retrieved docs.
+
+    Returns deduplicated ``Citation`` objects preserving first-seen order.
+    Only markers whose title matches a retrieved doc (case-insensitive,
+    stripped) are included — unmatched markers are treated as hallucinated
+    and dropped.
+    """
+    if not answer or not retrieved_docs:
+        return []
+
+    # Build a case-insensitive title → doc lookup.
+    title_to_doc: dict[str, RetrievedDoc] = {}
+    for doc in retrieved_docs:
+        key = doc.title.strip().lower()
+        if key:
+            title_to_doc.setdefault(key, doc)
+
+    citations: list[Citation] = []
+    seen_urls: set[str] = set()
+    for match in _CITATION_RE.finditer(answer):
+        raw_title = match.group(1).strip()
+        key = raw_title.lower()
+        doc = title_to_doc.get(key)
+        if doc is None:
+            logger.debug("Citation %r did not match any retrieved doc — dropping", raw_title)
+            continue
+        url = str(doc.source_url)
+        if url in seen_urls:
+            continue
+        seen_urls.add(url)
+        citations.append(Citation(title=doc.title, source_url=doc.source_url))
+    return citations
+
+
+# ── groundedness score ─────────────────────────────────────────────────
+
+
+def compute_groundedness(
+    answer: str,
+    docs: list[RetrievedDoc],
+    embedder: Embedder,
+) -> float:
+    """Max cosine similarity between the answer embedding and any chunk embedding.
+
+    Faithful implementation of the architecture doc's ``groundedness()``
+    pseudocode: embed the answer, embed each retrieved chunk's content, and
+    return the highest cosine similarity. Returns 0.0 if the answer or docs
+    are empty.
+    """
+    if not answer.strip() or not docs:
+        return 0.0
+
+    answer_vec = embedder.embed_text(answer)
+    doc_vecs = embedder.embed_texts([d.content for d in docs])
+    if not doc_vecs:
+        return 0.0
+
+    best = max(_cosine_similarity(answer_vec, dv) for dv in doc_vecs)
+    return min(max(best, 0.0), 1.0)
+
+
+def _cosine_similarity(a: list[float], b: list[float]) -> float:
+    """Cosine similarity between two dense vectors. Returns 0.0 for zero vectors."""
+    if not a or not b or len(a) != len(b):
+        return 0.0
+    dot = sum(x * y for x, y in zip(a, b))
+    norm_a = math.sqrt(sum(x * x for x in a))
+    norm_b = math.sqrt(sum(y * y for y in b))
+    if norm_a == 0.0 or norm_b == 0.0:
+        return 0.0
+    return dot / (norm_a * norm_b)

@@ -89,14 +89,15 @@ practice-rag/
 │   ├── index_writer.py                # Qdrant upsert (dense + sparse + payload)
 │   ├── manifest.py                    # File-hash manifest for incremental sync
 │   └── run.py                         # Orchestrator: sync→parse→chunk→embed→upsert
-├── rag/                               # Core RAG orchestrator (Step 3, plain Python)
+├── rag/                               # Core RAG orchestrator (Step 3, plain Python) ✅
 │   ├── __init__.py
 │   ├── qdrant_collection.py           # docs-knowledge collection helper (Step 1) ✅
-│   ├── query_rewriter.py
-│   ├── retriever.py                   # Qdrant hybrid (dense + sparse) + RRF fusion
-│   ├── context_assembler.py
-│   ├── generator.py                   # Ollama llama3.1:8b streaming
-│   └── post_processor.py              # Citations + groundedness score
+│   ├── query_rewriter.py              # Passthrough + optional LLM rewrite ✅
+│   ├── retriever.py                   # Qdrant hybrid (dense + sparse) + RRF fusion ✅
+│   ├── context_assembler.py           # Format chunks into system-prompt CONTEXT block ✅
+│   ├── generator.py                   # Ollama llama3.2:3b streaming (target: llama3.1:8b) ✅
+│   ├── post_processor.py              # Citation extraction + groundedness score ✅
+│   └── orchestrator.py                # Ties rewrite→retrieve→assemble→generate→post-process ✅
 ├── api/                               # FastAPI serving layer (Step 4)
 │   ├── main.py                        # app + middleware + Langfuse @observe
 │   ├── routes/
@@ -133,6 +134,12 @@ practice-rag/
     ├── test_ingestion_embedder.py     # dense (mocked Ollama) + sparse (hashing trick) ✅
     ├── test_ingestion_index_writer.py # Qdrant upsert + delete (mocked client) ✅
     ├── test_ingestion_run.py          # orchestrator integration (mocked) ✅
+    ├── test_rag_retriever.py           # hybrid dense+sparse + RRF fusion (mocked) ✅
+    ├── test_rag_context_assembler.py   # CONTEXT block formatting ✅
+    ├── test_rag_generator.py           # Ollama streaming + system prompt (mocked) ✅
+    ├── test_rag_post_processor.py      # citations + groundedness score (mocked) ✅
+    ├── test_rag_query_rewriter.py      # passthrough + LLM rewrite (mocked) ✅
+    ├── test_rag_orchestrator.py        # full RAG flow (mocked collaborators) ✅
     ├── test_guardrails.py
     ├── test_api_chat.py
     ├── test_api_health.py
@@ -198,7 +205,7 @@ The calendar phases (one weekend) are reordered below into the actual build grap
 | **0** | Colima + `docker-compose.yml` + conda env + repo scaffolding | nothing    | Phase 1 — Bootstrap              |
 | **1** | `schemas/` Pydantic contracts + Qdrant collection helper ✅  | Step 0     | seam for Phases 2 & 3            |
 | **2** | `ingestion/` pipeline → chunks in Qdrant ✅                  | Step 1     | Phase 2 — Ingestion              |
-| **3** | `rag/` orchestrator as plain Python (unit-testable)          | Step 2     | Phase 3 — Core RAG               |
+| **3** | `rag/` orchestrator as plain Python (unit-testable) ✅       | Step 2     | Phase 3 — Core RAG               |
 | **4** | `api/` FastAPI layer (`/health` before `/chat`)              | Step 3     | Phase 3 — Core RAG               |
 | **5** | `frontend/` React + SSE consumer                             | Step 4     | Phase 4 — Frontend               |
 | **6** | `guardrails` + `eval/` golden dataset + Ragas gate           | Step 4     | Phase 5 — Guardrails & Eval      |
@@ -232,6 +239,41 @@ Verify the chunks are in Qdrant:
 ```bash
 curl http://localhost:6333/collections/docs-knowledge | python3 -m json.tool
 ```
+
+### RAG orchestrator (Step 3)
+
+The RAG flow is plain Python — no HTTP layer yet. After ingesting the corpus,
+run an end-to-end query from a Python shell to verify retrieval + generation:
+
+```bash
+conda activate rag-chat
+
+python -c "
+from ingestion.embedder import Embedder
+from rag import (
+    HybridRetriever, ContextAssembler, Generator,
+    PostProcessor, RAGOrchestrator, get_qdrant_client,
+)
+
+client = get_qdrant_client()
+embedder = Embedder()
+orchestrator = RAGOrchestrator(
+    retriever=HybridRetriever(client, embedder),
+    context_assembler=ContextAssembler(),
+    generator=Generator(),
+    post_processor=PostProcessor(embedder),
+)
+
+for item in orchestrator.stream_answer('How do I declare path parameters in FastAPI?'):
+    if isinstance(item, str):
+        print(item, end='', flush=True)
+    else:
+        print(f'\n\n--- confidence={item.confidence:.3f}, citations={len(item.citations)}')
+"
+```
+
+> The generator uses `llama3.2:3b` (the dev substitute from Phase 0 deviation
+> D2). To use the documented production target, pass `Generator(model="llama3.1:8b")`.
 
 ### Backend (FastAPI)
 
