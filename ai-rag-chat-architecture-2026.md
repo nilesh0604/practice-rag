@@ -98,6 +98,28 @@ graph LR
 | **React + Vite + SSE**                 | C4         | React is the expected frontend in most interviews. Vite is fast to start. SSE is simpler than WebSockets and naturally pairs with FastAPI streaming.                                                               |
 | **Ragas offline eval**                 | C1, C2     | Builds the evaluation muscle for interviews. The judge is a local Ollama model or the Groq free tier, so the eval costs nothing.                                                                                   |
 
+### Phase 0 Implementation Decisions (deviations from original design)
+
+The decisions above are the _design intent_. During Phase 0 (Foundation)
+bootstrap, four practical deviations were made. Each is documented here so
+the trade-off can be defended in interviews and revisited when the project
+moves beyond local dev.
+
+| #      | Original Design                              | Actual Implementation                                   | Reason                                                                                                                                                                                                                                                                            | Revert Plan                                                                                                                                                                                                                              |
+| ------ | -------------------------------------------- | ------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **D1** | Ollama containerized in `docker-compose.yml` | Ollama runs on the **host** (not Docker)                | A host Ollama instance was already running on port 11434. Containerizing it would cause a port conflict and waste ~6 GB RAM on a second model cache. Host Ollama also gets native Metal GPU acceleration, which the container cannot access without extra GPU passthrough config. | If deploying to a clean machine or cloud, re-add the Ollama service to `docker-compose.yml` with `deploy.resources.limits.memory: 6g`. The backend only needs `OLLAMA_BASE_URL=http://localhost:11434`, so no code changes are required. |
+| **D2** | `llama3.1:8b` for generation (4-bit, ~5 GB)  | `llama3.2:3b` for generation (Q4_K_M, ~2 GB)            | `llama3.2:3b` was already pulled on the host. `llama3.1:8b` would require a ~5 GB download. The 3B model is lighter and faster for dev iteration, though less capable for complex RAG answers.                                                                                    | Run `ollama pull llama3.1:8b` on the host and update the generation model name in `rag/generator.py` (Step 3). The architecture doc's `llama3.1:8b` remains the documented production target.                                            |
+| **D3** | All containers capped at 1 CPU / 1 GB RAM    | Langfuse web + worker raised to **2 GB RAM**            | Langfuse v4 web (Next.js 16 + Prisma) hit a JavaScript heap OOM (`Ineffective mark-compacts near heap limit`) during Prisma migration at 1 GB RAM. The worker also needs headroom for ClickHouse batch writes. 2 GB is the minimum stable footprint.                              | This is a Langfuse v4 runtime requirement, not a project choice. If Langfuse is replaced by a lighter tracer (e.g. Phoenix, OpenTelemetry-only), the 1 GB cap can be restored.                                                           |
+| **D4** | Conda env via existing conda installation    | Miniforge installed via `brew install --cask miniforge` | No conda distribution was present on the machine. Miniforge was chosen over Miniconda because it defaults to conda-forge (better Apple Silicon support) and is the recommended conda variant for M1.                                                                              | No revert needed — Miniforge is now the system conda. The `rag-chat` env (Python 3.12) and all `requirements.txt` deps are installed.                                                                                                    |
+
+> **Interview framing:** These deviations are not shortcuts — they are
+> real-world trade-offs between the documented architecture and the actual
+> machine state. The original design decisions (D1–D7 in the table above)
+> remain the _target architecture_. Phase 0 deviations are _implementation
+> constraints_ that would be resolved in a clean-environment or cloud
+> deployment. Being able to articulate this distinction is itself an
+> interview signal.
+
 ---
 
 ## Table of Contents
