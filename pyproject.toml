@@ -1,0 +1,14 @@
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-ra --strict-markers"
+asyncio_mode = "auto"
+filterwarnings = [
+    "error",
+    "ignore::DeprecationWarning:qdrant_client.*",
+    # qdrant-client spawns a background _check_compatibility thread on client
+    # construction; with no live Qdrant in unit tests it raises, surfacing as
+    # an unhandled-thread warning. Not relevant to contract/collection tests.
+    "ignore::pytest.PytestUnhandledThreadExceptionWarning",
+]

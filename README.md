@@ -71,12 +71,15 @@ practice-rag/
 ├── README.md                          # This file
 ├── CHANGELOG.md                       # Keep a Changelog — updated before every commit
 ├── requirements.txt                   # Python deps (installed via pip3 in conda env)
+├── pyproject.toml                     # pytest config (pythonpath=. , testpaths=tests)
 ├── .gitignore                         # macOS, Python, Node, .env, Colima volumes
 ├── docker-compose.yml                 # Qdrant, Postgres, Langfuse (Phase 1)
 │                                      #   Ollama runs on the host, not in Docker
-├── schemas/                           # Shared Pydantic contracts (Step 1)
-│   ├── document.py                    # DocumentChunk, RetrievedDoc
-│   └── chat.py                        # ChatRequest, ChatResponse, FeedbackRequest
+├── schemas/                           # Shared Pydantic contracts (Step 1) ✅
+│   ├── __init__.py                    # Re-exports all contracts
+│   ├── documents.py                   # DocumentChunk, RetrievedDoc
+│   ├── chat.py                        # ChatRequest, ChatResponse, Citation
+│   └── feedback.py                    # FeedbackRequest
 ├── ingestion/                         # Offline pipeline (Step 2)
 │   ├── sync.py                        # Doc download / clone
 │   ├── parser.py                      # MD / PDF / HTML parsing
@@ -85,6 +88,8 @@ practice-rag/
 │   ├── index_writer.py                # Qdrant upsert + payload
 │   └── manifest.json                  # File hashes for incremental sync
 ├── rag/                               # Core RAG orchestrator (Step 3, plain Python)
+│   ├── __init__.py
+│   ├── qdrant_collection.py           # docs-knowledge collection helper (Step 1) ✅
 │   ├── query_rewriter.py
 │   ├── retriever.py                   # Qdrant hybrid (dense + sparse) + RRF fusion
 │   ├── context_assembler.py
@@ -117,6 +122,8 @@ practice-rag/
 ├── data/
 │   └── corpus/                        # Downloaded FastAPI / Pydantic / SQLModel docs
 └── tests/                             # pytest backend tests
+    ├── test_schemas.py                # DocumentChunk/ChatRequest/Feedback contracts ✅
+    ├── test_qdrant_collection.py      # collection helper (mocked client) ✅
     ├── test_guardrails.py
     ├── test_chunker.py
     ├── test_api_chat.py
@@ -124,7 +131,7 @@ practice-rag/
     └── test_cache.py
 ```
 
-> Files marked with a phase/step are **targets** — they are created as the build progresses, not all at bootstrap.
+> Files marked with a phase/step are **targets** — they are created as the build progresses, not all at bootstrap. ✅ = implemented.
 
 ---
 
@@ -181,7 +188,7 @@ The calendar phases (one weekend) are reordered below into the actual build grap
 | Step  | What to build                                                | Depends on | Maps to phase                    |
 | ----- | ------------------------------------------------------------ | ---------- | -------------------------------- |
 | **0** | Colima + `docker-compose.yml` + conda env + repo scaffolding | nothing    | Phase 1 — Bootstrap              |
-| **1** | `schemas/` Pydantic contracts + Qdrant collection helper     | Step 0     | seam for Phases 2 & 3            |
+| **1** | `schemas/` Pydantic contracts + Qdrant collection helper ✅  | Step 0     | seam for Phases 2 & 3            |
 | **2** | `ingestion/` pipeline → chunks in Qdrant                     | Step 1     | Phase 2 — Ingestion              |
 | **3** | `rag/` orchestrator as plain Python (unit-testable)          | Step 2     | Phase 3 — Core RAG               |
 | **4** | `api/` FastAPI layer (`/health` before `/chat`)              | Step 3     | Phase 3 — Core RAG               |
