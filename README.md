@@ -66,7 +66,7 @@ Full decision rationale: [`ai-rag-chat-architecture-2026.md` → Technology Stac
 ## Repository layout (target)
 
 ```
-ctc-rag/
+practice-rag/
 ├── ai-rag-chat-architecture-2026.md   # Full design doc (read first)
 ├── README.md                          # This file
 ├── CHANGELOG.md                       # Keep a Changelog — updated before every commit

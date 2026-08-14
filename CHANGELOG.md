@@ -5,6 +5,10 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+
+- Renamed project identifier from `ctc-rag` to `practice-rag` across README repo layout, `docker-compose.yml` container names (qdrant, postgres, clickhouse, redis, minio, langfuse-worker, langfuse-web), and frontend `package.json` / `package-lock.json` package name.
+
 ### Added
 
 - `README.md` with project overview, stack, repo layout, quick start, build order, testing strategy, API surface, observability, cost, interview discussion points, and project conventions.
