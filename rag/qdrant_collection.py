@@ -23,6 +23,7 @@ from qdrant_client.http.exceptions import UnexpectedResponse
 from qdrant_client.models import (
     Distance,
     HnswConfigDiff,
+    Modifier,
     SparseIndexParams,
     SparseVectorParams,
     VectorParams,
@@ -44,6 +45,11 @@ VECTOR_NAME: str = "dense"
 SPARSE_VECTOR_NAME: str = "text"
 """Named sparse vector field for hybrid (SPLADE / BM25) search."""
 
+SPARSE_MODIFIER: Modifier = Modifier.IDF
+"""Sparse vector modifier — Qdrant applies IDF weighting at query time,
+producing BM25-style scoring from the raw term-frequency sparse vectors
+generated client-side by the ingestion embedder."""
+
 HNSW_M: int = 16
 HNSW_EF_CONSTRUCT: int = 128
 HNSW_EF: int = 64
@@ -62,6 +68,7 @@ class CollectionConfig:
     vector_size: int = VECTOR_SIZE
     distance: Distance = Distance.COSINE
     sparse_vector_name: str = SPARSE_VECTOR_NAME
+    sparse_modifier: Modifier = SPARSE_MODIFIER
     hnsw_m: int = HNSW_M
     hnsw_ef_construct: int = HNSW_EF_CONSTRUCT
     hnsw_ef: int = HNSW_EF
@@ -94,6 +101,7 @@ def _build_sparse_vectors_config(
     return {
         config.sparse_vector_name: SparseVectorParams(
             index=SparseIndexParams(on_disk=False),
+            modifier=config.sparse_modifier,
         ),
     }
 

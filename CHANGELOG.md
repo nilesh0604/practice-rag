@@ -44,6 +44,34 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **qdrant-client version mismatch:** installed `qdrant-client` 1.19.0 vs server `qdrant/qdrant:v1.11.3` in `docker-compose.yml`. Collection creation works, but the client emits a compatibility warning. Revisit before Step 2 ingestion — either pin `qdrant-client==1.11.*` in `requirements.txt` to match the server, or bump the server image to a 1.18/1.19 tag. Documented here so it is not lost.
 - The architecture doc's collection schema JSON lists `ef: 64` alongside `m`/`ef_construct`. In qdrant-client, `ef` is a **search-time** parameter (passed per query), not a field on the build-time `HnswConfigDiff`. The helper keeps `HNSW_EF=64` as a constant for the Step 3 retriever to consume; collection creation sets only `m` and `ef_construct`. This is a clarification of the doc, not a deviation from its intent.
 
+### Added — Step 2 (Ingestion pipeline)
+
+- `ingestion/` package — the offline pipeline that converts a documentation corpus into embedded chunks stored in Qdrant.
+  - `ingestion/sync.py` — `discover_files()` finds supported source files (`.md`, `.html`, `.pdf`) under a corpus directory, skipping `.git`/`node_modules`/hidden dirs. `sync_from_git()` helper for future git-clone ingestion.
+  - `ingestion/parser.py` — `parse_file()` dispatches to format-specific parsers (Markdown with YAML frontmatter, HTML via BeautifulSoup, PDF via pypdf). Produces `ParsedDocument` with title, source_url, section, last_modified (UTC), and deterministic `parent_doc_id`.
+  - `ingestion/chunker.py` — `chunk_document()` two-stage split: `MarkdownHeaderTextSplitter` (H1/H2/H3 → section metadata) then `RecursiveCharacterTextSplitter.from_tiktoken_encoder` (512 tokens, 64 overlap, `cl100k_base`). Chunk IDs are deterministic UUIDs (SHA-256 of `parent_doc_id:chunk_index` → UUID) so re-indexes overwrite rather than duplicate.
+  - `ingestion/embedder.py` — `Embedder` class wraps Ollama `nomic-embed-text` for batched 768-d dense embeddings. `sparse_embed_text()` generates BM25-style sparse vectors via a dependency-free hashing trick (`zlib.crc32` → index, `1 + log(tf)` → weight), with Qdrant's `Modifier.IDF` applying IDF weighting at query time. Shared `tokenize()` function for index-time and query-time use.
+  - `ingestion/index_writer.py` — `IndexWriter` class wraps QdrantClient for batched upserts (dense + sparse + payload) and stale-chunk deletion by `parent_doc_id` filter (incremental re-index strategy from the architecture doc).
+  - `ingestion/manifest.py` — `Manifest` dataclass + `file_hash()` (SHA-256), `save_manifest()`/`load_manifest()` (JSON). Tracks per-file hash, last-indexed timestamp, and chunk count for incremental sync.
+  - `ingestion/run.py` — `run_ingestion()` orchestrator: discover → hash-compare against manifest → parse → chunk → embed (dense) → upsert (dense + sparse). Supports `--full-reindex` (drops + recreates collection). Prunes deleted files from manifest. CLI entrypoint via `python -m ingestion.run`.
+- `data/corpus/` seed corpus — 7 Markdown files across 3 doc sets: `fastapi/` (query-params, path-params, dependency-injection), `pydantic/` (models, types), `sqlmodel/` (intro, relationships). Each has YAML frontmatter with title + source_url.
+- Updated `rag/qdrant_collection.py` — added `Modifier.IDF` to the sparse vector config (`SPARSE_MODIFIER` constant + `CollectionConfig.sparse_modifier` field) so Qdrant applies BM25-style IDF weighting at query time.
+- `tests/test_ingestion_manifest.py` — 13 tests (file hashing, manifest CRUD, stale-path detection, JSON roundtrip).
+- `tests/test_ingestion_sync.py` — 9 tests (file discovery, nested dirs, skip dirs, sorted output, supported extensions).
+- `tests/test_ingestion_parser.py` — 12 tests (frontmatter extraction, H1 fallback, parent_doc_id determinism, UTC normalization, source_url heuristics, HTML parsing, dispatch).
+- `tests/test_ingestion_chunker.py` — 12 tests (single/multiple chunks, deterministic UUIDs, sequential indices, section metadata, empty content, overlap constants).
+- `tests/test_ingestion_embedder.py` — 22 tests (tokenizer, sparse vector determinism/bounds/term-frequency weighting, dense embedder with mocked Ollama, dimension validation, lazy client).
+- `tests/test_ingestion_index_writer.py` — 12 tests (upsert single/batch/empty, payload exclusion, sparse generation from content, missing-embedding error, delete-by-parent, 404 handling).
+- `tests/test_ingestion_run.py` — 7 integration tests (full first run, incremental skip, changed-file re-index, full re-index, manifest persistence, empty corpus, deleted-file pruning).
+- All 114 tests pass in the `rag-chat` conda env (`python -m pytest -q`).
+
+### Notes — Step 2
+
+- **Sparse vector strategy:** the architecture doc mentions SPLADE for sparse vectors, but running a SPLADE model locally adds complexity and RAM for a practice project. Instead, the embedder generates BM25-style sparse vectors client-side using a dependency-free hashing trick (token → `zlib.crc32` index, `1 + log(tf)` weight), and Qdrant's `Modifier.IDF` applies inverse-document-frequency weighting at query time. This produces proper BM25-like scoring without a separate model, and the same `tokenize()` function is shared between ingestion and the retriever (Step 3). This is a **deviation** from the doc's SPLADE mention — documented here for interview defensibility.
+- **Chunk IDs as UUIDs:** Qdrant 1.11.3 requires point IDs to be either unsigned integers or UUIDs (16-char hex strings are rejected with a 400). Chunk IDs are therefore deterministic UUIDs derived from `SHA-256(parent_doc_id:chunk_index)[:32]` → `uuid.UUID()`. This keeps re-indexes idempotent (same source → same UUID → upsert overwrites) while satisfying Qdrant's ID format.
+- **qdrant-client version mismatch (updated):** the mismatch (client 1.19.0 vs server 1.11.3) noted in Step 1 did not block ingestion. The `check_compatibility=False` flag is used in smoke tests to suppress the warning. The collection/upsert/search APIs are compatible across these versions. Still recommended to pin or bump before production.
+- **Smoke test results:** full re-index of 7 Markdown files → 45 chunks in Qdrant. Dense search for "How do I declare path parameters in FastAPI?" correctly ranks "Path Parameters - FastAPI" first (score 0.88). Sparse (BM25+IDF) search also ranks it first (score 10.30). Incremental re-run skips all 7 unchanged files. Collection deleted after smoke test to leave the store pristine for Step 3.
+
 ### Changed
 
 - Ollama runs on the **host** (not in Docker) to avoid port conflicts and leverage host Metal acceleration. The `docker-compose.yml` no longer includes an Ollama service.
@@ -57,5 +85,5 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Notes
 
-- Repository is in **Step 1 — Shared contracts** (complete). Phase 0 — Foundation is also complete. The next step is Step 2 — ingestion pipeline (doc sync → parse → chunk → embed → Qdrant upsert).
+- Repository is in **Step 2 — Ingestion pipeline** (complete). Steps 0–2 are done. The next step is Step 3 — Core RAG orchestrator (query embedder, hybrid retriever with RRF fusion, context assembler, Ollama streaming generator, post-processor with citations + confidence score).
 - All health endpoints verified: Ollama `localhost:11434`, Qdrant `localhost:6333/healthz`, Langfuse `localhost:3000` (HTTP 200).

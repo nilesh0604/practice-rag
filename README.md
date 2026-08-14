@@ -80,13 +80,15 @@ practice-rag/
 │   ├── documents.py                   # DocumentChunk, RetrievedDoc
 │   ├── chat.py                        # ChatRequest, ChatResponse, Citation
 │   └── feedback.py                    # FeedbackRequest
-├── ingestion/                         # Offline pipeline (Step 2)
-│   ├── sync.py                        # Doc download / clone
-│   ├── parser.py                      # MD / PDF / HTML parsing
-│   ├── chunker.py                     # RecursiveCharacterTextSplitter, 512 tok / 64 overlap
-│   ├── embedder.py                    # Ollama nomic-embed-text wrapper
-│   ├── index_writer.py                # Qdrant upsert + payload
-│   └── manifest.json                  # File hashes for incremental sync
+├── ingestion/                         # Offline pipeline (Step 2) ✅
+│   ├── __init__.py
+│   ├── sync.py                        # Doc discovery (local folder / git clone)
+│   ├── parser.py                      # MD / HTML / PDF parsing → ParsedDocument
+│   ├── chunker.py                     # MarkdownHeader + RecursiveCharacterTextSplitter, 512 tok / 64 overlap
+│   ├── embedder.py                    # Ollama nomic-embed-text (dense) + hashing-trick sparse
+│   ├── index_writer.py                # Qdrant upsert (dense + sparse + payload)
+│   ├── manifest.py                    # File-hash manifest for incremental sync
+│   └── run.py                         # Orchestrator: sync→parse→chunk→embed→upsert
 ├── rag/                               # Core RAG orchestrator (Step 3, plain Python)
 │   ├── __init__.py
 │   ├── qdrant_collection.py           # docs-knowledge collection helper (Step 1) ✅
@@ -120,12 +122,18 @@ practice-rag/
 │   ├── golden-dataset.json            # 30–50 hand-curated Q&A pairs
 │   └── run_eval.py                    # Local llama3.1:8b judge, threshold gate
 ├── data/
-│   └── corpus/                        # Downloaded FastAPI / Pydantic / SQLModel docs
+│   └── corpus/                        # Seed corpus: 7 MD files (FastAPI/Pydantic/SQLModel) ✅
 └── tests/                             # pytest backend tests
     ├── test_schemas.py                # DocumentChunk/ChatRequest/Feedback contracts ✅
     ├── test_qdrant_collection.py      # collection helper (mocked client) ✅
+    ├── test_ingestion_manifest.py     # manifest CRUD + file hashing ✅
+    ├── test_ingestion_sync.py         # doc discovery ✅
+    ├── test_ingestion_parser.py       # MD/HTML parsing + metadata ✅
+    ├── test_ingestion_chunker.py      # two-stage split + deterministic UUIDs ✅
+    ├── test_ingestion_embedder.py     # dense (mocked Ollama) + sparse (hashing trick) ✅
+    ├── test_ingestion_index_writer.py # Qdrant upsert + delete (mocked client) ✅
+    ├── test_ingestion_run.py          # orchestrator integration (mocked) ✅
     ├── test_guardrails.py
-    ├── test_chunker.py
     ├── test_api_chat.py
     ├── test_api_health.py
     └── test_cache.py
@@ -189,7 +197,7 @@ The calendar phases (one weekend) are reordered below into the actual build grap
 | ----- | ------------------------------------------------------------ | ---------- | -------------------------------- |
 | **0** | Colima + `docker-compose.yml` + conda env + repo scaffolding | nothing    | Phase 1 — Bootstrap              |
 | **1** | `schemas/` Pydantic contracts + Qdrant collection helper ✅  | Step 0     | seam for Phases 2 & 3            |
-| **2** | `ingestion/` pipeline → chunks in Qdrant                     | Step 1     | Phase 2 — Ingestion              |
+| **2** | `ingestion/` pipeline → chunks in Qdrant ✅                  | Step 1     | Phase 2 — Ingestion              |
 | **3** | `rag/` orchestrator as plain Python (unit-testable)          | Step 2     | Phase 3 — Core RAG               |
 | **4** | `api/` FastAPI layer (`/health` before `/chat`)              | Step 3     | Phase 3 — Core RAG               |
 | **5** | `frontend/` React + SSE consumer                             | Step 4     | Phase 4 — Frontend               |
@@ -201,6 +209,29 @@ The calendar phases (one weekend) are reordered below into the actual build grap
 ---
 
 ## Running the app
+
+### Ingestion pipeline (Step 2)
+
+Populate Qdrant with the seed corpus (7 Markdown files covering FastAPI, Pydantic v2, and SQLModel):
+
+```bash
+conda activate rag-chat
+
+# Full re-index (drops + recreates the collection, indexes every file)
+python -m ingestion.run data/corpus --full-reindex
+
+# Incremental sync (skips unchanged files based on manifest.json hashes)
+python -m ingestion.run data/corpus
+
+# Verbose logging
+python -m ingestion.run data/corpus -v
+```
+
+Verify the chunks are in Qdrant:
+
+```bash
+curl http://localhost:6333/collections/docs-knowledge | python3 -m json.tool
+```
 
 ### Backend (FastAPI)
 

@@ -14,6 +14,7 @@ import pytest
 from qdrant_client.models import (
     Distance,
     HnswConfigDiff,
+    Modifier,
     SparseIndexParams,
     SparseVectorParams,
     VectorParams,
@@ -56,6 +57,7 @@ class TestCollectionConfig:
         assert cfg.vector_size == 768
         assert cfg.distance == Distance.COSINE
         assert cfg.sparse_vector_name == "text"
+        assert cfg.sparse_modifier == Modifier.IDF
         assert cfg.hnsw_m == 16
         assert cfg.hnsw_ef_construct == 128
         assert cfg.hnsw_ef == 64
@@ -83,6 +85,7 @@ class TestCreateCollection:
         assert isinstance(sparse[SPARSE_VECTOR_NAME], SparseVectorParams)
         assert isinstance(sparse[SPARSE_VECTOR_NAME].index, SparseIndexParams)
         assert sparse[SPARSE_VECTOR_NAME].index.on_disk is False
+        assert sparse[SPARSE_VECTOR_NAME].modifier == Modifier.IDF
 
         hnsw: HnswConfigDiff = call.kwargs["hnsw_config"]
         assert hnsw.m == 16
