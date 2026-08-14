@@ -1,0 +1,109 @@
+"""FastAPI application factory — app + middleware + router wiring.
+
+Assembles the Step 4 serving layer:
+
+- **CORS** — allows the Vite dev server origin (default ``http://localhost:5173``)
+  so the React frontend can call the API during development.
+- **structlog JSON logging** — emits structured JSON log lines to stdout;
+  falls back to the stdlib logger if structlog is unavailable.
+- **Langfuse** — optional. If the ``langfuse`` package is importable and
+  ``LANGFUSE_HOST`` is set, the chat flow is traced; otherwise tracing is a
+  no-op so the app runs fine with Langfuse down or absent (per the doc's
+  "falls back gracefully if Langfuse is down"). Full Langfuse span wiring
+  is elaborated in Step 7 (Monitoring & Hardening); the seam is here so the
+  decorator is available from day one.
+- **Routers** — all five endpoint groups mounted under ``/api/v1``.
+
+Run with::
+
+    uvicorn api.main:app --reload --host 0.0.0.0 --port 8000
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+
+from api.routes import chat, feedback, health, history, ingest
+
+logger = logging.getLogger(__name__)
+
+API_PREFIX: str = "/api/v1"
+"""All endpoints live under this prefix (matches the architecture doc)."""
+
+DEFAULT_FRONTEND_ORIGIN: str = "http://localhost:5173"
+"""Default Vite dev server origin for CORS. Override with ``FRONTEND_ORIGIN``."""
+
+
+def _configure_structlog() -> None:
+    """Configure structlog for JSON output, falling back to stdlib on error."""
+    try:
+        import structlog
+
+        structlog.configure(
+            processors=[
+                structlog.contextvars.merge_contextvars,
+                structlog.processors.add_log_level,
+                structlog.processors.TimeStamper(fmt="iso"),
+                structlog.processors.JSONRenderer(),
+            ],
+            wrapper_class=structlog.make_filtering_bound_logger(logging.INFO),
+            logger_factory=structlog.PrintLoggerFactory(),
+            cache_logger_on_first_use=True,
+        )
+    except Exception:  # noqa: BLE001 — structlog is optional at runtime
+        logging.basicConfig(level=logging.INFO)
+
+
+def _langfuse_enabled() -> bool:
+    """True only if langfuse is importable AND ``LANGFUSE_HOST`` is set."""
+    if not os.getenv("LANGFUSE_HOST"):
+        return False
+    try:
+        import langfuse  # noqa: F401
+
+        return True
+    except ImportError:
+        return False
+
+
+def create_app() -> FastAPI:
+    """Build the FastAPI app with middleware and all routers mounted."""
+    _configure_structlog()
+
+    app = FastAPI(
+        title="practice-rag API",
+        description="RAG knowledge assistant — FastAPI serving layer (Step 4).",
+        version="0.4.0",
+    )
+
+    # ── CORS ───────────────────────────────────────────────────────────
+    allowed_origin = os.getenv("FRONTEND_ORIGIN", DEFAULT_FRONTEND_ORIGIN)
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=[allowed_origin],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
+    # ── routers ────────────────────────────────────────────────────────
+    app.include_router(health.router, prefix=API_PREFIX)
+    app.include_router(chat.router, prefix=API_PREFIX)
+    app.include_router(history.router, prefix=API_PREFIX)
+    app.include_router(feedback.router, prefix=API_PREFIX)
+    app.include_router(ingest.router, prefix=API_PREFIX)
+
+    logger.info(
+        "practice-rag API ready (langfuse=%s, cors_origin=%s)",
+        _langfuse_enabled(),
+        allowed_origin,
+    )
+    return app
+
+
+app = create_app()
+"""Module-level ASGI app for ``uvicorn api.main:app``."""

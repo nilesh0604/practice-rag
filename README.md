@@ -98,16 +98,19 @@ practice-rag/
 │   ├── generator.py                   # Ollama llama3.2:3b streaming (target: llama3.1:8b) ✅
 │   ├── post_processor.py              # Citation extraction + groundedness score ✅
 │   └── orchestrator.py                # Ties rewrite→retrieve→assemble→generate→post-process ✅
-├── api/                               # FastAPI serving layer (Step 4)
-│   ├── main.py                        # app + middleware + Langfuse @observe
+├── api/                               # FastAPI serving layer (Step 4) ✅
+│   ├── __init__.py
+│   ├── main.py                        # app + middleware (CORS, structlog, Langfuse optional) ✅
+│   ├── deps.py                        # FastAPI dependency injection wiring ✅
+│   ├── conversation.py                # SQLite session store, last-10-turns window ✅
+│   ├── cache.py                       # In-memory LRU response cache ✅
 │   ├── routes/
-│   │   ├── chat.py                    # POST /api/v1/chat (SSE)
-│   │   ├── feedback.py                # POST /api/v1/feedback
-│   │   ├── history.py                 # GET  /api/v1/history/{session_id}
-│   │   ├── ingest.py                  # POST /api/v1/ingest
-│   │   └── health.py                  # GET  /api/v1/health (compose healthcheck)
-│   ├── conversation.py                # SQLite session store, last-10-turns window
-│   ├── cache.py                       # In-memory LRU response cache
+│   │   ├── __init__.py
+│   │   ├── chat.py                    # POST /api/v1/chat (SSE) ✅
+│   │   ├── feedback.py                # POST /api/v1/feedback ✅
+│   │   ├── history.py                 # GET  /api/v1/history/{session_id} ✅
+│   │   ├── ingest.py                  # POST /api/v1/ingest ✅
+│   │   └── health.py                  # GET  /api/v1/health (compose healthcheck) ✅
 │   └── guardrails.py                  # Regex + local LLM judge (Step 6)
 ├── frontend/                          # React + Vite (Step 5)
 │   ├── package.json
@@ -141,9 +144,13 @@ practice-rag/
     ├── test_rag_query_rewriter.py      # passthrough + LLM rewrite (mocked) ✅
     ├── test_rag_orchestrator.py        # full RAG flow (mocked collaborators) ✅
     ├── test_guardrails.py
-    ├── test_api_chat.py
-    ├── test_api_health.py
-    └── test_cache.py
+    ├── test_api_cache.py               # LRU response cache (normalization, eviction, stats) ✅
+    ├── test_api_conversation.py        # SQLite session store + history window + feedback ✅
+    ├── test_api_health.py              # GET /api/v1/health ✅
+    ├── test_api_chat.py                # POST /api/v1/chat SSE (stream, cache, session, 404) ✅
+    ├── test_api_history.py             # GET /api/v1/history/{session_id} ✅
+    ├── test_api_feedback.py            # POST /api/v1/feedback ✅
+    └── test_api_ingest.py              # POST /api/v1/ingest (mocked pipeline) ✅
 ```
 
 > Files marked with a phase/step are **targets** — they are created as the build progresses, not all at bootstrap. ✅ = implemented.
@@ -206,7 +213,7 @@ The calendar phases (one weekend) are reordered below into the actual build grap
 | **1** | `schemas/` Pydantic contracts + Qdrant collection helper ✅  | Step 0     | seam for Phases 2 & 3            |
 | **2** | `ingestion/` pipeline → chunks in Qdrant ✅                  | Step 1     | Phase 2 — Ingestion              |
 | **3** | `rag/` orchestrator as plain Python (unit-testable) ✅       | Step 2     | Phase 3 — Core RAG               |
-| **4** | `api/` FastAPI layer (`/health` before `/chat`)              | Step 3     | Phase 3 — Core RAG               |
+| **4** | `api/` FastAPI layer (`/health` before `/chat`) ✅           | Step 3     | Phase 3 — Core RAG               |
 | **5** | `frontend/` React + SSE consumer                             | Step 4     | Phase 4 — Frontend               |
 | **6** | `guardrails` + `eval/` golden dataset + Ragas gate           | Step 4     | Phase 5 — Guardrails & Eval      |
 | **7** | Langfuse traces + resilience + optional cloud showcase       | Steps 3–6  | Phase 6 — Monitoring & Hardening |
@@ -282,12 +289,45 @@ conda activate rag-chat
 uvicorn api.main:app --reload --host 0.0.0.0 --port 8000
 ```
 
+Interactive API docs (OpenAPI/Swagger): `http://localhost:8000/docs`.
+
+Health check (used by the Docker Compose healthcheck):
+
+```bash
+curl http://localhost:8000/api/v1/health
+# {"status":"ok","service":"practice-rag-api","version":"0.4.0"}
+```
+
 Smoke-test the SSE stream before touching the frontend:
 
 ```bash
 curl -N -X POST http://localhost:8000/api/v1/chat \
   -H "Content-Type: application/json" \
   -d '{"message":"How do I declare optional query parameters in FastAPI?"}'
+```
+
+The SSE response emits `data: <token>` frames as tokens stream, then an
+`event: result` frame with the full `ChatResponse` JSON (citations +
+confidence + session id), and finally `data: [DONE]`. Repeated identical
+queries hit the in-memory LRU cache (`X-Cache: HIT` header) and replay the
+cached answer without invoking the orchestrator.
+
+Other endpoints:
+
+```bash
+# Conversation history for a session
+curl http://localhost:8000/api/v1/history/<session_id>
+
+# Thumbs up/down feedback
+curl -X POST http://localhost:8000/api/v1/feedback \
+  -H "Content-Type: application/json" \
+  -d '{"session_id":"<id>","message_index":1,"rating":"up","comment":"cited well"}'
+
+# Trigger incremental re-index of the corpus
+curl -X POST http://localhost:8000/api/v1/ingest
+# Full re-index (drops + recreates the collection)
+curl -X POST http://localhost:8000/api/v1/ingest -d '{"full_reindex":true}' \
+  -H "Content-Type: application/json"
 ```
 
 ### Frontend (React + Vite)

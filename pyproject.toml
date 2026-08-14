@@ -11,4 +11,9 @@ filterwarnings = [
     # construction; with no live Qdrant in unit tests it raises, surfacing as
     # an unhandled-thread warning. Not relevant to contract/collection tests.
     "ignore::pytest.PytestUnhandledThreadExceptionWarning",
+    # starlette's TestClient warns that httpx is deprecated in favor of
+    # httpx2; the project pins httpx and the test client works fine. Ignore
+    # until the migration to httpx2 is warranted.
+    "ignore:Using `httpx` with `starlette.testclient` is deprecated",
+    "ignore::starlette.exceptions.StarletteDeprecationWarning",
 ]
