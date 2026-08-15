@@ -112,16 +112,30 @@ practice-rag/
 │   │   ├── ingest.py                  # POST /api/v1/ingest ✅
 │   │   └── health.py                  # GET  /api/v1/health (compose healthcheck) ✅
 │   └── guardrails.py                  # Regex + local LLM judge (Step 6)
-├── frontend/                          # React + Vite (Step 5)
-│   ├── package.json
+├── frontend/                          # React + Vite chat widget (Step 5) ✅
+│   ├── package.json                   # Vite + React 18 + Jest + RTL ✅
+│   ├── vite.config.js                 # Dev server proxies /api → :8000 ✅
+│   ├── babel.config.js                # Babel for Jest (env + react presets) ✅
+│   ├── jest.setup.js                  # jsdom polyfills (scrollIntoView, TextEncoder) ✅
+│   ├── index.html                     # Vite entry HTML ✅
 │   ├── src/
-│   │   ├── App.jsx
-│   │   ├── ChatWidget.jsx
-│   │   ├── MessageList.jsx
-│   │   ├── InputBox.jsx
-│   │   ├── CitationChip.jsx
-│   │   └── ErrorBoundary.jsx
+│   │   ├── main.jsx                   # React root + styles.css import ✅
+│   │   ├── App.jsx                    # Root → ChatWidget ✅
+│   │   ├── ChatWidget.jsx             # State, session, streaming, feedback wiring ✅
+│   │   ├── MessageList.jsx            # Messages, citations, confidence warning, feedback ✅
+│   │   ├── InputBox.jsx               # Textarea + SendButton, Enter to send ✅
+│   │   ├── CitationChip.jsx           # [Source: title] link ✅
+│   │   ├── ErrorBoundary.jsx          # Catches render errors, recovery UI ✅
+│   │   ├── api.js                     # SSE parser + streamChat + sendFeedback + fetchHistory ✅
+│   │   └── styles.css                 # Chat widget styles ✅
 │   └── __tests__/
+│       ├── App.test.jsx               # Root renders ChatWidget ✅
+│       ├── api.test.js                # SSE parser + streamChat + REST helpers (18 tests) ✅
+│       ├── CitationChip.test.jsx      # Link rendering + URL fallback (3 tests) ✅
+│       ├── MessageList.test.jsx       # Messages, citations, warning, feedback (11 tests) ✅
+│       ├── InputBox.test.jsx          # Input, Enter/Shift+Enter, disabled (7 tests) ✅
+│       ├── ChatWidget.test.jsx        # Streaming, citations, feedback, session (10 tests) ✅
+│       └── ErrorBoundary.test.jsx     # Catch + recovery (3 tests) ✅
 ├── eval/                              # Offline Ragas eval (Step 6)
 │   ├── golden-dataset.json            # 30–50 hand-curated Q&A pairs
 │   └── run_eval.py                    # Local llama3.1:8b judge, threshold gate
@@ -214,7 +228,7 @@ The calendar phases (one weekend) are reordered below into the actual build grap
 | **2** | `ingestion/` pipeline → chunks in Qdrant ✅                  | Step 1     | Phase 2 — Ingestion              |
 | **3** | `rag/` orchestrator as plain Python (unit-testable) ✅       | Step 2     | Phase 3 — Core RAG               |
 | **4** | `api/` FastAPI layer (`/health` before `/chat`) ✅           | Step 3     | Phase 3 — Core RAG               |
-| **5** | `frontend/` React + SSE consumer                             | Step 4     | Phase 4 — Frontend               |
+| **5** | `frontend/` React + SSE consumer ✅                          | Step 4     | Phase 4 — Frontend               |
 | **6** | `guardrails` + `eval/` golden dataset + Ragas gate           | Step 4     | Phase 5 — Guardrails & Eval      |
 | **7** | Langfuse traces + resilience + optional cloud showcase       | Steps 3–6  | Phase 6 — Monitoring & Hardening |
 
@@ -332,10 +346,13 @@ curl -X POST http://localhost:8000/api/v1/ingest -d '{"full_reindex":true}' \
 
 ### Frontend (React + Vite)
 
+The chat widget is a React 18 + Vite SPA that consumes the FastAPI SSE
+stream. The Vite dev server proxies `/api` to the backend on `:8000`.
+
 ```bash
 cd frontend
 npm install
-npm run dev          # dev server with HMR
+npm run dev          # dev server with HMR on :5173
 ```
 
 Production build + local serve (no global install):
@@ -345,6 +362,34 @@ cd frontend
 npm run build
 npx serve -s dist
 ```
+
+**Component tree** (per the architecture doc):
+
+```
+App → ChatWidget → ErrorBoundary
+                 → MessageList → CitationChip
+                 → InputBox → SendButton
+```
+
+**SSE consumption:** `src/api.js` uses `fetch` + `ReadableStream` reader
+(per the doc's snippet) to parse the SSE stream. The parser handles three
+frame kinds:
+
+- `data: <token>` — appended to the streaming assistant bubble
+- `event: result` — parsed as `ChatResponse` JSON; sets citations,
+  confidence, and session id
+- `data: [DONE]` — marks streaming complete, enables feedback buttons
+
+**Features:**
+
+- Token-by-token streaming with a blinking cursor
+- Citation chips (`[Source: title]` as external links)
+- Low-confidence warning when `confidence < 0.65`
+- Thumbs up/down feedback → `POST /api/v1/feedback`
+- Session id carried across turns (from the `result` frame)
+- Error boundary with recovery ("Try again" button)
+- "New chat" button to reset the session
+- Enter to send, Shift+Enter for newline
 
 ---
 
@@ -368,7 +413,15 @@ cd frontend
 npm test -- --coverage
 ```
 
-Covers `ChatWidget` rendering, `CitationChip`, SSE `fetch` mock, and `ErrorBoundary`.
+54 tests across 7 suites covering:
+
+- `api.js` — SSE frame parser (token/result/done), `streamChat` with mocked `ReadableStream`, `sendFeedback`, `fetchHistory`
+- `CitationChip` — link rendering, URL fallback, camelCase key
+- `MessageList` — messages, citations, low-confidence warning, feedback buttons, error text, active state
+- `InputBox` — send on Enter, Shift+Enter newline, disabled state, empty guard
+- `ChatWidget` — streaming, citations, confidence warning, feedback wiring, session propagation, error handling, new chat reset
+- `ErrorBoundary` — catch + recovery
+- `App` — root renders ChatWidget
 
 ### 3. Golden-dataset eval gate (Ragas)
 
