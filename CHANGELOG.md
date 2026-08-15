@@ -5,6 +5,31 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added — Chat assistant feature status register
+
+- `docs/CHAT_ASSISTANT_FEATURES.md` — documents the full list of chat assistant features (core chat, React widget UI, retrieval, APIs, guardrails, responsible AI, performance & cost, RBAC) from the production AEM/Azure target in `ai-rag-chat-architecture-2026.md`, mapped to their **actual implementation status** in this local practice codebase. Each feature is tagged ✅ Implemented / 🟡 Partial / ❌ Not implemented, with the stack substitution table (Ollama vs Azure OpenAI, Qdrant vs Azure AI Search, SQLite vs Redis/Cosmos, standalone Vite SPA vs AEM SPA Editor) and per-feature file references. Includes a summary count table and a bottom-line assessment pointing to `docs/F500_ENTERPRISE_ACTION_ITEMS.md` for the deferred enterprise gaps.
+
+### Added — F500 enterprise production-grade action items tracker
+
+- `docs/F500_ENTERPRISE_ACTION_ITEMS.md` — tracks every place where the project ships a workaround instead of a production-grade F500 enterprise practice. Documents 7 gaps introduced/accepted by the context-blind-guardrails fix (3B judge model, no eval gate/SLO, history-synthesis hallucination risk, rewriter as injection surface, PII/injection in judge history, no guardrail metrics, no red-team suite). Each entry records the enterprise standard, the workaround shipped, the reasoning for the workaround at the current practice stage, and the future action item to close the gap. Items 1, 2, 5, and 7 are flagged as blockers the moment the app is deployed to a hosted/multi-user environment or the judge moves to a hosted model.
+
+### Added — NVIDIA NIM free LLM models research document
+
+- `docs/NVIDIA_NIM_FREE_MODELS.md` — deep-research reference of every free, OpenAI-compatible model hosted on NVIDIA's build.nvidia.com NIM catalog (125 models: 99 confirmed online + 26 requiring provider verification). Documents the platform overview, access/authentication steps, global constraints (~40 RPM shared rate limit, no credit card, no key expiration, phone verification), OpenAI compatibility (Chat Completions, streaming, function calling, vision), quick-start code (Python openai SDK, curl, LangChain), all flagship/mid-size/small chat models with their specialities (chat, reasoning, coding, vision, embedding, safety, domain-specific), a Kimi K2.5 / K2.6 deep-dive, a Bash probe script for programmatic availability detection, caveats/best practices, and direct relevance to this project's `generator.py` and `guardrails.py` components. Sources cited from build.nvidia.com, docs.api.nvidia.com, freellm.net, and stevescargall.com.
+
+### Fixed — Context-blind guardrails & classifier (multi-turn follow-up bug)
+
+A context-dependent follow-up such as `"please summarize all above 3 answers"` was rejected by the input guardrail (LLM judge false-positive) and would have been misrouted to `off_topic` by the classifier, because both pre-RAG gates ran on the bare query with no conversation history. The 3B judge couldn't distinguish a legitimate conversational anaphor ("the above 3 answers") from a manipulative one ("the above instructions").
+
+- `api/guardrails.py` — `InputGuardrail.check(message, history="")` and `QueryClassifier.classify(query, history="")` now accept the formatted conversation history. `INJECTION_JUDGE_PROMPT` and `CLASSIFIER_PROMPT` gained a `Conversation history:` block so the LLM judge/classifier can see prior on-topic Q&A and avoid false positives on follow-ups. `GuardrailSuite.check_input` / `GuardrailSuite.classify` forward `history`. Backward compatible (history defaults to `""`).
+- `api/guardrails.py` — added a `follow_up` classification label (`CLASS_FOLLOW_UP`) for context-dependent follow-ups that reference prior turns. It is `handled=False` (still goes through the RAG flow) so the generator can synthesize from history. `VALID_CLASSES` and `CLASSIFIER_PROMPT` updated.
+- `rag/orchestrator.py` — `stream_answer` and `answer` now pass `history` into `check_input(query, history)` and `classify(query, history)` (previously only the query was passed).
+- `rag/generator.py` — `SYSTEM_PROMPT_TEMPLATE` rule 5 now explicitly permits synthesizing a follow-up answer from `CONVERSATION HISTORY` (e.g. a summary of prior turns) while forbidding invented facts. Previously the prompt said "use ONLY the provided context", which would starve a "summarize the above" answer.
+- `api/deps.py` — `get_orchestrator()` now injects `LLMQueryRewriter()` instead of the passthrough default, so a decontextualized follow-up is rewritten into a self-contained query (coreference resolution against history) before retrieval. Falls back to the original query on LLM error/empty.
+- `tests/test_guardrails.py` — 8 new tests: follow-up with history not blocked, follow-up without history blocked when judge unsafe, history default renders as `(none)`, `follow_up` label not handled, follow-up with history routed to `follow_up`, follow-up without history can route `off_topic`, `GuardrailSuite` forwards history to both `check_input` and `classify`.
+- `tests/test_rag_orchestrator.py` — 3 new tests: orchestrator forwards history to `check_input` and `classify` (stream + answer), follow-up with history reaches the RAG flow instead of short-circuiting.
+- All 493 backend tests pass (`python -m pytest -q`).
+
 ### Added — Step 7 (Observability & hardening)
 
 - `api/observability.py` — the observability & hardening layer (build-order items 39–41, Phase 6 — Monitoring & Hardening).

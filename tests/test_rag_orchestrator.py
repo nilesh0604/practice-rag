@@ -266,6 +266,32 @@ class TestOrchestratorGuardrailsStream:
         assert tokens == ["a", "b"]
         orch.retriever.retrieve.assert_called_once()
 
+    def test_guardrail_receives_history(self):
+        """The orchestrator must forward conversation history to both
+        check_input and classify so context-dependent follow-ups are not
+        false-positive blocked or misrouted to off_topic."""
+        suite = _mock_guardrail_suite(classification_label="documentation")
+        orch = self._build_with_guardrails(suite)
+        list(orch.stream_answer("summarize the above", "prior Q&A"))
+        suite.check_input.assert_called_once_with("summarize the above", "prior Q&A")
+        suite.classify.assert_called_once_with("summarize the above", "prior Q&A")
+
+    def test_follow_up_not_blocked_with_history(self):
+        """A context-dependent follow-up with on-topic history must pass
+        through the guardrail and reach the RAG flow (not short-circuit)."""
+        suite = _mock_guardrail_suite(
+            classification_label="follow_up",
+            classification_handled=False,
+        )
+        orch = self._build_with_guardrails(suite, tokens=["summary"])
+        items = list(orch.stream_answer(
+            "please summarize all above 3 answers",
+            "Q: What is Pydantic? A: ...",
+        ))
+        tokens = [i for i in items if isinstance(i, str)]
+        assert tokens == ["summary"]
+        orch.retriever.retrieve.assert_called_once()
+
     def test_compare_proceeds_through_rag_flow(self):
         suite = _mock_guardrail_suite(classification_label="compare")
         orch = self._build_with_guardrails(suite)
@@ -326,6 +352,13 @@ class TestOrchestratorGuardrailsAnswer:
         assert "can't process" in answer
         assert docs == []
         orch.retriever.retrieve.assert_not_called()
+
+    def test_guardrail_receives_history(self):
+        suite = _mock_guardrail_suite(classification_label="documentation")
+        orch = self._build_with_guardrails(suite)
+        orch.answer("summarize the above", "prior Q&A")
+        suite.check_input.assert_called_once_with("summarize the above", "prior Q&A")
+        suite.classify.assert_called_once_with("summarize the above", "prior Q&A")
 
     def test_greeting_handled_returns_canned(self):
         suite = _mock_guardrail_suite(

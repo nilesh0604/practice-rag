@@ -29,6 +29,7 @@ from rag.generator import Generator
 from rag.orchestrator import RAGOrchestrator
 from rag.post_processor import PostProcessor
 from rag.qdrant_collection import get_qdrant_client
+from rag.query_rewriter import LLMQueryRewriter
 from rag.retriever import HybridRetriever
 
 logger = logging.getLogger(__name__)
@@ -98,6 +99,7 @@ def get_orchestrator() -> RAGOrchestrator:
         ContextAssembler(),
         Generator(circuit_breaker=get_circuit_breaker()),
         PostProcessor(get_embedder()),
+        query_rewriter=LLMQueryRewriter(),
         guardrail_suite=get_guardrail_suite(),
         tracer=get_tracer(),
     )

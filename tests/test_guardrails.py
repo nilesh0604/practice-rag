@@ -23,6 +23,7 @@ import pytest
 from api.guardrails import (
     CLASS_COMPARE,
     CLASS_DOCUMENTATION,
+    CLASS_FOLLOW_UP,
     CLASS_GREETING,
     CLASS_OFF_TOPIC,
     GUARD_MODEL,
@@ -253,6 +254,35 @@ class TestInputGuardrail:
         gr.close()
         assert gr._client is None
 
+    def test_follow_up_with_history_not_blocked(self):
+        """A context-dependent follow-up ("summarize the above") with prior
+        on-topic history must not be blocked by the LLM judge."""
+        gr = InputGuardrail()
+        gr._client = _mock_ollama("safe")
+        history = "Q: What is Pydantic?\nA: A validation library.\nQ: What is FastAPI?\nA: A web framework."
+        decision = gr.check("please summarize all above 3 answers", history)
+        assert decision.blocked is False
+        # The prompt sent to the LLM must include the history block.
+        sent_prompt = gr._client.chat.call_args.kwargs["messages"][0]["content"]
+        assert "Conversation history:" in sent_prompt
+        assert "Pydantic" in sent_prompt
+
+    def test_follow_up_without_history_blocked_when_judge_unsafe(self):
+        """Same follow-up with empty history and an unsafe judge verdict
+        is still blocked (conservative behavior preserved)."""
+        gr = InputGuardrail()
+        gr._client = _mock_ollama("unsafe")
+        decision = gr.check("please summarize all above 3 answers", "")
+        assert decision.blocked is True
+
+    def test_history_default_is_empty(self):
+        gr = InputGuardrail()
+        gr._client = _mock_ollama("safe")
+        gr.check("question")
+        sent_prompt = gr._client.chat.call_args.kwargs["messages"][0]["content"]
+        # Default history renders as "(none)".
+        assert "(none)" in sent_prompt
+
 
 # ── OutputGuardrail ────────────────────────────────────────────────────
 
@@ -409,6 +439,41 @@ class TestQueryClassifier:
         clf.close()
         assert clf._client is None
 
+    def test_llm_labels_follow_up_not_handled(self):
+        clf = QueryClassifier()
+        clf._client = _mock_ollama("follow_up")
+        result = clf.classify("summarize the above")
+        assert result.label == CLASS_FOLLOW_UP
+        assert result.handled is False
+        assert result.answer == ""
+
+    def test_follow_up_with_history_routed_to_follow_up(self):
+        clf = QueryClassifier()
+        clf._client = _mock_ollama("follow_up")
+        history = "Q: What is Pydantic?\nA: A validation library."
+        result = clf.classify("please summarize all above 3 answers", history)
+        assert result.label == CLASS_FOLLOW_UP
+        assert result.handled is False
+        sent_prompt = clf._client.chat.call_args.kwargs["messages"][0]["content"]
+        assert "Conversation history:" in sent_prompt
+        assert "Pydantic" in sent_prompt
+
+    def test_follow_up_without_history_can_route_off_topic(self):
+        """With no history the classifier may route a vague follow-up to
+        off_topic (conservative). Here the LLM returns off_topic."""
+        clf = QueryClassifier()
+        clf._client = _mock_ollama("off_topic")
+        result = clf.classify("please summarize all above 3 answers", "")
+        assert result.label == CLASS_OFF_TOPIC
+        assert result.handled is True
+
+    def test_history_default_is_empty(self):
+        clf = QueryClassifier()
+        clf._client = _mock_ollama("documentation")
+        clf.classify("question")
+        sent_prompt = clf._client.chat.call_args.kwargs["messages"][0]["content"]
+        assert "(none)" in sent_prompt
+
 
 # ── GuardrailSuite (facade) ────────────────────────────────────────────
 
@@ -419,16 +484,30 @@ class TestGuardrailSuite:
         ig.check.return_value = GuardrailDecision(blocked=True, reason="blocked")
         suite = GuardrailSuite(input_guardrail=ig)
         decision = suite.check_input("msg")
-        ig.check.assert_called_once_with("msg")
+        ig.check.assert_called_once_with("msg", "")
         assert decision.blocked is True
+
+    def test_check_input_forwards_history(self):
+        ig = MagicMock()
+        ig.check.return_value = GuardrailDecision(blocked=False)
+        suite = GuardrailSuite(input_guardrail=ig)
+        suite.check_input("msg", "prior Q&A")
+        ig.check.assert_called_once_with("msg", "prior Q&A")
 
     def test_classify_delegates(self):
         clf = MagicMock()
         clf.classify.return_value = QueryClassification(label=CLASS_GREETING, handled=True, answer="hi")
         suite = GuardrailSuite(classifier=clf)
         result = suite.classify("hello")
-        clf.classify.assert_called_once_with("hello")
+        clf.classify.assert_called_once_with("hello", "")
         assert result.handled is True
+
+    def test_classify_forwards_history(self):
+        clf = MagicMock()
+        clf.classify.return_value = QueryClassification(label=CLASS_DOCUMENTATION)
+        suite = GuardrailSuite(classifier=clf)
+        suite.classify("summarize the above", "prior Q&A")
+        clf.classify.assert_called_once_with("summarize the above", "prior Q&A")
 
     def test_check_output_delegates(self):
         og = MagicMock()

@@ -56,6 +56,10 @@ RULES:
 2. Cite the source title in [Source: title] format.
 3. Keep answers concise — 2-4 sentences for simple questions.
 4. Never fabricate API names, version numbers, or code signatures.
+5. You may use the CONVERSATION HISTORY to synthesize a follow-up answer \
+(such as a summary of prior turns) when the user references earlier answers. \
+Do not invent facts not present in the context or history; if history is needed \
+but empty, say: "I don't have enough information to answer that."
 
 CONTEXT:
 {context}

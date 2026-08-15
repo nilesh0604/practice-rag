@@ -112,7 +112,7 @@ class RAGOrchestrator:
                 self.tracer.start_span(trace, "guardrail_input")
                 if trace is not None else None
             )
-            decision = self.guardrail_suite.check_input(query)
+            decision = self.guardrail_suite.check_input(query, history)
             if decision.blocked:
                 logger.info("Orchestrator: input blocked — %s", decision.reason)
                 if gr_span is not None:
@@ -123,7 +123,7 @@ class RAGOrchestrator:
                 )
                 return
 
-            classification = self.guardrail_suite.classify(query)
+            classification = self.guardrail_suite.classify(query, history)
             if gr_span is not None:
                 self.tracer.end_span(
                     gr_span,
@@ -226,7 +226,7 @@ class RAGOrchestrator:
                 self.tracer.start_span(trace, "guardrail_input")
                 if trace is not None else None
             )
-            decision = self.guardrail_suite.check_input(query)
+            decision = self.guardrail_suite.check_input(query, history)
             if decision.blocked:
                 refusal = (
                     "I can't process that request. Please ask a question about "
@@ -236,7 +236,7 @@ class RAGOrchestrator:
                     self.tracer.end_span(gr_span, metadata={"blocked": True})
                 return refusal, PostProcessResult(answer=refusal), []
 
-            classification = self.guardrail_suite.classify(query)
+            classification = self.guardrail_suite.classify(query, history)
             if gr_span is not None:
                 self.tracer.end_span(
                     gr_span, metadata={"blocked": False, "class": classification.label},
