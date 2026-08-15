@@ -444,11 +444,45 @@ the production generation/guardrail path until all 10 gaps are closed.
   This is a **manual step** requiring a live `NVIDIA_API_KEY` + Ollama
   running; not automatable in CI at the practice stage.
 
-### Phase 2 — Guardrail comparison test
+### Phase 2 — Guardrail comparison test ✅ (code landed)
 
-- Add NIM-backed `InputGuardrail` / `OutputGuardrail` / `QueryClassifier`
-  variants behind the config flag.
-- Wire 3-tier fallback: NIM LLM → Ollama LLM → regex/keyword.
+- ✅ Add NIM-backed `InputGuardrail` / `OutputGuardrail` / `QueryClassifier`
+  variants behind the config flag (`api/nim_guardrails.py` —
+  `NIMGuardrailClient` + `NIMInputGuardrail` + `NIMOutputGuardrail` +
+  `NIMQueryClassifier` + `build_guardrail_suite()` factory).
+- ✅ Wire 3-tier fallback: NIM LLM → Ollama LLM → regex/keyword. The three
+  subclasses override only the LLM-judge / LLM-classify method of the
+  existing guardrail classes, so the regex/keyword tiers and the
+  `GuardrailDecision` / `QueryClassification` contracts are inherited
+  unchanged.
+  - `NIMInputGuardrail` — regex injection scan (tier 1, inherited) → NIM
+    content-safety judge (tier 2) → Ollama injection judge (tier 3,
+    inherited) → regex-only on all-LLM failure.
+  - `NIMOutputGuardrail` — PII regex scrub (tier 1, inherited) → NIM
+    content-safety judge (tier 2) → Ollama harmful-content judge (tier 3,
+    inherited) → scrub-only on all-LLM failure.
+  - `NIMQueryClassifier` — NIM topic-control guard (binary on-topic/off-topic,
+    tier 1) → Ollama 5-way classifier (tier 2, inherited) → keyword fallback
+    (tier 3, inherited). NIM "off-topic" routes directly to `off_topic`;
+    NIM "on-topic" defers to the Ollama 5-way for fine-grained routing.
+- ✅ The NIM guardrail client gets its **own** `CircuitBreaker` (separate
+  from the generator's NIM breaker and the Ollama breaker). All three NIM
+  guardrails share one `NIMGuardrailClient` (one API key + one rate-limit
+  budget + one breaker).
+- ✅ Unit tests: `tests/test_api_nim_guardrails.py` (50 tests, all mocked).
+- ✅ `api/deps.py` wired through `build_guardrail_suite()` — default path
+  unchanged (plain Ollama `GuardrailSuite` when `NIM_ENABLED` is unset/false).
+- ⬜ The hosted PII model (`nvidia/gliner-pii`, §2.4) is **not** wired here.
+  It is in the "check provider" list (uncertain availability), carries a
+  chicken-and-egg data-egress problem, and F500 item #5 flags PII scrubbing
+  upstream of hosted models as a blocker. The regex `scrub_pii` (inherited,
+  always-on) remains the PII tier. The hosted PII refinement is deferred to
+  a sub-phase after availability is probed.
+- ⬜ Run a comparison eval: same queries, Ollama-judge vs. NIM-judge
+  verdicts, side-by-side FPR/FNR review (no automated SLO yet — that is
+  F500 item #2). This is a **manual step** requiring a live
+  `NVIDIA_API_KEY` + Ollama running; not automatable in CI at the practice
+  stage.
 - **Do not** enable NIM guardrails on any corpus with real PII until
   F500 item #5 (PII scrubbing upstream) is closed.
 

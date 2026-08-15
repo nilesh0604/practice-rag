@@ -22,7 +22,8 @@ from qdrant_client import QdrantClient
 
 from api.cache import DEFAULT_MAX_SIZE, LRUCache
 from api.conversation import DEFAULT_DB_PATH, ConversationStore
-from api.guardrails import GuardrailSuite, InputGuardrail, OutputGuardrail, QueryClassifier
+from api.guardrails import GuardrailSuite
+from api.nim_guardrails import build_guardrail_suite
 from api.observability import CircuitBreaker, LangfuseTracer, MetricsCollector
 from rag.context_assembler import ContextAssembler
 from rag.nim_generator import build_generator
@@ -107,16 +108,15 @@ def get_orchestrator() -> RAGOrchestrator:
 
 @lru_cache
 def get_guardrail_suite() -> GuardrailSuite:
-    """Process-wide guardrail suite (Step 6).
+    """Process-wide guardrail suite (Step 6 + NIM Phase 2).
 
-    LLM-backed checks are enabled by default; they degrade to regex/keyword
-    fallbacks if Ollama is unreachable (see ``api/guardrails.py``).
+    When ``NIM_ENABLED=true`` the suite uses the NIM-augmented guardrails with
+    3-tier fallback (NIM → Ollama → regex/keyword). Otherwise (default) the
+    plain Ollama guardrails are used. LLM-backed checks degrade to
+    regex/keyword fallbacks if Ollama is unreachable (see
+    ``api/guardrails.py`` + ``api/nim_guardrails.py``).
     """
-    return GuardrailSuite(
-        input_guardrail=InputGuardrail(),
-        output_guardrail=OutputGuardrail(),
-        classifier=QueryClassifier(),
-    )
+    return build_guardrail_suite()
 
 
 @lru_cache

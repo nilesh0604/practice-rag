@@ -5,6 +5,73 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added — NVIDIA NIM guardrail integration (Phase 2 — comparison testing)
+
+- `api/nim_guardrails.py` — new module implementing the Phase 2 guardrail
+  comparison test from `docs/NVIDIA_NIM_INTEGRATION_PLAN.md`:
+  - `NIMGuardrailClient` — non-streaming OpenAI-compatible chat client for
+    NIM guardrail verdicts (`https://integrate.api.nvidia.com/v1`). Uses
+    `httpx` (already a dependency) to POST to `/chat/completions` with
+    `stream=False` and returns the verdict content. Maps 429/404/timeout/
+    connection errors to `NIMGuardrailError` for fallback. Owns a dedicated
+    `CircuitBreaker` (separate from the generator's NIM breaker and the
+    Ollama breaker) so a NIM guardrail outage does not trip other breakers.
+    Default models: `nvidia/llama-3.1-nemoguard-8b-content-safety` (input +
+    output judges) and `nvidia/llama-3.1-nemoguard-8b-topic-control`
+    (classifier).
+  - `NIMInputGuardrail(InputGuardrail)` — overrides `_llm_judge` to call the
+    NIM content-safety model first; on NIM failure
+    (`NIMGuardrailError` / `CircuitOpenError`) or an unparseable verdict,
+    falls back to the parent Ollama injection judge. The regex injection
+    tier (tier 1) is inherited and always runs first. 3-tier: regex → NIM →
+    Ollama → regex-only.
+  - `NIMOutputGuardrail(OutputGuardrail)` — overrides `_llm_judge` to call
+    the NIM content-safety model first; on failure falls back to the parent
+    Ollama harmful-content judge. The PII regex scrub (tier 1) is inherited
+    and always runs first. 3-tier: PII scrub → NIM → Ollama → scrub-only.
+  - `NIMQueryClassifier(QueryClassifier)` — overrides `_llm_classify` to
+    call the NIM topic-control model first (binary on-topic/off-topic). NIM
+    "off-topic" routes directly to `off_topic`; NIM "on-topic" defers to
+    the parent Ollama 5-way classifier for fine-grained routing. 3-tier:
+    NIM topic-control → Ollama 5-way → keyword fallback.
+  - `build_guardrail_suite()` factory — reads `NIM_ENABLED` env var. When
+    `true` (case-insensitive, also accepts `1`/`yes`), returns a
+    `GuardrailSuite` with the three NIM-augmented subclasses sharing one
+    `NIMGuardrailClient` (one API key + one rate-limit budget + one
+    dedicated circuit breaker). When disabled (default), returns the plain
+    Ollama `GuardrailSuite` — no change to the existing default path.
+- `api/deps.py` — `get_guardrail_suite` now uses `build_guardrail_suite()`
+  instead of constructing `GuardrailSuite` directly, so the NIM guardrail
+  path is wired through the config flag with zero change to the default
+  behavior.
+- `.env.example` — updated the NIM section to note it now covers guardrails
+  (Phase 2) in addition to generation (Phase 1).
+- `tests/test_api_nim_guardrails.py` — 50 new unit tests covering
+  `NIMGuardrailClient` (non-streaming POST, verdict extraction, lazy
+  client, error mapping for 429/404/500/timeout/connect, circuit-breaker
+  open/failure-recording/success-reset), `NIMInputGuardrail` (regex
+  short-circuit, NIM unsafe/safe, NIM failure → Ollama fallback, NIM
+  unparseable → Ollama, both-fail → regex-only, circuit-open fallback,
+  model + history passthrough), `NIMOutputGuardrail` (PII scrub always,
+  NIM unsafe/safe, NIM failure → Ollama, both-fail → scrub-only), and
+  `NIMQueryClassifier` (NIM off-topic direct route, NIM on-topic → Ollama
+  5-way, NIM failure → Ollama, both-fail → keyword, circuit-open
+  fallback, model + history passthrough), and `build_guardrail_suite`
+  (default → plain suite, NIM-enabled → NIM-augmented suite sharing one
+  client, case-insensitive flag, dedicated breaker). All mocked — no
+  network.
+- `docs/NVIDIA_NIM_INTEGRATION_PLAN.md` — marked Phase 2 as ✅ (code
+  landed) with notes on the 3-tier fallback design per component and the
+  deferred hosted PII model (`nvidia/gliner-pii`).
+
+**F500 enterprise gap notice:** This is a **practice-stage comparison
+test only**, not a production promotion. All 10 gaps in
+`docs/F500_ENTERPRISE_ACTION_ITEMS.md` item #8 remain open. The default
+path (NIM disabled) is unchanged — Ollama stays primary, local-first,
+$0-cost. NIM guardrails must not be enabled on corpora with real PII
+(F500 item #5). The hosted PII model (`nvidia/gliner-pii`) is deferred
+(uncertain availability + chicken-and-egg data-egress problem).
+
 ### Changed — NVIDIA NIM default model swapped after live integration test
 
 - `NIM_GENERATION_MODEL` default changed from `moonshotai/kimi-k2.6` to

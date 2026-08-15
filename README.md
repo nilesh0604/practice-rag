@@ -157,10 +157,12 @@ practice-rag/
     ├── test_rag_retriever.py           # hybrid dense+sparse + RRF fusion (mocked) ✅
     ├── test_rag_context_assembler.py   # CONTEXT block formatting ✅
     ├── test_rag_generator.py           # Ollama streaming + system prompt + circuit breaker (mocked) ✅
+    ├── test_rag_nim_generator.py       # NIM generator + fallback + factory (29 tests, mocked) ✅
     ├── test_rag_post_processor.py      # citations + groundedness score (mocked) ✅
     ├── test_rag_query_rewriter.py      # passthrough + LLM rewrite (mocked) ✅
     ├── test_rag_orchestrator.py        # full RAG flow + guardrail + tracer integration (mocked) ✅
     ├── test_guardrails.py              # input/output guardrails + classifier (61 tests) ✅
+    ├── test_api_nim_guardrails.py      # NIM guardrails + 3-tier fallback + factory (50 tests, mocked) ✅
     ├── test_eval.py                    # golden dataset + threshold gate + CSV (25 tests) ✅
     ├── test_observability.py           # CircuitBreaker, MetricsCollector, LangfuseTracer, warm-up (67 tests) ✅
     ├── test_api_cache.py               # LRU response cache (normalization, eviction, stats) ✅

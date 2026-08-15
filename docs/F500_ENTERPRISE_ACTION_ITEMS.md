@@ -234,6 +234,11 @@ F500 deployments of a third-party hosted LLM provider require:
 
 NVIDIA NIM is documented as an **optional cloud provider for comparison testing only** (`docs/NVIDIA_NIM_FREE_MODELS.md` Section 13), kept behind a config flag, with Ollama remaining the default for local development. No code integration has been promoted to the production generation/guardrail path. The doc itself states: "Free APIs from large vendors are fine for prototyping but unreliable for production. The proof is in the SLO."
 
+Code landed so far (both behind `NIM_ENABLED`, default off):
+
+- **Phase 1 (generator):** `rag/nim_generator.py` — `NIMGenerator` + `FallbackGenerator` + `build_generator()`. NIM → Ollama → refusal, with a dedicated NIM circuit breaker.
+- **Phase 2 (guardrails):** `api/nim_guardrails.py` — `NIMGuardrailClient` + `NIMInputGuardrail` + `NIMOutputGuardrail` + `NIMQueryClassifier` + `build_guardrail_suite()`. 3-tier fallback: NIM nemoguard → Ollama judge → regex/keyword. All three NIM guardrails share one client + one dedicated circuit breaker. The hosted PII model (`nvidia/gliner-pii`) is **deferred** — uncertain availability (plan §8 "check provider" list) + chicken-and-egg data-egress problem + item 5 is a blocker; the regex `scrub_pii` (inherited, always-on) remains the PII tier.
+
 ### Reasoning for the workaround
 
 - This is a **local, $0-cost, single-user practice project** (per README + architecture doc deviations D1/D2).
