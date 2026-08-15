@@ -97,7 +97,7 @@ practice-rag/
 │   ├── context_assembler.py           # Format chunks into system-prompt CONTEXT block ✅
 │   ├── generator.py                   # Ollama llama3.2:3b streaming (target: llama3.1:8b) ✅
 │   ├── post_processor.py              # Citation extraction + groundedness score ✅
-│   └── orchestrator.py                # Ties rewrite→retrieve→assemble→generate→post-process ✅
+│   └── orchestrator.py                # Ties rewrite→retrieve→assemble→generate→post-process + guardrails ✅
 ├── api/                               # FastAPI serving layer (Step 4) ✅
 │   ├── __init__.py
 │   ├── main.py                        # app + middleware (CORS, structlog, Langfuse optional) ✅
@@ -111,7 +111,7 @@ practice-rag/
 │   │   ├── history.py                 # GET  /api/v1/history/{session_id} ✅
 │   │   ├── ingest.py                  # POST /api/v1/ingest ✅
 │   │   └── health.py                  # GET  /api/v1/health (compose healthcheck) ✅
-│   └── guardrails.py                  # Regex + local LLM judge (Step 6)
+│   └── guardrails.py                  # Input/output guardrails + query classifier (Step 6) ✅
 ├── frontend/                          # React + Vite chat widget (Step 5) ✅
 │   ├── package.json                   # Vite + React 18 + Jest + RTL ✅
 │   ├── vite.config.js                 # Dev server proxies /api → :8000 ✅
@@ -136,9 +136,9 @@ practice-rag/
 │       ├── InputBox.test.jsx          # Input, Enter/Shift+Enter, disabled (7 tests) ✅
 │       ├── ChatWidget.test.jsx        # Streaming, citations, feedback, session (10 tests) ✅
 │       └── ErrorBoundary.test.jsx     # Catch + recovery (3 tests) ✅
-├── eval/                              # Offline Ragas eval (Step 6)
-│   ├── golden-dataset.json            # 30–50 hand-curated Q&A pairs
-│   └── run_eval.py                    # Local llama3.1:8b judge, threshold gate
+├── eval/                              # Offline Ragas eval (Step 6) ✅
+│   ├── golden-dataset.json            # 36 hand-curated Q&A pairs (7 corpus docs)
+│   └── run_eval.py                    # Ragas + local judge fallback, threshold gate ✅
 ├── data/
 │   └── corpus/                        # Seed corpus: 7 MD files (FastAPI/Pydantic/SQLModel) ✅
 └── tests/                             # pytest backend tests
@@ -156,8 +156,9 @@ practice-rag/
     ├── test_rag_generator.py           # Ollama streaming + system prompt (mocked) ✅
     ├── test_rag_post_processor.py      # citations + groundedness score (mocked) ✅
     ├── test_rag_query_rewriter.py      # passthrough + LLM rewrite (mocked) ✅
-    ├── test_rag_orchestrator.py        # full RAG flow (mocked collaborators) ✅
-    ├── test_guardrails.py
+    ├── test_rag_orchestrator.py        # full RAG flow + guardrail integration (mocked) ✅
+    ├── test_guardrails.py              # input/output guardrails + classifier (61 tests) ✅
+    ├── test_eval.py                    # golden dataset + threshold gate + CSV (25 tests) ✅
     ├── test_api_cache.py               # LRU response cache (normalization, eviction, stats) ✅
     ├── test_api_conversation.py        # SQLite session store + history window + feedback ✅
     ├── test_api_health.py              # GET /api/v1/health ✅
@@ -229,7 +230,7 @@ The calendar phases (one weekend) are reordered below into the actual build grap
 | **3** | `rag/` orchestrator as plain Python (unit-testable) ✅       | Step 2     | Phase 3 — Core RAG               |
 | **4** | `api/` FastAPI layer (`/health` before `/chat`) ✅           | Step 3     | Phase 3 — Core RAG               |
 | **5** | `frontend/` React + SSE consumer ✅                          | Step 4     | Phase 4 — Frontend               |
-| **6** | `guardrails` + `eval/` golden dataset + Ragas gate           | Step 4     | Phase 5 — Guardrails & Eval      |
+| **6** | `guardrails` + `eval/` golden dataset + Ragas gate ✅        | Step 4     | Phase 5 — Guardrails & Eval      |
 | **7** | Langfuse traces + resilience + optional cloud showcase       | Steps 3–6  | Phase 6 — Monitoring & Hardening |
 
 > **Rule of thumb:** never mock something you haven't built yet. Follow the order left-to-right.
@@ -429,8 +430,20 @@ Acts as a **regression gate** before merge. Fails the commit if quality drops.
 
 ```bash
 conda activate rag-chat
+# Full eval (36 questions, ~5–10 min with local Ollama)
 python eval/run_eval.py --threshold-faithfulness 0.75 --threshold-recall 0.70
+
+# Quick smoke (first 5 questions)
+python eval/run_eval.py --limit 5
+
+# Force local LLM judge (skip Ragas)
+python eval/run_eval.py --no-ragas
 ```
+
+> **Ragas fallback:** if the `ragas` package can't import (version mismatch
+> with `langchain_community`), the script falls back to a lightweight local
+> LLM judge that scores each metric 0–1 with simple Ollama prompts. The
+> fallback is less rigorous than Ragas but provides a working regression gate.
 
 ### Pre-commit checklist
 

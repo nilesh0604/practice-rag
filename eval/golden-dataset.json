@@ -1,0 +1,229 @@
+{
+  "description": "Golden Q&A dataset for the practice-rag RAG eval (Step 6). 35 hand-curated question/answer/context triples over the FastAPI + Pydantic v2 + SQLModel seed corpus. Used by eval/run_eval.py with Ragas to measure faithfulness, answer relevancy, and context recall against thresholds (faithfulness >= 0.75, context_recall >= 0.70).",
+  "version": "1.0",
+  "created": "2026-08-14",
+  "corpus": "data/corpus (7 Markdown files: FastAPI path-params/query-params/dependency-injection, Pydantic models/types, SQLModel intro/relationships)",
+  "thresholds": {
+    "faithfulness": 0.75,
+    "context_recall": 0.70,
+    "answer_relevancy": 0.70
+  },
+  "examples": [
+    {
+      "question": "How do I declare path parameters in FastAPI?",
+      "ground_truth": "You declare path parameters in FastAPI using Python format strings (the same syntax as str.format) in the route path, and the path parameter is passed to the function as an argument. FastAPI validates and converts the path parameter to the declared type. For example, @app.get(\"/items/{item_id}\") with async def read_item(item_id) passes the URL segment as item_id.",
+      "ground_truth_context": "You can declare path parameters in FastAPI using Python format strings (the same syntax used by `str.format`). FastAPI validates and converts the path parameter to the declared type.",
+      "source_title": "Path Parameters - FastAPI"
+    },
+    {
+      "question": "How do I add type validation to a FastAPI path parameter?",
+      "ground_truth": "You declare the type of a path parameter using Python type hints. FastAPI uses the type to parse and validate the value. For example, async def read_item(item_id: int) validates item_id as an integer; a request to /items/abc returns a 422 error because abc cannot be converted to int.",
+      "ground_truth_context": "You can declare the type of a path parameter using Python type hints. FastAPI uses the type to parse and validate the value. Now `item_id` is validated as an integer. A request to `/items/3` returns `{\"item_id\": 3}` (a JSON number, not a string). A request to `/items/abc` returns a 422 error because `abc` cannot be converted to `int`.",
+      "source_title": "Path Parameters - FastAPI"
+    },
+    {
+      "question": "Why does route declaration order matter for path parameters in FastAPI?",
+      "ground_truth": "When two paths could overlap, the order of route declaration matters. For example, /users/me must be declared before /users/{user_id}, otherwise /users/me would match the parameterized path and user_id would be \"me\".",
+      "ground_truth_context": "When you define two paths that could overlap, the order of route declaration matters. The `/users/me` route must be declared **before** `/users/{user_id}`, otherwise `/users/me` would match the parameterized path and `user_id` would be `\"me\"`.",
+      "source_title": "Path Parameters - FastAPI"
+    },
+    {
+      "question": "How do I restrict a FastAPI path parameter to a fixed set of values?",
+      "ground_truth": "Use a standard enum.Enum for the path parameter type. FastAPI validates that the incoming path value is one of the enum members and returns a 422 otherwise. For example, class ModelName(str, Enum) with members alexnet, resnet, lenet, then async def get_model(model_name: ModelName).",
+      "ground_truth_context": "If you have a path parameter that should only accept a fixed set of values, use a standard `enum.Enum`. FastAPI validates that the incoming path value is one of the enum members and returns a 422 otherwise. Inside the function you can compare against enum members directly.",
+      "source_title": "Path Parameters - FastAPI"
+    },
+    {
+      "question": "How do I add min/max validation to a FastAPI path parameter?",
+      "ground_truth": "Use Path from fastapi to constrain path parameters. For example, item_id: int = Path(ge=1, le=1000) restricts item_id to integers between 1 and 1000 inclusive. Path parameters always have a value (they come from the URL), so you cannot declare them optional, but you can constrain them with Path.",
+      "ground_truth_context": "For finer control over path parameters (minimum/maximum length, regex patterns), use `Path` from `fastapi`. This restricts `item_id` to integers between 1 and 1000 inclusive. Path parameters always have a value (they come from the URL), so you cannot declare them optional — but you can constrain them with `Path`.",
+      "source_title": "Path Parameters - FastAPI"
+    },
+    {
+      "question": "How do I declare query parameters in FastAPI?",
+      "ground_truth": "You declare query parameters by adding them to your path operation function as default parameters that are not part of the path. FastAPI automatically parses them from the URL query string. For example, async def read_items(skip: int = 0, limit: int = 10) parses skip and limit from the URL after the ? character.",
+      "ground_truth_context": "You can declare query parameters in FastAPI by adding them to your path operation function as default parameters. FastAPI automatically parses them from the URL query string. When you declare parameters that are not part of the path, FastAPI interprets them as query parameters.",
+      "source_title": "Query Parameters - FastAPI"
+    },
+    {
+      "question": "How do I make a FastAPI query parameter optional?",
+      "ground_truth": "Give the query parameter a default value of None. For example, q: Union[str, None] = None or q: str | None = None in Python 3.10+. FastAPI treats parameters with a default of None as optional query parameters.",
+      "ground_truth_context": "You can declare optional query parameters by giving them a default value of `None`. In Python 3.10+ you can use `str | None` instead of `Union[str, None]`.",
+      "source_title": "Query Parameters - FastAPI"
+    },
+    {
+      "question": "How does FastAPI convert boolean query parameters?",
+      "ground_truth": "When you declare a parameter with a bool type, FastAPI converts common truthy/falsy string values. The values True, true, 1, yes, on are converted to True. The values False, false, 0, no, off are converted to False.",
+      "ground_truth_context": "When you declare a parameter with a `bool` type, FastAPI converts common truthy/falsy string values. The values `True`, `true`, `1`, `yes`, `on` are converted to `True`. The values `False`, `false`, `0`, `no`, `off` are converted to `False`.",
+      "source_title": "Query Parameters - FastAPI"
+    },
+    {
+      "question": "How do I make a FastAPI query parameter required?",
+      "ground_truth": "Declare the parameter without a default value. If the client does not provide it, FastAPI returns a 422 Unprocessable Entity error with a clear validation message. You can mix required and optional parameters in the same function; the order does not matter — FastAPI determines required vs optional by the presence of a default value.",
+      "ground_truth_context": "When a parameter is declared without a default value, it becomes required. If the client does not provide it, FastAPI returns a 422 Unprocessable Entity error with a clear validation message. The order does not matter — FastAPI determines required vs optional by the presence of a default value, not by parameter ordering.",
+      "source_title": "Query Parameters - FastAPI"
+    },
+    {
+      "question": "Can I mix path and query parameters in the same FastAPI function?",
+      "ground_truth": "Yes. You can mix path and query parameters in the same function. FastAPI knows which is which by matching the function parameters to the path template. Parameters that match path placeholders are path parameters; the rest are query parameters.",
+      "ground_truth_context": "You can mix path and query parameters in the same function. FastAPI knows which is which by matching the function parameters to the path template.",
+      "source_title": "Query Parameters - FastAPI"
+    },
+    {
+      "question": "What is dependency injection in FastAPI?",
+      "ground_truth": "FastAPI includes an extremely easy-to-use but powerful dependency injection system. You define dependencies as functions (or classes) and declare them in path operation functions using the Depends function. FastAPI resolves the dependency graph, calls the dependencies, and injects their return values into your endpoint.",
+      "ground_truth_context": "FastAPI includes an extremely easy-to-use but powerful Dependency Injection system. Define a dependency as a function, then declare it in your path operation function with Depends. FastAPI calls the dependency before your endpoint and injects the return value.",
+      "source_title": "Dependency Injection - FastAPI"
+    },
+    {
+      "question": "How do I use Depends in FastAPI?",
+      "ground_truth": "Import Depends from fastapi, define a dependency function, and declare it as a parameter default using Depends(dependency_func). FastAPI calls the dependency before your endpoint and injects the return value as the parameter value.",
+      "ground_truth_context": "Import Depends from fastapi, define a dependency function, and declare it as a parameter default using Depends(dependency_func). FastAPI calls the dependency before your endpoint and injects the return value as the parameter value.",
+      "source_title": "Dependency Injection - FastAPI"
+    },
+    {
+      "question": "Can FastAPI dependencies have sub-dependencies?",
+      "ground_truth": "Yes. FastAPI dependencies can themselves depend on other dependencies. FastAPI resolves the full dependency graph, calling each dependency in order and injecting results, so you can build hierarchical dependency trees.",
+      "ground_truth_context": "FastAPI dependencies can themselves depend on other dependencies. FastAPI resolves the full dependency graph, calling each dependency in order and injecting results, so you can build hierarchical dependency trees.",
+      "source_title": "Dependency Injection - FastAPI"
+    },
+    {
+      "question": "How do I share a database session across FastAPI endpoints using dependencies?",
+      "ground_truth": "Define a dependency function that yields a database session (using yield) and declare it in each endpoint with Depends. FastAPI creates the session before the endpoint runs and closes it after the endpoint returns, so each request gets a fresh session without duplicating setup code.",
+      "ground_truth_context": "Define a dependency function that yields a database session (using yield) and declare it in each endpoint with Depends. FastAPI creates the session before the endpoint runs and closes it after the endpoint returns, so each request gets a fresh session without duplicating setup code.",
+      "source_title": "Dependency Injection - FastAPI"
+    },
+    {
+      "question": "What is a Pydantic model?",
+      "ground_truth": "A Pydantic model is a class that inherits from BaseModel and declares fields as annotated attributes. Pydantic validates the input data at instantiation time and converts it to the declared types. Fields without a default value are required; fields with a default value are optional.",
+      "ground_truth_context": "Pydantic models are the core of the library. A model is a class that inherits from `BaseModel` and declares fields as annotated attributes. Pydantic validates the input data at instantiation time and converts it to the declared types. Fields without a default value are **required**. Fields with a default value are optional.",
+      "source_title": "Models - Pydantic v2"
+    },
+    {
+      "question": "What is the difference between BaseModel and BaseSettings in Pydantic?",
+      "ground_truth": "BaseModel is for data validation and serialization, with data coming from constructor arguments (API request bodies, database rows). BaseSettings (available via pydantic-settings) is for configuration management — it reads values from environment variables, .env files, and secrets, with the same validation logic as BaseModel.",
+      "ground_truth_context": "`BaseModel` is for data validation and serialization. `BaseSettings` (available via `pydantic-settings`) is for configuration management — it reads values from environment variables, `.env` files, and secrets, with the same validation logic as `BaseModel`. Use `BaseModel` when the data comes from an API request body or a database row. Use `BaseSettings` when the data comes from the environment.",
+      "source_title": "Models - Pydantic v2"
+    },
+    {
+      "question": "How do I add constraints to a Pydantic field?",
+      "ground_truth": "Use Field to add constraints and metadata. For example, name: str = Field(min_length=1, max_length=100) or price: float = Field(gt=0, description=\"The price must be positive\"). For custom validation logic, use @field_validator on the field.",
+      "ground_truth_context": "Use `Field` to add constraints and metadata. For custom validation logic, use `@field_validator`.",
+      "source_title": "Models - Pydantic v2"
+    },
+    {
+      "question": "How do I write a custom field validator in Pydantic v2?",
+      "ground_truth": "Use the @field_validator decorator on a classmethod. For example, @field_validator(\"username\") @classmethod def username_alphanumeric(cls, v: str) -> str: checks if v.isalnum() and raises ValueError if not. The validator runs when the field is assigned.",
+      "ground_truth_context": "For custom validation logic, use `@field_validator`: @field_validator(\"username\") @classmethod def username_alphanumeric(cls, v: str) -> str: if not v.isalnum(): raise ValueError(\"must be alphanumeric\") return v",
+      "source_title": "Models - Pydantic v2"
+    },
+    {
+      "question": "How do I configure a Pydantic model to reject unknown fields?",
+      "ground_truth": "Set extra=\"forbid\" in the model_config ConfigDict. For example, model_config = ConfigDict(extra=\"forbid\", str_strip_whitespace=True, frozen=True). Other common options include frozen, str_strip_whitespace, populate_by_name, and use_enum_values.",
+      "ground_truth_context": "Model behavior is configured via the `model_config` attribute, which accepts a `ConfigDict`. Common options: `extra` (`\"allow\"`, `\"ignore\"`, `\"forbid\"`), `frozen`, `str_strip_whitespace`, `populate_by_name`, `use_enum_values`.",
+      "source_title": "Models - Pydantic v2"
+    },
+    {
+      "question": "How do I serialize a Pydantic model to a dict or JSON?",
+      "ground_truth": "Pydantic v2 uses model_dump() (replaces v1's .dict()) to serialize to a dict and model_dump_json() (replaces v1's .json()) to serialize to a JSON string. You can exclude fields with model_dump(exclude={\"name\"}).",
+      "ground_truth_context": "Pydantic v2 uses `model_dump()` (replaces v1's `.dict()`) and `model_dump_json()` (replaces v1's `.json()`). user.model_dump() returns a dict; user.model_dump_json() returns a JSON string; user.model_dump(exclude={\"name\"}) returns a dict without 'name'.",
+      "source_title": "Models - Pydantic v2"
+    },
+    {
+      "question": "Can Pydantic models be nested?",
+      "ground_truth": "Yes. A field's type can be another BaseModel. Pydantic recursively validates nested models, so passing a dict for a nested field automatically constructs the nested model instance. For example, a UserWithAddress model with an address: Address field accepts a dict for address.",
+      "ground_truth_context": "Models can be nested — a field's type can be another `BaseModel`. Pydantic recursively validates nested models, so passing a dict for `address` automatically constructs the `Address` instance.",
+      "source_title": "Models - Pydantic v2"
+    },
+    {
+      "question": "What types does Pydantic support out of the box?",
+      "ground_truth": "Pydantic supports common Python types directly: int, float, str, bool, bytes, list[int], dict[str, int], and more. When a value is assigned to a field, Pydantic attempts to coerce it to the declared type. If coercion fails, a ValidationError is raised.",
+      "ground_truth_context": "Pydantic supports a wide range of types out of the box. When a value is assigned to a field, Pydantic attempts to coerce it to the declared type. If coercion fails, a `ValidationError` is raised. Pydantic validates common Python types directly: int, float, str, bool, bytes, list[int], dict[str, int].",
+      "source_title": "Types - Pydantic v2"
+    },
+    {
+      "question": "How do I declare an optional field in Pydantic?",
+      "ground_truth": "Use Optional or Union for fields that accept multiple types or None. For example, desc: Optional[str] = None declares a str or None field with default None. In Python 3.10+ you can use the | syntax: desc: str | None = None.",
+      "ground_truth_context": "Use `Optional` or `Union` for fields that accept multiple types or `None`. In Python 3.10+ you can use the `|` syntax: desc: str | None = None.",
+      "source_title": "Types - Pydantic v2"
+    },
+    {
+      "question": "What is strict mode in Pydantic?",
+      "ground_truth": "By default Pydantic coerces types (e.g. \"1\" becomes 1 for an int field). In strict mode, only exact type matches are accepted. Enable it with model_config = ConfigDict(strict=True), or per-field using StrictInt, StrictStr, etc. from pydantic.types. In strict mode, StrictModel(x=\"1\") raises a ValidationError.",
+      "ground_truth_context": "By default Pydantic coerces types (e.g. `\"1\"` → `1` for an `int` field). In strict mode, only exact type matches are accepted. You can also enable strict mode per-field using `StrictInt`, `StrictStr`, etc. from `pydantic.types`.",
+      "source_title": "Types - Pydantic v2"
+    },
+    {
+      "question": "How do I use constrained types with Annotated in Pydantic?",
+      "ground_truth": "Use Annotated with Field constraints for fine-grained control. For example, PositiveInt = Annotated[int, Field(gt=0)] and ShortStr = Annotated[str, Field(max_length=10)]. You can then use these aliases as field types in your models.",
+      "ground_truth_context": "Use `Annotated` with `Field` constraints for fine-grained control. PositiveInt = Annotated[int, Field(gt=0)]; ShortStr = Annotated[str, Field(max_length=10)].",
+      "source_title": "Types - Pydantic v2"
+    },
+    {
+      "question": "How does Pydantic handle URL and email types?",
+      "ground_truth": "Pydantic provides specialized string types: HttpUrl parses the URL into a structured object with .scheme, .host, .path, etc. EmailStr validates email addresses and requires the email-validator package. For example, website: HttpUrl and email: EmailStr in a Profile model.",
+      "ground_truth_context": "Pydantic provides specialized string types for common formats. `HttpUrl` parses the URL into a structured object with `.scheme`, `.host`, `.path`, etc. `EmailStr` requires the `email-validator` package.",
+      "source_title": "Types - Pydantic v2"
+    },
+    {
+      "question": "How does Pydantic handle datetime types?",
+      "ground_truth": "Pydantic handles datetime, date, time, and timedelta. It parses ISO 8601 strings and Unix timestamps. Naive datetimes are left naive; aware datetimes keep their timezone. To normalize everything to UTC, use a @field_validator.",
+      "ground_truth_context": "Pydantic handles `datetime`, `date`, `time`, and `timedelta`. It parses ISO 8601 strings and Unix timestamps. Naive datetimes are left naive; aware datetimes keep their timezone. To normalize everything to UTC, use a `@field_validator`.",
+      "source_title": "Types - Pydantic v2"
+    },
+    {
+      "question": "What is SQLModel?",
+      "ground_truth": "SQLModel is a library for interacting with SQL databases from Python code with Python objects. It is built on top of Pydantic and SQLAlchemy, combining Pydantic's validation and serialization with SQLAlchemy's ORM power. You define a single class that serves as both a Pydantic model and a SQLAlchemy table using table=True.",
+      "ground_truth_context": "SQLModel is a library for interacting with SQL databases from Python code, with Python objects. SQLModel is built on top of **Pydantic** and **SQLAlchemy**. It combines the validation and serialization of Pydantic with the ORM power of SQLAlchemy, so you define a single class that serves as both a Pydantic model and a SQLAlchemy table.",
+      "source_title": "Introduction to SQLModel"
+    },
+    {
+      "question": "What is the difference between SQLModel and SQLAlchemy?",
+      "ground_truth": "SQLAlchemy is a full-featured SQL toolkit and ORM. SQLModel is a thin wrapper that uses Pydantic for validation and serialization (so API models and database models can share the same class), uses SQLAlchemy's engine and session under the hood, and simplifies the most common CRUD patterns. SQLModel has a gentler learning curve but covers common patterns; SQLAlchemy offers full flexibility.",
+      "ground_truth_context": "SQLAlchemy is a full-featured SQL toolkit and ORM. SQLModel is a thin wrapper that uses Pydantic for validation and serialization, uses SQLAlchemy's engine and session under the hood, and simplifies the most common CRUD patterns. If you need advanced SQLAlchemy features, you can drop down to SQLAlchemy directly — SQLModel does not hide it.",
+      "source_title": "Introduction to SQLModel"
+    },
+    {
+      "question": "How do I create a database table with SQLModel?",
+      "ground_truth": "Define a class inheriting from SQLModel with table=True, then call SQLModel.metadata.create_all(engine) after creating the engine with create_engine. The table=True argument tells SQLModel the class is a database table. For production, use Alembic migrations instead of create_all.",
+      "ground_truth_context": "The `table=True` argument tells SQLModel that this class is a database table. engine = create_engine(\"sqlite:///database.db\"); SQLModel.metadata.create_all(engine). This creates all tables defined by your `SQLModel` subclasses. For production, use Alembic migrations instead of `create_all`.",
+      "source_title": "Introduction to SQLModel"
+    },
+    {
+      "question": "How do I read and write records with SQLModel?",
+      "ground_truth": "Use a Session context manager. To write: create an instance, session.add(it), session.commit(), session.refresh(it) to get the auto-generated primary key. To read: use select(Model).where(...) with session.exec(statement) and call .first() on the results.",
+      "ground_truth_context": "with Session(engine) as session: hero = Hero(name=\"Deadpond\", secret_name=\"Dive Wilson\"); session.add(hero); session.commit(); session.refresh(hero). statement = select(Hero).where(Hero.name == \"Deadpond\"); results = session.exec(statement); db_hero = results.first().",
+      "source_title": "Introduction to SQLModel"
+    },
+    {
+      "question": "How do I separate API schemas from database models in SQLModel?",
+      "ground_truth": "Define a base model without table=True for API schemas, and a table model that inherits from it with table=True. Then create HeroCreate and HeroRead models inheriting from the base for input/output schemas. This keeps API input/output schemas separate from the persistence model while avoiding field duplication.",
+      "ground_truth_context": "A common pattern is to define a base model without `table=True` for API schemas, and a table model that inherits from it. This keeps API input/output schemas separate from the persistence model while avoiding field duplication.",
+      "source_title": "Introduction to SQLModel"
+    },
+    {
+      "question": "How do I define a one-to-many relationship in SQLModel?",
+      "ground_truth": "Use Relationship on the parent and ForeignKey on the child. For example, a Team model has heroes: List[\"Hero\"] = Relationship(back_populates=\"team\"), and the Hero model has team_id: Optional[int] = Field(default=None, foreign_key=\"team.id\") and team: Optional[\"Team\"] = Relationship(back_populates=\"heroes\"). The back_populates links the two Python attributes.",
+      "ground_truth_context": "A one-to-many relationship is defined with `Relationship` on the parent and `ForeignKey` on the child. `foreign_key=\"team.id\"` creates the SQL foreign key column. `Relationship(back_populates=...)` links the two Python attributes so accessing `team.heroes` loads the related heroes and `hero.team` loads the parent team.",
+      "source_title": "Relationships - SQLModel"
+    },
+    {
+      "question": "How does SQLModel load related objects?",
+      "ground_truth": "Related objects are loaded lazily by default — they are fetched from the database only when you access the attribute, and only within an active session. If you access the attribute after the session is closed, SQLAlchemy raises DetachedInstanceError. To avoid this, eagerly load relationships with selectinload: select(Team).options(selectinload(Team.heroes)).",
+      "ground_truth_context": "Related objects are loaded lazily by default — they are fetched from the database only when you access the attribute, and only within an active session. If you access `team.heroes` after the session is closed, SQLAlchemy raises `DetachedInstanceError`. To avoid this, eagerly load relationships with `selectinload`.",
+      "source_title": "Relationships - SQLModel"
+    },
+    {
+      "question": "How do I define a many-to-many relationship in SQLModel?",
+      "ground_truth": "Many-to-many requires a link table. Define it as a SQLModel with table=True and two foreign keys (both as primary key). Then use Relationship with link_model=HeroTeamLink on both sides. The link_model argument tells SQLModel to use the link table for the association, and the link table's primary key is the composite of both foreign keys.",
+      "ground_truth_context": "Many-to-many requires a link table. Define it as a `SQLModel` with `table=True` and two foreign keys. The `link_model` argument tells SQLModel to use the link table for the association. The link table's primary key is the composite of both foreign keys.",
+      "source_title": "Relationships - SQLModel"
+    },
+    {
+      "question": "How do I set up cascade deletes in SQLModel?",
+      "ground_truth": "Set ondelete on the foreign key and configure the relationship cascade. On the child, use foreign_key=\"team.id\" with ondelete=\"CASCADE\". On the parent, use Relationship(back_populates=\"team\", sa_relationship_kwargs={\"cascade\": \"all, delete-orphan\"}). Deleting the parent via session.delete(team) will then also delete all its children in the same transaction.",
+      "ground_truth_context": "To delete a parent and its children automatically, set `ondelete` on the foreign key and configure the relationship cascade. Deleting the team via `session.delete(team)` will now also delete all its heroes in the same transaction.",
+      "source_title": "Relationships - SQLModel"
+    }
+  ]
+}

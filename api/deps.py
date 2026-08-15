@@ -22,6 +22,7 @@ from qdrant_client import QdrantClient
 
 from api.cache import DEFAULT_MAX_SIZE, LRUCache
 from api.conversation import DEFAULT_DB_PATH, ConversationStore
+from api.guardrails import GuardrailSuite, InputGuardrail, OutputGuardrail, QueryClassifier
 from rag.context_assembler import ContextAssembler
 from rag.generator import Generator
 from rag.orchestrator import RAGOrchestrator
@@ -67,6 +68,21 @@ def get_orchestrator() -> RAGOrchestrator:
         ContextAssembler(),
         Generator(),
         PostProcessor(get_embedder()),
+        guardrail_suite=get_guardrail_suite(),
+    )
+
+
+@lru_cache
+def get_guardrail_suite() -> GuardrailSuite:
+    """Process-wide guardrail suite (Step 6).
+
+    LLM-backed checks are enabled by default; they degrade to regex/keyword
+    fallbacks if Ollama is unreachable (see ``api/guardrails.py``).
+    """
+    return GuardrailSuite(
+        input_guardrail=InputGuardrail(),
+        output_guardrail=OutputGuardrail(),
+        classifier=QueryClassifier(),
     )
 
 
