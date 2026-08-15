@@ -471,7 +471,22 @@ def build_orchestrator(ollama_url: str = DEFAULT_OLLAMA_URL):
     This is the production wiring — the eval script needs the real
     pipeline (not mocks) to measure actual RAG quality. Uses the same
     dependency wiring as ``api/deps.py``.
+
+    When ``NIM_ENABLED=true`` is set in the environment, delegates to
+    ``api.deps.get_orchestrator()`` so the NIM generator, guardrails, and
+    reranker (Phase 1/2/4) are exercised through the same config-flag
+    wiring as the live app. This enables the Phase 4 A/B comparison
+    (reranker on vs off) by running the script twice with different
+    ``NIM_RERANK_ENABLED`` values. When NIM is disabled (default), the
+    plain Ollama-only orchestrator is constructed directly (unchanged).
     """
+    nim_enabled = os.getenv("NIM_ENABLED", "").strip().lower() in ("true", "1", "yes")
+    if nim_enabled:
+        from api.deps import get_orchestrator
+
+        logger.info("NIM_ENABLED=true — using api.deps.get_orchestrator() wiring")
+        return get_orchestrator()
+
     from api.guardrails import GuardrailSuite
     from rag.context_assembler import ContextAssembler
     from rag.generator import Generator
@@ -575,20 +590,32 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     # Mark per-question pass/fail.
-    thresholds = {
-        "faithfulness": args.threshold_faithfulness,
-        "recall": args.threshold_recall,
-        "relevancy": args.threshold_relevancy,
-    }
-    mark_passes(results, **thresholds)
+    mark_passes(
+        results,
+        threshold_faithfulness=args.threshold_faithfulness,
+        threshold_recall=args.threshold_recall,
+        threshold_relevancy=args.threshold_relevancy,
+    )
 
     # Aggregate + gate check.
     summary = aggregate(results)
-    check_gate(summary, **thresholds)
+    check_gate(
+        summary,
+        threshold_faithfulness=args.threshold_faithfulness,
+        threshold_recall=args.threshold_recall,
+        threshold_relevancy=args.threshold_relevancy,
+    )
 
     # Write CSV + print summary.
     write_csv(results, args.output)
-    print_summary(summary, thresholds)
+    print_summary(
+        summary,
+        {
+            "faithfulness": args.threshold_faithfulness,
+            "recall": args.threshold_recall,
+            "relevancy": args.threshold_relevancy,
+        },
+    )
 
     # Exit code: 0 if gate passed, 1 if failed.
     return 0 if summary.gate_passed else 1

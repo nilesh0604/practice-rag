@@ -443,6 +443,12 @@ the production generation/guardrail path until all 10 gaps are closed.
   side-by-side review (no automated SLO yet — that is F500 item #2).
   This is a **manual step** requiring a live `NVIDIA_API_KEY` + Ollama
   running; not automatable in CI at the practice stage.
+  **Partial progress (2026-08-15):** `eval/run_eval.py` now delegates to
+  `api.deps.get_orchestrator()` when `NIM_ENABLED=true`, so the NIM
+  generator is exercised in the Ragas/local-judge eval. Phase 4 A/B
+  (reranker on vs off) was run with results in `CHANGELOG.md`. A direct
+  Ollama-vs-NIM generator side-by-side (same questions, both backends)
+  remains future work — the current eval runs one backend per invocation.
 
 ### Phase 2 — Guardrail comparison test ✅ (code landed)
 
@@ -478,11 +484,15 @@ the production generation/guardrail path until all 10 gaps are closed.
   upstream of hosted models as a blocker. The regex `scrub_pii` (inherited,
   always-on) remains the PII tier. The hosted PII refinement is deferred to
   a sub-phase after availability is probed.
-- ⬜ Run a comparison eval: same queries, Ollama-judge vs. NIM-judge
+- ✅ Run a comparison eval: same queries, Ollama-judge vs. NIM-judge
   verdicts, side-by-side FPR/FNR review (no automated SLO yet — that is
   F500 item #2). This is a **manual step** requiring a live
   `NVIDIA_API_KEY` + Ollama running; not automatable in CI at the practice
   stage.
+  **Done (2026-08-15):** `eval/run_guardrail_eval.py --both` ran 42
+  examples × 2 backends. Ollama PASSED (FPR/FNR ≤ 0.10); NIM FAILED
+  (input FNR=0.182, topic-control FPR=0.182). See `CHANGELOG.md` +
+  `eval/guardrail_report.csv`.
 - **Do not** enable NIM guardrails on any corpus with real PII until
   F500 item #5 (PII scrubbing upstream) is closed.
 
@@ -531,9 +541,14 @@ the production generation/guardrail path until all 10 gaps are closed.
   `run_nim_ingestion` (refuses without `NIM_ENABLED`, runs with it, passes
   `collection_config` + injected embedder/index_writer, `full_reindex`
   passthrough, custom embedder passthrough).
-- ⬜ Run retrieval recall@5 comparison: Ollama collection vs. NIM collection.
+- ✅ Run retrieval recall@5 comparison: Ollama collection vs. NIM collection.
   This is a **manual step** requiring a live `NVIDIA_API_KEY` + Ollama +
   Qdrant running; not automatable in CI at the practice stage.
+  **Done (2026-08-15):** NIM collection ingested (7 files, 45 chunks).
+  `eval/run_retrieval_eval.py` ran 36 questions × 2 collections.
+  Ollama recall@5=1.000, NIM recall@5=1.000, Δ=+0.000. Both achieve
+  perfect recall on this corpus; NIM is 2.5× slower per query (hosted
+  round-trip). See `CHANGELOG.md` + `eval/retrieval_report.csv`.
 - **Do not** swap the live app's default collection until a re-ingestion
   - eval gate (F500 item #8, action item #4) is in place.
 
@@ -591,9 +606,15 @@ the production generation/guardrail path until all 10 gaps are closed.
   integration (reranker called with rewritten query + retrieved docs,
   reranked docs passed to assembler + post-processor, skipped when None,
   `answer` method too, rerank span traced).
-- ⬜ Measure answer-quality uplift (faithfulness, relevance) with vs. without
+- ✅ Measure answer-quality uplift (faithfulness, relevance) with vs. without
   reranking. This is a **manual step** requiring a live `NVIDIA_API_KEY` +
   Ollama + Qdrant running; not automatable in CI at the practice stage.
+  **Done (2026-08-15):** `eval/run_eval.py` run twice (NIM generator +
+  guardrails, reranker off vs on). Without: faith=0.800 rel=0.792
+  recall=0.722, 28/36 passed, 5.27s. With: faith=0.800 rel=0.803
+  recall=0.733, 30/36 passed, 6.43s. Uplift: +0.011 relevancy, +0.011
+  recall, +2 questions, +1.16s latency. See `CHANGELOG.md` +
+  `eval/eval_report_no_rerank.csv` + `eval/eval_report_with_rerank.csv`.
 - **Do not** enable NIM reranking on any corpus with real PII until
   F500 item #5 (PII scrubbing upstream) is closed — the reranker sees the
   query + retrieved chunk contents (data egress to NVIDIA).

@@ -51,6 +51,24 @@ A guardrail change ships with an **eval report** showing the precision/recall (o
 
 Unit tests with **mocked LLM responses** verify routing logic (`safe`/`unsafe`/`follow_up` labels). No real-model eval, no confusion matrix, no FPR/FNR SLO, no adversarial regression suite.
 
+**Partial progress (2026-08-15):** The adversarial eval set + runner now
+exist (`eval/guardrail-dataset.json` + `eval/run_guardrail_eval.py`) and
+have been **run live** against both the Ollama and NIM guardrail suites
+(42 examples × 2 backends). Results:
+
+- **Ollama backend PASSED** the FPR/FNR ≤ 0.10 gate on all three checks
+  (input FPR=0.032 FNR=0.091, output FPR=0.000 FNR=0.000, topic-control
+  FPR=0.045 FNR=0.000).
+- **NIM backend FAILED** the gate: input FNR=0.182 (missed 2 injections),
+  topic-control FPR=0.182 (over-rejected 4 borderline questions). The
+  NIM topic-control model also has a prompt-format parsing issue
+  (`'on-topic '` with trailing space → fallback to Ollama).
+- Report: `eval/guardrail_report.csv`.
+
+What remains: wiring the eval into CI as a **blocking** gate (currently
+manual), tightening the SLO to the enterprise target (FPR ≤ 2%, FNR ≤ 5%),
+and curating a larger red-team corpus.
+
 ### Reasoning for the workaround
 
 - Mocked tests are deterministic and fast (0.3s for the guardrail suite) — appropriate for TDD on the routing logic.
@@ -58,11 +76,12 @@ Unit tests with **mocked LLM responses** verify routing logic (`safe`/`unsafe`/`
 
 ### Future action item
 
-1. Build `eval/guardrail_eval_set.jsonl` — labeled examples: `{text, history, expected_label, expected_blocked}`.
-2. Add `eval/run_guardrail_eval.py` that runs the real model over the set and prints a confusion matrix + FPR/FNR.
-3. Set SLOs: **FPR ≤ 2%**, **FNR ≤ 5%**, **follow-up misroute rate ≤ 3%**.
+1. ~~Build `eval/guardrail_eval_set.jsonl` — labeled examples: `{text, history, expected_label, expected_blocked}`.~~ ✅ Done — `eval/guardrail-dataset.json` (42 examples, 5 categories).
+2. ~~Add `eval/run_guardrail_eval.py` that runs the real model over the set and prints a confusion matrix + FPR/FNR.~~ ✅ Done — runs Ollama + NIM backends, per-check P/R/F1/FPR/FNR + per-class P/R/F1.
+3. Set SLOs: **FPR ≤ 2%**, **FNR ≤ 5%**, **follow-up misroute rate ≤ 3%** (current gate is FPR/FNR ≤ 10% — looser than enterprise target).
 4. Wire the eval into CI as a **blocking gate** on guardrail-prompt/model changes.
 5. Curate a **red-team corpus** (DAN, indirect-injection-via-history, multi-turn jailbreak) and add it to the eval set.
+6. **Fix the NIM topic-control prompt-format parsing** (`'on-topic '` trailing-space issue) so the NIM classifier is evaluated on its own merits, not masked by fallback to Ollama.
 
 ---
 
@@ -255,7 +274,7 @@ Before promoting NIM (or any hosted LLM provider) to the production generation/g
 1. **SLA/SLO contract** — negotiate or select a provider tier with contractual uptime + p95 latency + error budget; define an alert on SLO burn.
 2. **DPA / data residency** — sign a DPA (and BAA if PII/PHI is in scope); enforce zero-retention where required; document data flow in the architecture doc.
 3. **Secrets manager** — move `NVIDIA_API_KEY` (and equivalents) to a secrets manager; rotate per IR4 policy; remove long-lived keys from client code and env files.
-4. **Model version pinning + eval gate** — pin model versions in IaC; add a regression eval (Ragas faithfulness, guardrail FPR/FNR, retrieval recall@5) as a **blocking CI gate** on any model/prompt change; record model version in trace metadata.
+4. **Model version pinning + eval gate** — pin model versions in IaC; add a regression eval (Ragas faithfulness, guardrail FPR/FNR, retrieval recall@5) as a **blocking CI gate** on any model/prompt change; record model version in trace metadata. **Partial progress (2026-08-15):** the eval artifacts now exist for all three — `eval/run_eval.py` (faithfulness), `eval/run_guardrail_eval.py` + `eval/guardrail-dataset.json` (guardrail FPR/FNR + per-class P/R/F1), and `eval/run_retrieval_eval.py` (recall@5 Ollama vs NIM) — and have been **run live** against the full stack with results recorded in `CHANGELOG.md`. Phase 2: Ollama PASSED (FPR/FNR ≤ 0.10), NIM FAILED (input FNR=0.182, topic-control FPR=0.182). Phase 3: both Ollama + NIM recall@5=1.000. Phase 4: reranker uplift +0.011 relevancy, +0.011 recall, +2 questions passed (28→30), +1.16s latency. What remains is wiring them into CI as a **blocking** gate (they currently run manually / on-commit, not enforced on every PR), persisting the per-run reports as artifacts, and recording the model version in each report row.
 5. **Throughput / rate-limit strategy** — provision dedicated quotas or a multi-key/multi-provider router; do not rely on a shared 40 RPM cap for production traffic.
 6. **Failover & circuit breaker** — implement a multi-provider router with health checks, circuit breaker, and automatic fallback (OpenAI / Azure / self-hosted Ollama).
 7. **Retry/backoff/timeout** — exponential backoff + jitter, per-call timeout budget, idempotency keys; cap retry budget to avoid cascading failures.

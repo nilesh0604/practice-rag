@@ -5,6 +5,141 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added — Live NIM comparison eval results (Phases 2, 3, 4)
+
+Ran the three eval artifacts against the live Ollama + Qdrant + NIM stack
+(2026-08-15, `NIM_ENABLED=true`, NIM guardrail models
+`nvidia/llama-3.1-nemoguard-8b-content-safety` +
+`nvidia/llama-3.1-nemoguard-8b-topic-control`, NIM embedder
+`nvidia/llama-nemotron-embed-1b-v2`, NIM reranker
+`nvidia/llama-nemotron-rerank-1b-v2`, NIM generator
+`meta/llama-3.1-8b-instruct`). All four phases of the NIM integration plan
+are now measured with real data, not just scaffolded.
+
+- **Phase 2 — guardrail FPR/FNR** (`eval/run_guardrail_eval.py --both`):
+  - **Ollama backend: PASSED** the gate (FPR ≤ 0.10, FNR ≤ 0.10 on all
+    three checks). Input: P=0.909 R=0.909 F1=0.909 FPR=0.032 FNR=0.091.
+    Output: P=1.000 R=1.000 F1=1.000 FPR=0.000 FNR=0.000. Topic-control
+    reject: P=0.900 R=1.000 F1=0.947 FPR=0.045 FNR=0.000.
+  - **NIM backend: FAILED** the gate on two checks. Input (injection):
+    P=1.000 R=0.818 F1=0.900 FPR=0.000 **FNR=0.182** — NIM's nemoguard
+    content-safety model missed 2 prompt-injection attacks that Ollama
+    caught (higher precision but lower recall). Topic-control reject:
+    P=0.692 R=1.000 F1=0.818 **FPR=0.182** — NIM's topic-control model is
+    over-aggressive, routing 4 legitimate borderline questions ("best
+    framework", "FastAPI vs Django", "summarize the above", "vague help")
+    to `off_topic`. Output: P=1.000 R=1.000 F1=1.000 (same as Ollama).
+  - **Key finding:** the NIM nemoguard topic-control model's parsing is
+    brittle — it frequently returns `'on-topic '` (with trailing space)
+    which the classifier doesn't recognize as a valid label, causing
+    fallback to Ollama. This is a prompt-format mismatch, not a model
+    quality issue. The NIM content-safety model is more precise (FPR=0)
+    but less recall (misses 2 injections). Neither backend is strictly
+    better — this is exactly the kind of finding the eval was designed to
+    surface before any production promotion.
+  - Report: `eval/guardrail_report.csv` (42 examples × 2 backends).
+
+- **Phase 3 — retrieval recall@5** (`eval/run_retrieval_eval.py`):
+  - NIM collection ingested: 7 files, 45 chunks into `ctc_rag_nim`
+    (2048-d, `nvidia/llama-nemotron-embed-1b-v2`).
+  - **Ollama recall@5 = 1.000** (36/36 hits, mean latency 0.072s).
+  - **NIM recall@5 = 1.000** (36/36 hits, mean latency 0.181s).
+  - **Δ = +0.000** — both embedders achieve perfect recall@5 on this
+    corpus. The NIM embedder is 2.5× slower per query (hosted round-trip
+    vs local Ollama) with no recall uplift on this small, well-curated
+    corpus. The NIM embedder's advantage (multilingual, long-doc QA
+    tuning) would likely show on a larger/more ambiguous corpus — not
+    measurable here. Gate (Ollama recall@5 ≥ 0.70): PASSED.
+  - Report: `eval/retrieval_report.csv` (36 questions × 2 collections).
+
+- **Phase 4 — reranker A/B** (`eval/run_eval.py`, NIM generator +
+  guardrails, reranker on vs off):
+  - **Without reranker:** faithfulness=0.800, relevancy=0.792,
+    recall=0.722, 28/36 passed, mean latency 5.27s. Gate: PASSED.
+  - **With reranker:** faithfulness=0.800, relevancy=0.803,
+    recall=0.733, 30/36 passed, mean latency 6.43s. Gate: PASSED.
+  - **Uplift:** +0.011 relevancy, +0.011 recall, +2 questions passed
+    (28→30). The reranker reorders 20 candidates → top 5, improving
+    context precision enough to flip 2 borderline questions from fail
+    to pass. Latency cost: +1.16s/query (the extra NIM rerank call).
+    Faithfulness is unchanged (0.800) — the reranker improves _what_ is
+    retrieved but not _how faithfully_ the generator uses it.
+  - Reports: `eval/eval_report_no_rerank.csv`, `eval/eval_report_with_rerank.csv`.
+
+### Fixed — `eval/run_eval.py` kwarg mismatch + NIM orchestrator wiring
+
+- `build_orchestrator()` now delegates to `api.deps.get_orchestrator()`
+  when `NIM_ENABLED=true` is set, so the NIM generator, guardrails, and
+  reranker are exercised through the same config-flag wiring as the live
+  app. This enables the Phase 4 A/B comparison (reranker on vs off) by
+  running the script twice with different `NIM_RERANK_ENABLED` values.
+  When NIM is disabled (default), the plain Ollama-only orchestrator is
+  constructed directly (unchanged).
+- Fixed a pre-existing `TypeError` in `main()`: `mark_passes()` and
+  `check_gate()` expect `threshold_faithfulness` / `threshold_recall` /
+  `threshold_relevancy` kwargs, but the call site passed the short names
+  (`faithfulness` / `recall` / `relevancy`). The `print_summary()` call
+  correctly expects the short-named dict, so the call site was
+  restructured to pass the right form to each function. This bug would
+  have crashed any full `run_eval.py` run (the local-judge path
+  completed all questions but crashed at the post-processing step).
+- All 730 backend tests pass (`python -m pytest -q`).
+
+### Added — Eval artifacts for Phase 2 (guardrails) + Phase 3 (embeddings)
+
+The existing `eval/run_eval.py` + `eval/golden-dataset.json` suite covered
+only Phase 1 (generator) and Phase 4 (reranker) of the NIM integration plan.
+Phase 2 (guardrail FPR/FNR) and Phase 3 (embedding recall@5) had no
+automated eval artifacts — the plan's "manual review" steps assumed eyeballing
+verdicts. This adds the three missing artifacts so all four phases are
+measurable:
+
+- `eval/guardrail-dataset.json` — adversarial golden set of 48 labeled
+  examples across 5 categories (`on_topic_safe`, `off_topic`,
+  `prompt_injection`, `harmful_output`, `borderline`) with expected verdicts
+  for each of the three guardrail checks (`expected_input` block/allow,
+  `expected_class` label, `expected_output` block/allow). Enough samples per
+  class (>=6 for the four main categories, >=4 borderline) to compute
+  meaningful FPR/FNR. Includes legitimate context-dependent follow-ups
+  (with history) that must NOT be false-positive blocked, and safe answers
+  that must NOT be false-positive blocked by the output guardrail.
+- `eval/run_guardrail_eval.py` — runner that loads the adversarial set and
+  runs each example through `build_guardrail_suite()` (NIM on via
+  `NIM_ENABLED=true`, or plain Ollama, or `--no-llm` for regex/keyword only).
+  Records actual verdicts for all three checks and computes, per check:
+  input guardrail precision/recall/F1/FPR/FNR (positive=block), output
+  guardrail precision/recall/F1/FPR/FNR (positive=block), topic-control
+  binary reject/accept FPR/FNR (positive=off_topic), and per-class
+  precision/recall/F1 for the multi-class classifier. Writes a per-example
+  CSV (`eval/guardrail_report.csv`) and prints a per-check summary. Gate:
+  exits non-zero if any binary check's FPR > `--max-fpr` (default 0.10) or
+  FNR > `--max-fnr` (default 0.10). `--both` runs Ollama then NIM
+  back-to-back for side-by-side comparison.
+- `eval/run_retrieval_eval.py` — recall@5 comparison script that reuses
+  `eval/golden-dataset.json`'s `source_title` ground truth. For each golden
+  question, queries both the default Ollama `docs-knowledge` collection and
+  the separate NIM `ctc_rag_nim` collection via `HybridRetriever.retrieve()`,
+  checks whether the ground-truth title appears in the top-5 (substring +
+  case-insensitive tolerant match), and reports recall@5 per collection +
+  the NIM−Ollama delta. Writes a per-question CSV
+  (`eval/retrieval_report.csv`). Gracefully reports `n/a` for the NIM
+  collection when it is missing/empty (with a hint to ingest it first via
+  `NIM_ENABLED=true python -m ingestion.nim_embedder`). Gate: exits
+  non-zero if Ollama recall@5 < `--threshold` (default 0.70); the NIM
+  recall@5 is a comparison metric, not a release gate (the live app keeps
+  using the Ollama collection). `--no-nim` / `--only-nim` select a single
+  collection.
+- `tests/test_eval_guardrails.py` — 27 unit tests for the pure-logic parts
+  of the guardrail runner (dataset loading + category balance, `BinaryMetrics`
+  / `ClassMetrics` arithmetic incl. zero-denominator safety, `_score_binary`,
+  `aggregate` wiring for input/output/topic-reject/per-class, `run_example`
+  with a mocked suite, `write_csv` append behavior).
+- `tests/test_eval_retrieval.py` — 20 unit tests for the pure-logic parts of
+  the retrieval runner (dataset loading, `compute_hit` exact/substring/
+  case-insensitive/miss/empty + min-length guard against single-char false
+  matches, `aggregate` recall + error-exclusion + latency, `write_csv`).
+- All 730 backend tests pass (`python -m pytest -q`).
+
 ### Added — NVIDIA NIM reranker integration (Phase 4 — net-new capability)
 
 - `rag/nim_reranker.py` — new module implementing the Phase 4 reranker from
