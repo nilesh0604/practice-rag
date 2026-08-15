@@ -39,6 +39,7 @@ if TYPE_CHECKING:
     # means the orchestrator has no hard dependency on the api package.
     from api.guardrails import GuardrailSuite
     from api.observability import LangfuseTracer
+    from rag.nim_reranker import NIMReranker
 
 logger = logging.getLogger(__name__)
 
@@ -77,6 +78,7 @@ class RAGOrchestrator:
         query_rewriter: QueryRewriter | None = None,
         guardrail_suite: "GuardrailSuite | None" = None,
         tracer: "LangfuseTracer | None" = None,
+        reranker: "NIMReranker | None" = None,
     ) -> None:
         self.retriever = retriever
         self.context_assembler = context_assembler
@@ -85,6 +87,7 @@ class RAGOrchestrator:
         self.query_rewriter = query_rewriter or PassthroughQueryRewriter()
         self.guardrail_suite = guardrail_suite
         self.tracer = tracer
+        self.reranker = reranker
 
     def stream_answer(
         self,
@@ -146,6 +149,16 @@ class RAGOrchestrator:
             docs = self.retriever.retrieve(rewritten)
             if ret_span is not None:
                 self.tracer.end_span(ret_span, metadata={"num_docs": len(docs)})
+
+            # ── Phase 4: rerank retrieved docs (if a reranker is configured) ──
+            if self.reranker is not None:
+                rr_span = (
+                    self.tracer.start_span(trace, "rerank", metadata={"candidates": len(docs)})
+                    if trace is not None else None
+                )
+                docs = self.reranker.rerank(rewritten, docs)
+                if rr_span is not None:
+                    self.tracer.end_span(rr_span, metadata={"reranked": len(docs)})
 
             context = self.context_assembler.assemble(docs)
 
@@ -259,6 +272,16 @@ class RAGOrchestrator:
             docs = self.retriever.retrieve(rewritten)
             if ret_span is not None:
                 self.tracer.end_span(ret_span, metadata={"num_docs": len(docs)})
+
+            # ── Phase 4: rerank retrieved docs (if a reranker is configured) ──
+            if self.reranker is not None:
+                rr_span = (
+                    self.tracer.start_span(trace, "rerank", metadata={"candidates": len(docs)})
+                    if trace is not None else None
+                )
+                docs = self.reranker.rerank(rewritten, docs)
+                if rr_span is not None:
+                    self.tracer.end_span(rr_span, metadata={"reranked": len(docs)})
 
             context = self.context_assembler.assemble(docs)
 

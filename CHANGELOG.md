@@ -5,6 +5,74 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added — NVIDIA NIM reranker integration (Phase 4 — net-new capability)
+
+- `rag/nim_reranker.py` — new module implementing the Phase 4 reranker from
+  `docs/NVIDIA_NIM_INTEGRATION_PLAN.md`:
+  - `NIMReranker` — calls the NVIDIA NIM dedicated reranking endpoint
+    (`https://ai.api.nvidia.com/v1/retrieval/{model}/reranking` — note the
+    different host vs. the chat/embeddings endpoint). Uses `httpx` (already a
+    dependency) to POST with `{"model", "query": {"text"}, "passages":
+[{"text"}, ...], "truncate": "END"}` and parses the `{"rankings":
+[{"index", "logit"}, ...]}` response (sorted by relevance — highest logit
+    first). Reorders `RetrievedDoc` candidates by the reranker's relevance
+    scores, truncates to `top_n` (default 5). Lazy httpx client so unit tests
+    inject mocks without hitting the network. Maps 429/404/timeout/connection/
+    malformed-response errors to `NIMRerankError`. Owns a dedicated
+    `CircuitBreaker` (separate from the generator's, guardrails', embedder's
+    NIM breakers and the Ollama breaker). **No fallback model** — on any
+    failure (circuit open, 429, 404, timeout, connection error, malformed
+    response), `rerank()` returns the original retrieved order truncated to
+    `top_n` (graceful degradation to no-reranking, the status quo). The
+    exception is logged but never raised, because reranking is a quality
+    enhancement, not a correctness requirement. Preserves the original RRF
+    retrieval scores (the reranker reorders but does not rescore — its logits
+    are unbounded and not comparable to the [0, 1] RRF score). Default model
+    `nvidia/llama-nemotron-rerank-1b-v2`.
+  - `build_reranker()` factory — returns `NIMReranker` when `NIM_ENABLED=true`
+    and `NIM_RERANK_ENABLED` is not `false` (default true), else `None`. A
+    second flag `NIM_RERANK_ENABLED` allows disabling just the reranker while
+    keeping the generator/guardrails on NIM — useful for the A/B quality
+    comparison. `NIM_RERANK_TOP_N` overrides the number of docs to keep
+    (default 5). Returns `None` (not a no-op reranker) so the orchestrator
+    skips the rerank step entirely with a simple `is not None` check.
+  - `get_rerank_candidate_k()` helper — returns the retriever `top_k` to use
+    when reranking is active (default 20, override with
+    `NIM_RERANK_CANDIDATE_K`). Matches the retriever's `PREFETCH_LIMIT`.
+- `rag/orchestrator.py` — `RAGOrchestrator` gained an optional `reranker`
+  param. After retrieval, if a reranker is configured, the docs are reranked
+  before context assembly (both `stream_answer` and `answer` methods). A
+  Langfuse `"rerank"` span is emitted with candidate + reranked count
+  metadata. Default path unchanged when `reranker` is `None`.
+- `api/deps.py` — wired through `build_reranker()` via a cached
+  `get_reranker()`. When the reranker is active, `get_retriever()` uses a
+  larger `top_k` (`NIM_RERANK_CANDIDATE_K`, default 20) so the reranker has
+  enough candidates to reorder; otherwise the default `top_k=5`. Default path
+  unchanged (no reranker, `top_k=5`) when `NIM_ENABLED` is unset/false.
+- `.env.example` — added `NIM_RERANK_ENABLED`, `NIM_RERANK_TOP_N`,
+  `NIM_RERANK_CANDIDATE_K` env vars (Phase 4); updated the NIM section header
+  to note Phase 4 coverage.
+- `tests/test_rag_nim_reranker.py` — 58 new unit tests covering endpoint URL
+  construction (model in path, different host), request shape (model/query/
+  passages/truncate, doc content not title, custom model/truncate, auth
+  header), reordering (by rankings, truncation to top_n, preserves original
+  RRF scores, skip when ≤top_n, empty docs), error mapping (429/404/500/
+  empty-rankings/out-of-range-index/missing-index/timeout/connect/unexpected),
+  graceful degradation on every error path (returns original[:top_n], never
+  raises), circuit breaker (open→degrade, failure recording, success reset,
+  wraps request), lazy client, close, `build_reranker` factory (None when
+  disabled, None when rerank disabled, reranker when enabled, top_n override,
+  dedicated breaker, default model), `get_rerank_candidate_k` (default 20,
+  env override), and orchestrator integration (reranker called with rewritten
+  query + retrieved docs, reranked docs passed to assembler + post-processor,
+  skipped when None, `answer` method too, rerank span traced).
+- **F500 enterprise gap notice:** this is comparison-test-only code behind
+  `NIM_ENABLED` (default off), not production-grade. The reranker adds one
+  extra hosted call per query (data egress of query + chunk contents to
+  NVIDIA), consuming the shared ~40 RPM rate-limit budget. See
+  `docs/F500_ENTERPRISE_ACTION_ITEMS.md` item #8 for the 10 gaps to close
+  before any production promotion.
+
 ### Added — NVIDIA NIM embedding integration (Phase 3 — comparison testing)
 
 - `ingestion/nim_embedder.py` — new module implementing the Phase 3 embedding

@@ -159,6 +159,7 @@ practice-rag/
     ├── test_rag_context_assembler.py   # CONTEXT block formatting ✅
     ├── test_rag_generator.py           # Ollama streaming + system prompt + circuit breaker (mocked) ✅
     ├── test_rag_nim_generator.py       # NIM generator + fallback + factory (29 tests, mocked) ✅
+    ├── test_rag_nim_reranker.py        # NIM reranker + graceful degradation + orchestrator integration (58 tests, mocked) ✅
     ├── test_rag_post_processor.py      # citations + groundedness score (mocked) ✅
     ├── test_rag_query_rewriter.py      # passthrough + LLM rewrite (mocked) ✅
     ├── test_rag_orchestrator.py        # full RAG flow + guardrail + tracer integration (mocked) ✅

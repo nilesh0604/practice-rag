@@ -27,11 +27,12 @@ from api.nim_guardrails import build_guardrail_suite
 from api.observability import CircuitBreaker, LangfuseTracer, MetricsCollector
 from rag.context_assembler import ContextAssembler
 from rag.nim_generator import build_generator
+from rag.nim_reranker import build_reranker, get_rerank_candidate_k
 from rag.orchestrator import RAGOrchestrator
 from rag.post_processor import PostProcessor
 from rag.qdrant_collection import get_qdrant_client
 from rag.query_rewriter import LLMQueryRewriter
-from rag.retriever import HybridRetriever
+from rag.retriever import DEFAULT_TOP_K, HybridRetriever
 
 logger = logging.getLogger(__name__)
 
@@ -55,9 +56,14 @@ def get_retriever() -> HybridRetriever:
     """Construct the hybrid retriever from the cached client + embedder.
 
     Not cached itself — it holds no expensive state beyond the injected
-    client/embedder (which are themselves cached).
+    client/embedder (which are themselves cached). When the NIM reranker is
+    active (Phase 4), the retriever fetches a larger candidate pool
+    (``NIM_RERANK_CANDIDATE_K``, default 20) so the reranker has enough
+    signal to reorder meaningfully; otherwise the default ``top_k=5``.
     """
-    return HybridRetriever(get_qdrant_client_dep(), get_embedder())
+    reranker = get_reranker()
+    top_k = get_rerank_candidate_k() if reranker is not None else DEFAULT_TOP_K
+    return HybridRetriever(get_qdrant_client_dep(), get_embedder(), top_k=top_k)
 
 
 @lru_cache
@@ -103,7 +109,21 @@ def get_orchestrator() -> RAGOrchestrator:
         query_rewriter=LLMQueryRewriter(),
         guardrail_suite=get_guardrail_suite(),
         tracer=get_tracer(),
+        reranker=get_reranker(),
     )
+
+
+@lru_cache
+def get_reranker():
+    """Process-wide NIM reranker (Phase 4).
+
+    Returns ``None`` when NIM reranking is disabled (``NIM_ENABLED`` unset or
+    ``NIM_RERANK_ENABLED=false``) — the orchestrator skips the rerank step
+    entirely. When enabled, the retriever fetches a larger candidate pool
+    (see ``get_retriever``) and the reranker reorders down to ``top_n``.
+    The reranker owns a dedicated ``CircuitBreaker`` and a lazy httpx client.
+    """
+    return build_reranker()
 
 
 @lru_cache

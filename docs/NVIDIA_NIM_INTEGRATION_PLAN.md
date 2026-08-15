@@ -537,12 +537,66 @@ the production generation/guardrail path until all 10 gaps are closed.
 - **Do not** swap the live app's default collection until a re-ingestion
   - eval gate (F500 item #8, action item #4) is in place.
 
-### Phase 4 — Reranker (net-new capability)
+### Phase 4 — Reranker (net-new capability) ✅ (code landed)
 
-- Add a reranker stage between retrieval and generation, behind the config
+- ✅ Add a reranker stage between retrieval and generation, behind the config
   flag.
-- Measure answer-quality uplift (faithfulness, relevance) with vs. without
-  reranking.
+  - `rag/nim_reranker.py` — `NIMReranker` (calls the NIM dedicated reranking
+    endpoint `https://ai.api.nvidia.com/v1/retrieval/{model}/reranking` —
+    note the different host vs. chat/embeddings; request shape
+    `{"model", "query": {"text"}, "passages": [{"text"}, ...], "truncate":
+"END"}`, response `{"rankings": [{"index", "logit"}, ...]}` sorted by
+    relevance). Lazy httpx client, dedicated `CircuitBreaker`, maps
+    429/404/timeout/connect/malformed errors to `NIMRerankError`. Reorders
+    docs by the reranker's relevance scores, truncates to `top_n` (default 5),
+    preserves the original RRF retrieval scores (the reranker reorders but
+    does not rescore — its logits are unbounded and not comparable to the
+    [0, 1] RRF score). `build_reranker()` factory + `get_rerank_candidate_k()`
+    helper.
+  - `rag/orchestrator.py` — `RAGOrchestrator` gained an optional `reranker`
+    param. After retrieval, if a reranker is configured, the docs are
+    reranked before context assembly. A Langfuse `"rerank"` span is emitted
+    (with candidate count + reranked count metadata). Both `stream_answer`
+    and `answer` methods updated. Default path unchanged when `reranker` is
+    `None`.
+  - `api/deps.py` — wired through `build_reranker()` via a cached
+    `get_reranker()`. When the reranker is active, `get_retriever()` uses a
+    larger `top_k` (`NIM_RERANK_CANDIDATE_K`, default 20) so the reranker has
+    enough candidates to reorder; otherwise the default `top_k=5`. Default
+    path unchanged (no reranker, `top_k=5`) when `NIM_ENABLED` is unset/false.
+- ✅ A second flag `NIM_RERANK_ENABLED` (default `true` when `NIM_ENABLED` is
+  true) allows disabling just the reranker while keeping the generator/
+  guardrails on NIM — useful for the A/B comparison (answer quality with vs.
+  without reranking). When disabled, `build_reranker()` returns `None` and the
+  orchestrator skips the rerank step entirely (no extra hosted call, no
+  latency, no rate-limit consumption).
+- ✅ **No fallback model** — there is no local reranker. On any failure
+  (circuit open, 429, 404, timeout, connection error, malformed response),
+  `rerank()` returns the original retrieved order truncated to `top_n` —
+  graceful degradation to the status quo (no reranking). The exception is
+  logged but never raised, because reranking is a quality enhancement, not a
+  correctness requirement.
+- ✅ Unit tests: `tests/test_rag_nim_reranker.py` (58 tests, all mocked) —
+  endpoint URL construction (model in path, different host), request shape
+  (model/query/passages/truncate, doc content not title, custom model/
+  truncate, auth header), reordering (by rankings, truncation to top_n,
+  preserves original RRF scores, skip when ≤top_n, empty docs), error mapping
+  (429/404/500/empty-rankings/out-of-range-index/missing-index/timeout/
+  connect/unexpected), graceful degradation on every error path (returns
+  original[:top_n], never raises), circuit breaker (open→degrade, failure
+  recording, success reset, wraps request), lazy client, close, `build_reranker`
+  factory (None when disabled, None when rerank disabled, reranker when
+  enabled, top_n override, dedicated breaker, default model),
+  `get_rerank_candidate_k` (default 20, env override), and orchestrator
+  integration (reranker called with rewritten query + retrieved docs,
+  reranked docs passed to assembler + post-processor, skipped when None,
+  `answer` method too, rerank span traced).
+- ⬜ Measure answer-quality uplift (faithfulness, relevance) with vs. without
+  reranking. This is a **manual step** requiring a live `NVIDIA_API_KEY` +
+  Ollama + Qdrant running; not automatable in CI at the practice stage.
+- **Do not** enable NIM reranking on any corpus with real PII until
+  F500 item #5 (PII scrubbing upstream) is closed — the reranker sees the
+  query + retrieved chunk contents (data egress to NVIDIA).
 
 ### Phase 5 — Production promotion (BLOCKED on F500 item #8)
 
