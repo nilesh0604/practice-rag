@@ -5,6 +5,67 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added — NVIDIA NIM embedding integration (Phase 3 — comparison testing)
+
+- `ingestion/nim_embedder.py` — new module implementing the Phase 3 embedding
+  comparison test from `docs/NVIDIA_NIM_INTEGRATION_PLAN.md`:
+  - `NIMEmbedder` — OpenAI-compatible `/embeddings` client for the NVIDIA NIM
+    free tier (`https://integrate.api.nvidia.com/v1`). Uses `httpx` (already a
+    dependency) to POST to `/embeddings` with `input_type` (`passage` at index
+    time, `query` at query time — the nemotron model is tuned for asymmetric
+    bi-encoder retrieval). Lazy httpx client so unit tests inject mocks
+    without hitting the network. Maps 429/404/timeout/connection errors to
+    `NIMEmbeddingError`. Owns a dedicated `CircuitBreaker` (separate from the
+    generator's and guardrails' NIM breakers and the Ollama breaker). Default
+    model `nvidia/llama-nemotron-embed-1b-v2` (native 2048-d; Matryoshka
+    reduced dimensions 384/512/768/1024/2048 via the `dimensions` API param,
+    configurable with `NIM_EMBEDDING_DIM`). Same `embed_texts`/`embed_text`
+    interface as the Ollama `Embedder` so it is a drop-in for the existing
+    `IndexWriter` and `HybridRetriever`. **No fallback embedder** — vectors
+    are not interoperable across models, so a NIM embedding failure aborts
+    the ingestion batch (the Ollama collection is never touched).
+  - `build_nim_embedder()` factory — reads `NVIDIA_API_KEY`,
+    `NIM_EMBEDDING_MODEL`, `NIM_EMBEDDING_DIM` env vars.
+  - `build_nim_retriever()` factory — existing `HybridRetriever` pointed at
+    the NIM comparison collection (`ctc_rag_nim`), for recall@5 comparison
+    against the default Ollama collection. Not wired into `api/deps.py`.
+  - `run_nim_ingestion()` orchestrator — thin wrapper over
+    `ingestion.run.run_ingestion` that injects a `NIMEmbedder` + an
+    `IndexWriter` pointed at `ctc_rag_nim`, ensures the NIM collection
+    exists at the configured dimensionality, and refuses to run without
+    `NIM_ENABLED=true`. The default `docs-knowledge` collection is never
+    touched.
+- `rag/qdrant_collection.py` — added NIM comparison collection support:
+  `NIM_COLLECTION_NAME` (`ctc_rag_nim`), `NIM_VECTOR_SIZE` (2048),
+  `NIM_EMBEDDING_MODEL_DEFAULT`, `build_nim_collection_config()` (reuses the
+  same `dense`/`text` named vectors as the default collection so
+  `IndexWriter`/`HybridRetriever` work unchanged — only the collection name +
+  dense size differ), `ensure_nim_collection()`.
+- `ingestion/run.py` — `run_ingestion` parameterized with an optional
+  `collection_config: CollectionConfig | None = None`. When `None` (default)
+  the standard `docs-knowledge` collection is used (unchanged). When provided,
+  the collection is ensured/recreated at that config's name + dimensionality.
+  This lets the NIM ingestion path target a separate collection without
+  duplicating the orchestrator. Default path unchanged.
+- `.env.example` — added `NIM_EMBEDDING_MODEL` and `NIM_EMBEDDING_DIM` env
+  vars (Phase 3); updated the NIM section header to note Phase 3 coverage.
+- `tests/test_ingestion_nim_embedder.py` — 47 new unit tests covering
+  `NIMEmbedder` (request shape, `input_type`, dimensions/Matryoshka, error
+  mapping for 429/404/500/empty/count-mismatch/timeout/connect/unexpected,
+  circuit-breaker open/failure-recording/success-reset, lazy client, close),
+  `build_nim_embedder` factory, `build_nim_collection_config` (NIM collection
+  name + size, same vector names, overrides, env), `ensure_nim_collection`
+  (creates if missing, skips if exists, never touches default collection),
+  `build_nim_retriever`, and `run_nim_ingestion` (refuses without
+  `NIM_ENABLED`, runs with it, passes `collection_config` + injected
+  embedder/index_writer, `full_reindex` passthrough, custom embedder
+  passthrough).
+- **F500 enterprise gap notice:** this is comparison-test-only code behind
+  `NIM_ENABLED` (default off), not production-grade. The NIM embedder is not
+  wired into the live app's default path. See
+  `docs/F500_ENTERPRISE_ACTION_ITEMS.md` item #8 for the 10 gaps to close
+  before any production promotion.
+
 ### Added — NVIDIA NIM guardrail integration (Phase 2 — comparison testing)
 
 - `api/nim_guardrails.py` — new module implementing the Phase 2 guardrail

@@ -486,11 +486,54 @@ the production generation/guardrail path until all 10 gaps are closed.
 - **Do not** enable NIM guardrails on any corpus with real PII until
   F500 item #5 (PII scrubbing upstream) is closed.
 
-### Phase 3 — Embedding comparison test (separate collection)
+### Phase 3 — Embedding comparison test (separate collection) ✅ (code landed)
 
-- Add a NIM embedder ingestion path that populates a separate Qdrant
+- ✅ Add a NIM embedder ingestion path that populates a separate Qdrant
   collection (`ctc_rag_nim`).
-- Run retrieval recall@5 comparison: Ollama collection vs. NIM collection.
+  - `ingestion/nim_embedder.py` — `NIMEmbedder` (OpenAI-compatible
+    `/embeddings` client, lazy httpx, `input_type=passage` at index time /
+    `query` at query time, dedicated `CircuitBreaker`, maps 429/404/timeout/
+    connect errors to `NIMEmbeddingError`) + `build_nim_embedder()` factory
+    - `build_nim_retriever()` factory (existing `HybridRetriever` pointed at
+      `ctc_rag_nim`) + `run_nim_ingestion()` orchestrator (refuses to run
+      without `NIM_ENABLED=true`).
+  - `rag/qdrant_collection.py` — `NIM_COLLECTION_NAME` (`ctc_rag_nim`),
+    `NIM_VECTOR_SIZE` (2048 — native dim of `nvidia/llama-nemotron-embed-1b-v2`),
+    `build_nim_collection_config()` (reuses the same `dense`/`text` named
+    vectors so `IndexWriter`/`HybridRetriever` work unchanged — only the
+    collection name + dense size differ), `ensure_nim_collection()`.
+  - `ingestion/run.py` — `run_ingestion` parameterized with an optional
+    `collection_config` so the same orchestrator can populate either the
+    default `docs-knowledge` collection (unchanged) or the NIM comparison
+    collection. Default path unchanged when `collection_config` is `None`.
+- ✅ The NIM embedder is **not** a runtime fallback and is **not** wired into
+  `api/deps.py` — embeddings are not interoperable across models, so the NIM
+  embedder populates a **separate** collection for retrieval-quality
+  (recall@5) comparison only. The live app continues to query the Ollama
+  `docs-knowledge` collection.
+- ✅ The nemotron model supports Matryoshka reduced dimensions
+  (384/512/768/1024/2048) via the `dimensions` API param. Native 2048-d is
+  the default; override with `NIM_EMBEDDING_DIM` to trade storage for speed.
+  The collection is created at the configured dimensionality on first
+  ingestion; changing it afterwards requires dropping + re-ingesting the NIM
+  collection.
+- ✅ The sparse vector tier (local hashing-trick BM25) is embedder-agnostic
+  and unchanged — the NIM collection keeps the same hybrid dense+sparse
+  design as the default collection.
+- ✅ Unit tests: `tests/test_ingestion_nim_embedder.py` (47 tests, all
+  mocked) — `NIMEmbedder` (request shape, `input_type`, dimensions/Matryoshka,
+  error mapping for 429/404/500/empty/count-mismatch/timeout/connect/
+  unexpected, circuit-breaker open/failure-recording/success-reset, lazy
+  client, close), `build_nim_embedder` factory, `build_nim_collection_config`
+  (NIM collection name + size, same vector names, overrides, env), NIM
+  collection config + `ensure_nim_collection` (creates if missing, skips if
+  exists, never touches default collection), `build_nim_retriever`, and
+  `run_nim_ingestion` (refuses without `NIM_ENABLED`, runs with it, passes
+  `collection_config` + injected embedder/index_writer, `full_reindex`
+  passthrough, custom embedder passthrough).
+- ⬜ Run retrieval recall@5 comparison: Ollama collection vs. NIM collection.
+  This is a **manual step** requiring a live `NVIDIA_API_KEY` + Ollama +
+  Qdrant running; not automatable in CI at the practice stage.
 - **Do not** swap the live app's default collection until a re-ingestion
   - eval gate (F500 item #8, action item #4) is in place.
 

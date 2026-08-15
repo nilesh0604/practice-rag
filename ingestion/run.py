@@ -39,7 +39,7 @@ from ingestion.manifest import (
 )
 from ingestion.parser import parse_file
 from ingestion.sync import discover_files
-from rag.qdrant_collection import ensure_collection
+from rag.qdrant_collection import CollectionConfig, ensure_collection
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +54,7 @@ def run_ingestion(
     manifest_path: str | Path | None = None,
     embedder: Embedder | None = None,
     index_writer: IndexWriter | None = None,
+    collection_config: CollectionConfig | None = None,
 ) -> dict:
     """Run the full ingestion pipeline on ``corpus_dir``.
 
@@ -65,6 +66,14 @@ def run_ingestion(
             to ``<corpus_dir>/manifest.json``.
         embedder: optional pre-constructed Embedder (for testing / reuse).
         index_writer: optional pre-constructed IndexWriter.
+        collection_config: optional override for the Qdrant collection
+            config. When ``None`` (default) the standard ``docs-knowledge``
+            collection is used. When provided (e.g. a NIM comparison
+            collection config from ``build_nim_collection_config``), the
+            collection is ensured/recreated at that config's name +
+            dimensionality instead. This keeps the default path unchanged
+            while letting the NIM ingestion path target a separate
+            collection without duplicating the orchestrator.
 
     Returns:
         A summary dict: ``{files_total, files_indexed, files_skipped,
@@ -83,14 +92,20 @@ def run_ingestion(
 
     # ── 2. ensure collection + load manifest ──────────────────────────
     if full_reindex:
-        client = ensure_collection()
-        # Recreate to clear all existing points.
         from rag.qdrant_collection import create_collection
 
-        create_collection(client, recreate=True)
+        if collection_config is not None:
+            client = ensure_collection(config=collection_config)
+            create_collection(client, collection_config, recreate=True)
+        else:
+            client = ensure_collection()
+            create_collection(client, recreate=True)
         manifest = Manifest()
     else:
-        client = ensure_collection()
+        if collection_config is not None:
+            client = ensure_collection(config=collection_config)
+        else:
+            client = ensure_collection()
         manifest = load_manifest(manifest_file)
 
     emb = embedder or Embedder()

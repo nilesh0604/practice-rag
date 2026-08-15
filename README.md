@@ -152,6 +152,7 @@ practice-rag/
     ├── test_ingestion_parser.py       # MD/HTML parsing + metadata ✅
     ├── test_ingestion_chunker.py      # two-stage split + deterministic UUIDs ✅
     ├── test_ingestion_embedder.py     # dense (mocked Ollama) + sparse (hashing trick) ✅
+    ├── test_ingestion_nim_embedder.py # NIM embedder + NIM collection + run_nim_ingestion (47 tests, mocked) ✅
     ├── test_ingestion_index_writer.py # Qdrant upsert + delete (mocked client) ✅
     ├── test_ingestion_run.py          # orchestrator integration (mocked) ✅
     ├── test_rag_retriever.py           # hybrid dense+sparse + RRF fusion (mocked) ✅
