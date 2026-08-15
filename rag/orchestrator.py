@@ -106,91 +106,96 @@ class RAGOrchestrator:
         if self.tracer is not None:
             trace = self.tracer.start_trace("chat", metadata={"query": query})
 
-        # ── Step 6: input guardrail + query classification ─────────────
-        if self.guardrail_suite is not None:
-            gr_span = (
-                self.tracer.start_span(trace, "guardrail_input")
-                if trace is not None else None
-            )
-            decision = self.guardrail_suite.check_input(query, history)
-            if decision.blocked:
-                logger.info("Orchestrator: input blocked — %s", decision.reason)
+        try:
+            # ── Step 6: input guardrail + query classification ─────────
+            if self.guardrail_suite is not None:
+                gr_span = (
+                    self.tracer.start_span(trace, "guardrail_input")
+                    if trace is not None else None
+                )
+                decision = self.guardrail_suite.check_input(query, history)
+                if decision.blocked:
+                    logger.info("Orchestrator: input blocked — %s", decision.reason)
+                    if gr_span is not None:
+                        self.tracer.end_span(gr_span, metadata={"blocked": True, "reason": decision.reason})
+                    yield from self._refusal_stream(
+                        "I can't process that request. Please ask a question about "
+                        "FastAPI, Pydantic v2, or SQLModel.",
+                    )
+                    return
+
+                classification = self.guardrail_suite.classify(query, history)
                 if gr_span is not None:
-                    self.tracer.end_span(gr_span, metadata={"blocked": True, "reason": decision.reason})
-                yield from self._refusal_stream(
-                    "I can't process that request. Please ask a question about "
-                    "FastAPI, Pydantic v2, or SQLModel.",
-                )
-                return
+                    self.tracer.end_span(
+                        gr_span,
+                        metadata={"blocked": False, "class": classification.label},
+                    )
+                if classification.handled:
+                    logger.info("Orchestrator: query classified as %s — short-circuit", classification.label)
+                    yield from self._refusal_stream(classification.answer)
+                    return
 
-            classification = self.guardrail_suite.classify(query, history)
-            if gr_span is not None:
-                self.tracer.end_span(
-                    gr_span,
-                    metadata={"blocked": False, "class": classification.label},
-                )
-            if classification.handled:
-                logger.info("Orchestrator: query classified as %s — short-circuit", classification.label)
-                yield from self._refusal_stream(classification.answer)
-                return
+            rewritten = self.query_rewriter.rewrite(query, history)
+            logger.debug("Orchestrator: query=%r → rewritten=%r", query, rewritten)
 
-        rewritten = self.query_rewriter.rewrite(query, history)
-        logger.debug("Orchestrator: query=%r → rewritten=%r", query, rewritten)
-
-        # ── Step 7: retrieval span ─────────────────────────────────────
-        ret_span = (
-            self.tracer.start_span(trace, "retrieval", metadata={"rewritten": rewritten})
-            if trace is not None else None
-        )
-        docs = self.retriever.retrieve(rewritten)
-        if ret_span is not None:
-            self.tracer.end_span(ret_span, metadata={"num_docs": len(docs)})
-
-        context = self.context_assembler.assemble(docs)
-
-        # ── Step 7: generation span (wraps the streaming loop) ─────────
-        gen_span = (
-            self.tracer.start_span(trace, "generation")
-            if trace is not None else None
-        )
-        answer = ""
-        for token in self.generator.stream(rewritten, context, history):
-            answer += token
-            yield token
-        if gen_span is not None:
-            self.tracer.end_span(
-                gen_span, metadata={"answer_len": len(answer)},
-            )
-
-        # ── Step 6: output guardrail (PII scrub + harmful-content judge) ──
-        if self.guardrail_suite is not None:
-            out_span = (
-                self.tracer.start_span(trace, "guardrail_output")
+            # ── Step 7: retrieval span ─────────────────────────────────
+            ret_span = (
+                self.tracer.start_span(trace, "retrieval", metadata={"rewritten": rewritten})
                 if trace is not None else None
             )
-            out_decision = self.guardrail_suite.check_output(answer)
-            if out_decision.blocked:
-                logger.info("Orchestrator: output blocked — %s", out_decision.reason)
-                # Replace the streamed answer with a refusal. The already-
-                # streamed tokens are not un-sent (SSE is one-way), but the
-                # persisted + post-processed answer is the refusal so the
-                # session store and history endpoint reflect the block.
-                answer = (
-                    "I can't provide that answer. Please ask a question about "
-                    "FastAPI, Pydantic v2, or SQLModel."
-                )
-            else:
-                answer = out_decision.scrubbed or answer
-            if out_span is not None:
+            docs = self.retriever.retrieve(rewritten)
+            if ret_span is not None:
+                self.tracer.end_span(ret_span, metadata={"num_docs": len(docs)})
+
+            context = self.context_assembler.assemble(docs)
+
+            # ── Step 7: generation span (wraps the streaming loop) ──────
+            gen_span = (
+                self.tracer.start_span(trace, "generation")
+                if trace is not None else None
+            )
+            answer = ""
+            for token in self.generator.stream(rewritten, context, history):
+                answer += token
+                yield token
+            if gen_span is not None:
                 self.tracer.end_span(
-                    out_span,
-                    metadata={"blocked": out_decision.blocked, "reason": out_decision.reason},
+                    gen_span, metadata={"answer_len": len(answer)},
                 )
 
-        result = self.post_processor.post_process(answer, docs)
-        if trace is not None:
-            result.trace_id = trace.id
-        yield result
+            # ── Step 6: output guardrail (PII scrub + harmful-content judge) ──
+            if self.guardrail_suite is not None:
+                out_span = (
+                    self.tracer.start_span(trace, "guardrail_output")
+                    if trace is not None else None
+                )
+                out_decision = self.guardrail_suite.check_output(answer)
+                if out_decision.blocked:
+                    logger.info("Orchestrator: output blocked — %s", out_decision.reason)
+                    # Replace the streamed answer with a refusal. The already-
+                    # streamed tokens are not un-sent (SSE is one-way), but the
+                    # persisted + post-processed answer is the refusal so the
+                    # session store and history endpoint reflect the block.
+                    answer = (
+                        "I can't provide that answer. Please ask a question about "
+                        "FastAPI, Pydantic v2, or SQLModel."
+                    )
+                else:
+                    answer = out_decision.scrubbed or answer
+                if out_span is not None:
+                    self.tracer.end_span(
+                        out_span,
+                        metadata={"blocked": out_decision.blocked, "reason": out_decision.reason},
+                    )
+
+            result = self.post_processor.post_process(answer, docs)
+            if trace is not None:
+                result.trace_id = trace.id
+            yield result
+        finally:
+            # ── Step 7: end the Langfuse root span (closes the trace) ───
+            if trace is not None:
+                self.tracer.end_trace(trace)
 
     def _refusal_stream(self, answer: str) -> Iterator[StreamItem]:
         """Yield a canned answer as one token + an empty PostProcessResult.
@@ -220,70 +225,75 @@ class RAGOrchestrator:
         if self.tracer is not None:
             trace = self.tracer.start_trace("chat", metadata={"query": query})
 
-        # ── Step 6: input guardrail + query classification ─────────────
-        if self.guardrail_suite is not None:
-            gr_span = (
-                self.tracer.start_span(trace, "guardrail_input")
-                if trace is not None else None
-            )
-            decision = self.guardrail_suite.check_input(query, history)
-            if decision.blocked:
-                refusal = (
-                    "I can't process that request. Please ask a question about "
-                    "FastAPI, Pydantic v2, or SQLModel."
+        try:
+            # ── Step 6: input guardrail + query classification ─────────
+            if self.guardrail_suite is not None:
+                gr_span = (
+                    self.tracer.start_span(trace, "guardrail_input")
+                    if trace is not None else None
                 )
+                decision = self.guardrail_suite.check_input(query, history)
+                if decision.blocked:
+                    refusal = (
+                        "I can't process that request. Please ask a question about "
+                        "FastAPI, Pydantic v2, or SQLModel."
+                    )
+                    if gr_span is not None:
+                        self.tracer.end_span(gr_span, metadata={"blocked": True})
+                    return refusal, PostProcessResult(answer=refusal), []
+
+                classification = self.guardrail_suite.classify(query, history)
                 if gr_span is not None:
-                    self.tracer.end_span(gr_span, metadata={"blocked": True})
-                return refusal, PostProcessResult(answer=refusal), []
+                    self.tracer.end_span(
+                        gr_span, metadata={"blocked": False, "class": classification.label},
+                    )
+                if classification.handled:
+                    return classification.answer, PostProcessResult(answer=classification.answer), []
 
-            classification = self.guardrail_suite.classify(query, history)
-            if gr_span is not None:
-                self.tracer.end_span(
-                    gr_span, metadata={"blocked": False, "class": classification.label},
-                )
-            if classification.handled:
-                return classification.answer, PostProcessResult(answer=classification.answer), []
+            rewritten = self.query_rewriter.rewrite(query, history)
 
-        rewritten = self.query_rewriter.rewrite(query, history)
-
-        ret_span = (
-            self.tracer.start_span(trace, "retrieval", metadata={"rewritten": rewritten})
-            if trace is not None else None
-        )
-        docs = self.retriever.retrieve(rewritten)
-        if ret_span is not None:
-            self.tracer.end_span(ret_span, metadata={"num_docs": len(docs)})
-
-        context = self.context_assembler.assemble(docs)
-
-        gen_span = (
-            self.tracer.start_span(trace, "generation")
-            if trace is not None else None
-        )
-        answer = "".join(self.generator.stream(rewritten, context, history))
-        if gen_span is not None:
-            self.tracer.end_span(gen_span, metadata={"answer_len": len(answer)})
-
-        # ── Step 6: output guardrail (PII scrub + harmful-content judge) ──
-        if self.guardrail_suite is not None:
-            out_span = (
-                self.tracer.start_span(trace, "guardrail_output")
+            ret_span = (
+                self.tracer.start_span(trace, "retrieval", metadata={"rewritten": rewritten})
                 if trace is not None else None
             )
-            out_decision = self.guardrail_suite.check_output(answer)
-            if out_decision.blocked:
-                answer = (
-                    "I can't provide that answer. Please ask a question about "
-                    "FastAPI, Pydantic v2, or SQLModel."
-                )
-            else:
-                answer = out_decision.scrubbed or answer
-            if out_span is not None:
-                self.tracer.end_span(
-                    out_span, metadata={"blocked": out_decision.blocked},
-                )
+            docs = self.retriever.retrieve(rewritten)
+            if ret_span is not None:
+                self.tracer.end_span(ret_span, metadata={"num_docs": len(docs)})
 
-        result = self.post_processor.post_process(answer, docs)
-        if trace is not None:
-            result.trace_id = trace.id
-        return answer, result, docs
+            context = self.context_assembler.assemble(docs)
+
+            gen_span = (
+                self.tracer.start_span(trace, "generation")
+                if trace is not None else None
+            )
+            answer = "".join(self.generator.stream(rewritten, context, history))
+            if gen_span is not None:
+                self.tracer.end_span(gen_span, metadata={"answer_len": len(answer)})
+
+            # ── Step 6: output guardrail (PII scrub + harmful-content judge) ──
+            if self.guardrail_suite is not None:
+                out_span = (
+                    self.tracer.start_span(trace, "guardrail_output")
+                    if trace is not None else None
+                )
+                out_decision = self.guardrail_suite.check_output(answer)
+                if out_decision.blocked:
+                    answer = (
+                        "I can't provide that answer. Please ask a question about "
+                        "FastAPI, Pydantic v2, or SQLModel."
+                    )
+                else:
+                    answer = out_decision.scrubbed or answer
+                if out_span is not None:
+                    self.tracer.end_span(
+                        out_span, metadata={"blocked": out_decision.blocked},
+                    )
+
+            result = self.post_processor.post_process(answer, docs)
+            if trace is not None:
+                result.trace_id = trace.id
+            return answer, result, docs
+        finally:
+            # ── Step 7: end the Langfuse root span (closes the trace) ───
+            if trace is not None:
+                self.tracer.end_trace(trace)

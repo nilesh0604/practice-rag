@@ -2,14 +2,15 @@
 
 Implements build-order items 39–41 (Phase 6 — Monitoring & Hardening):
 
-**39. Langfuse traces** — ``LangfuseTracer`` wraps the langfuse Python SDK so
-the orchestrator can emit a trace per chat request with child spans for
-retrieval, generation, and guardrail phases, plus a feedback score event.
-The tracer degrades gracefully: when the ``langfuse`` package is absent or
-``LANGFUSE_HOST`` is unset, every method is a safe no-op that still logs
-span lifecycle events via ``structlog``/stdlib — this is the doc's
-"Langfuse-down fallback to structlog" mitigation. The lazy-client pattern
-(like ``Generator`` / ``Embedder``) keeps unit tests network-free.
+**39. Langfuse traces** — ``LangfuseTracer`` wraps the langfuse Python SDK
+(v3/v4 OpenTelemetry-style API) so the orchestrator can emit a trace per
+chat request with child spans for retrieval, generation, and guardrail
+phases, plus a feedback score event. The tracer degrades gracefully: when
+the ``langfuse`` package is absent or ``LANGFUSE_BASE_URL`` is unset, every
+method is a safe no-op that still logs span lifecycle events via
+``structlog``/stdlib — this is the doc's "Langfuse-down fallback to
+structlog" mitigation. The lazy-client pattern (like ``Generator`` /
+``Embedder``) keeps unit tests network-free.
 
 **40. Metrics** — ``MetricsCollector`` is a thread-safe in-memory store for
 online serving metrics: TTFT (time-to-first-token) samples, request count,
@@ -44,8 +45,8 @@ logger = logging.getLogger(__name__)
 
 # ── Langfuse constants ─────────────────────────────────────────────────
 
-DEFAULT_LANGFUSE_HOST: str = "http://localhost:3000"
-"""Default Langfuse web host (the self-hosted Docker container)."""
+DEFAULT_LANGFUSE_BASE_URL: str = "https://us.cloud.langfuse.com"
+"""Default Langfuse base URL (Langfuse Cloud SaaS, US region)."""
 
 MAX_TTFT_SAMPLES: int = 200
 """Cap on retained TTFT samples for percentile computation (memory-bounded)."""
@@ -269,14 +270,17 @@ def _percentile(samples: list[float], pct: float) -> float:
 class TraceHandle:
     """Opaque handle for a Langfuse trace.
 
-    Carries a correlation ``id`` (a UUID-ish string) so the feedback
+    Carries a correlation ``id`` (the Langfuse trace id) so the feedback
     endpoint can attach a score to the right trace even when Langfuse is
     disabled (the id is still logged via structlog for correlation).
+    ``_lf_root`` is the root Langfuse observation (span) created by
+    ``start_trace``; it is ``None`` for handles constructed by the feedback
+    route (which only carries an ``id``) and for disabled traces.
     """
 
     id: str
     enabled: bool = True
-    _lf_trace: Any = None  # the real langfuse trace object (None when disabled)
+    _lf_root: Any = None  # root LangfuseSpan (None when disabled / feedback-only)
 
 
 @dataclass
@@ -290,18 +294,27 @@ class SpanHandle:
 
 
 class LangfuseTracer:
-    """Thin wrapper around the Langfuse SDK with graceful degradation.
+    """Thin wrapper around the Langfuse v3/v4 SDK with graceful degradation.
 
-    When Langfuse is available (``langfuse`` importable + ``LANGFUSE_HOST``
-    set + public/secret keys configured), traces and spans are sent to the
-    self-hosted Langfuse container. When any of those conditions fail, every
-    method is a safe no-op that still emits a structured log line — this is
-    the doc's "Langfuse-down fallback to structlog" mitigation. The
-    orchestrator calls tracer methods unconditionally; the tracer decides
-    whether to ship to Langfuse or just log.
+    When Langfuse is available (``langfuse`` importable + ``LANGFUSE_BASE_URL``
+    set + public/secret keys configured), traces and spans are sent to
+    Langfuse Cloud (https://us.cloud.langfuse.com). When any of those
+    conditions fail, every method is a safe no-op that still emits a
+    structured log line — this is the doc's "Langfuse-down fallback to
+    structlog" mitigation. The orchestrator calls tracer methods
+    unconditionally; the tracer decides whether to ship to Langfuse or just
+    log.
 
     The Langfuse client is lazily constructed (like ``Generator``) so unit
     tests inject a mock client or simply construct a disabled tracer.
+
+    SDK mapping (Langfuse >=3, OpenTelemetry-style API):
+
+    - ``start_trace`` → ``client.create_trace_id()`` + ``client.start_observation(as_type="span", trace_context=...)`` to create the root span.
+    - ``start_span``  → ``root.start_observation(as_type="span", ...)`` for a nested child.
+    - ``end_span``    → ``span.update(metadata=...)`` then ``span.end()``.
+    - ``end_trace``   → ``root.update(metadata=...)`` then ``root.end()``.
+    - ``record_score``→ ``client.create_score(trace_id=..., name=..., value=..., comment=...)``. Uses the trace id directly so the feedback route (which only has an id) works without the root span object.
     """
 
     def __init__(
@@ -313,7 +326,7 @@ class LangfuseTracer:
         secret_key: str | None = None,
     ) -> None:
         self._client = client
-        self._host = host or os.getenv("LANGFUSE_HOST", DEFAULT_LANGFUSE_HOST)
+        self._host = host or os.getenv("LANGFUSE_BASE_URL", DEFAULT_LANGFUSE_BASE_URL)
         self._public_key = public_key or os.getenv("LANGFUSE_PUBLIC_KEY")
         self._secret_key = secret_key or os.getenv("LANGFUSE_SECRET_KEY")
         if enabled is None:
@@ -324,11 +337,11 @@ class LangfuseTracer:
         """True only if langfuse is importable AND host + keys are configured.
 
         Checks the *raw* env vars (not the defaulted ``self._host``) so that
-        an unset ``LANGFUSE_HOST`` disables tracing even though the host
-        attribute has a localhost default for client construction.
+        an unset ``LANGFUSE_BASE_URL`` disables tracing even though the host
+        attribute has a cloud default for client construction.
         """
         if (
-            not os.getenv("LANGFUSE_HOST")
+            not os.getenv("LANGFUSE_BASE_URL")
             or not self._public_key
             or not self._secret_key
         ):
@@ -362,21 +375,29 @@ class LangfuseTracer:
     # ── trace + span lifecycle ──────────────────────────────────────────
 
     def start_trace(self, name: str, metadata: dict | None = None) -> TraceHandle:
-        """Begin a new trace for a chat request."""
-        trace_id = _gen_id()
+        """Begin a new trace for a chat request.
+
+        Creates a Langfuse trace id and a root span (observation) on that
+        trace. The root span is ended by ``end_trace``; child spans are
+        created via ``start_span`` and ended via ``end_span``.
+        """
         if not self._enabled:
+            trace_id = _gen_id()
             logger.info("trace.start name=%s id=%s meta=%s", name, trace_id, metadata)
             return TraceHandle(id=trace_id, enabled=False)
         try:
-            lf_trace = self.client.trace(
+            trace_id = self.client.create_trace_id()
+            lf_root = self.client.start_observation(
                 name=name,
-                id=trace_id,
+                as_type="span",
+                trace_context={"trace_id": trace_id},
                 metadata=metadata or {},
             )
         except Exception:  # noqa: BLE001 — Langfuse must never break serving
+            trace_id = _gen_id()
             logger.warning("Langfuse trace creation failed — falling back to log")
             return TraceHandle(id=trace_id, enabled=False)
-        return TraceHandle(id=trace_id, enabled=True, _lf_trace=lf_trace)
+        return TraceHandle(id=trace_id, enabled=True, _lf_root=lf_root)
 
     def start_span(
         self,
@@ -384,13 +405,17 @@ class LangfuseTracer:
         name: str,
         metadata: dict | None = None,
     ) -> SpanHandle:
-        """Begin a child span on ``trace``."""
+        """Begin a child span nested under the trace's root span."""
         start = time.time()
-        if not trace.enabled or not self._enabled:
+        if not trace.enabled or not self._enabled or trace._lf_root is None:
             logger.debug("span.start name=%s trace=%s meta=%s", name, trace.id, metadata)
             return SpanHandle(name=name, start=start, enabled=False)
         try:
-            lf_span = trace._lf_trace.span(name=name, metadata=metadata or {})
+            lf_span = trace._lf_root.start_observation(
+                name=name,
+                as_type="span",
+                metadata=metadata or {},
+            )
         except Exception:  # noqa: BLE001
             logger.warning("Langfuse span creation failed — falling back to log")
             return SpanHandle(name=name, start=start, enabled=False)
@@ -407,11 +432,22 @@ class LangfuseTracer:
             return
         try:
             if metadata:
-                span._lf_span.end(metadata=metadata)
-            else:
-                span._lf_span.end()
+                span._lf_span.update(metadata=metadata)
+            span._lf_span.end()
         except Exception:  # noqa: BLE001
             logger.warning("Langfuse span end failed")
+
+    def end_trace(self, trace: TraceHandle, metadata: dict | None = None) -> None:
+        """End the root span of a trace (call via try/finally in the orchestrator)."""
+        if not trace.enabled or not self._enabled or trace._lf_root is None:
+            logger.debug("trace.end id=%s meta=%s", trace.id, metadata)
+            return
+        try:
+            if metadata:
+                trace._lf_root.update(metadata=metadata)
+            trace._lf_root.end()
+        except Exception:  # noqa: BLE001
+            logger.warning("Langfuse trace end failed")
 
     def span(
         self,
@@ -434,7 +470,12 @@ class LangfuseTracer:
         value: float,
         comment: str | None = None,
     ) -> None:
-        """Attach a score (e.g. user feedback thumbs up/down) to a trace."""
+        """Attach a score (e.g. user feedback thumbs up/down) to a trace.
+
+        Uses ``client.create_score(trace_id=...)`` so this works for handles
+        that only carry an ``id`` (the feedback route) as well as for full
+        traces created by ``start_trace``.
+        """
         if not trace.enabled or not self._enabled:
             logger.info(
                 "score name=%s value=%s trace=%s comment=%s",
@@ -442,7 +483,12 @@ class LangfuseTracer:
             )
             return
         try:
-            trace._lf_trace.score(name=name, value=value, comment=comment or "")
+            self.client.create_score(
+                trace_id=trace.id,
+                name=name,
+                value=value,
+                comment=comment or "",
+            )
         except Exception:  # noqa: BLE001
             logger.warning("Langfuse score recording failed")
 

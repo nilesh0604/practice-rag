@@ -75,7 +75,7 @@ def get_tracer() -> LangfuseTracer:
     """Process-wide Langfuse tracer (Step 7, build-order item 39).
 
     Auto-disables when the ``langfuse`` package is absent or
-    ``LANGFUSE_HOST`` / public / secret keys are unset — in that mode every
+    ``LANGFUSE_BASE_URL`` / public / secret keys are unset — in that mode every
     method is a no-op that logs via structlog (the doc's "Langfuse-down
     fallback to structlog" mitigation).
     """

@@ -11,7 +11,7 @@ A **Retrieval-Augmented Generation (RAG) chat assistant** built end-to-end to pr
 | Goal                     | How this repo delivers                                                                                               |
 | ------------------------ | -------------------------------------------------------------------------------------------------------------------- |
 | **Interview confidence** | Reproduce the _entire_ RAG lifecycle (not just a notebook) so every design decision can be justified with trade-offs |
-| **$0 cost**              | Local Ollama LLM + embeddings, self-hosted Qdrant, self-hosted Langfuse — no per-token or managed-service bill       |
+| **$0 cost**              | Local Ollama LLM + embeddings, self-hosted Qdrant, Langfuse Cloud free tier — no per-token or managed-service bill   |
 | **Apple Silicon first**  | Targets MacBook Pro M1 32 GB RAM, macOS Sequoia, Colima for Docker                                                   |
 | **Employable stack**     | FastAPI, Ollama, Qdrant, Langfuse, Ragas, Docker, React — all appear in 2026 AI/LLM job specs                        |
 | **Single-language**      | Python for both the offline ingestion pipeline and the online serving layer (one venv, one test suite)               |
@@ -52,7 +52,7 @@ The corpus is a small open-source documentation subset (**FastAPI + Pydantic v2 
 │  Ragas offline eval (golden dataset)                       │
 ├─────────────────────────────────────────────────────────────┤
 │                   OBSERVABILITY                              │
-│  Langfuse (self-hosted)  │  structlog JSON                 │
+│  Langfuse Cloud          │  structlog JSON                 │
 ├─────────────────────────────────────────────────────────────┤
 │                   INFRASTRUCTURE                             │
 │  Docker Compose  │  Colima  │  Local named volumes          │
@@ -73,7 +73,7 @@ practice-rag/
 ├── requirements.txt                   # Python deps (installed via pip3 in conda env)
 ├── pyproject.toml                     # pytest config (pythonpath=. , testpaths=tests)
 ├── .gitignore                         # macOS, Python, Node, .env, Colima volumes
-├── docker-compose.yml                 # Qdrant, Postgres, Langfuse + backend (Phase 1 + Step 7)
+├── docker-compose.yml                 # Qdrant + backend (Langfuse is cloud-hosted)
 │                                      #   Ollama runs on the host, not in Docker
 ├── Dockerfile                         # Backend image (Step 7) ✅
 ├── schemas/                           # Shared Pydantic contracts (Step 1) ✅
@@ -194,7 +194,7 @@ Hardware target: **MacBook Pro M1, 32 GB RAM, macOS Sequoia**. The Colima VM is 
 ## Quick start (Phase 1 — Bootstrap)
 
 ```bash
-# 1. Start Colima with enough headroom for Qdrant + Langfuse
+# 1. Start Colima with enough headroom for Qdrant + backend
 colima start --cpu 4 --memory 8 --disk 100
 
 # 2. Ensure Ollama is running on the HOST (not in Docker)
@@ -211,13 +211,13 @@ conda activate rag-chat
 # 5. Install Python deps with pip3 (never into system Python)
 pip3 install -r requirements.txt
 
-# 6. Bring up the infrastructure stack (Qdrant + Langfuse)
+# 6. Bring up the infrastructure stack (Qdrant + backend)
 docker compose up -d
 
 # 7. Verify health endpoints
 curl http://localhost:11434/api/tags        # Ollama (host)
 curl http://localhost:6333/healthz          # Qdrant
-curl http://localhost:3000                  # Langfuse UI
+# Langfuse UI is hosted at https://cloud.langfuse.com (no local container)
 ```
 
 Once the stack is green, follow the **Dependency-Driven Build Order** below.
@@ -485,7 +485,7 @@ Request/response examples and the SSE format: [`ai-rag-chat-architecture-2026.md
 
 ## Observability & evaluation
 
-- **Langfuse (self-hosted)** traces every chat request: retrieval span, generation span, guardrail span, feedback score. The `LangfuseTracer` (`api/observability.py`) degrades to structlog logging when Langfuse is down or unconfigured — serving never breaks.
+- **Langfuse Cloud** (langfuse.com) traces every chat request: retrieval span, generation span, guardrail span, feedback score. The `LangfuseTracer` (`api/observability.py`) degrades to structlog logging when Langfuse is down or unconfigured — serving never breaks.
 - **structlog** emits JSON logs to stdout; falls back gracefully if Langfuse is down.
 - **Online metrics** (`GET /api/v1/metrics`) — TTFT (mean/p50/p95), request count, error count, cache hit rate. Collected in-process by `MetricsCollector`.
 - **Circuit breaker** (`CircuitBreaker`) wraps Ollama generation calls — opens after 3 consecutive failures, half-opens after 30 s, never stalls serving on a flaky model.
@@ -499,7 +499,7 @@ Metrics tracked: TTFT, retrieval recall@5, faithfulness, answer relevancy, user 
 
 ## Cost
 
-**Core workload: $0/month.** Ollama, Qdrant, FastAPI, React dev server, Langfuse, SQLite all run locally in Docker on Colima.
+**Core workload: $0/month.** Ollama, Qdrant, FastAPI, React dev server, Langfuse Cloud (free tier), SQLite all run locally in Docker on Colima.
 
 Optional "showcase" cloud deployment for a live resume URL: **$0–$2/month** using Vercel + Render/Railway + Groq free tier + Qdrant Cloud free tier + Turso.
 

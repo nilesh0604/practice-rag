@@ -2,8 +2,8 @@
 #
 # Brings up everything the project needs before any application code exists:
 #   - Qdrant      : hybrid (dense + sparse) vector store
-#   - Langfuse v4 : self-hosted LLM observability
-#       └─ postgres + clickhouse + redis + minio + langfuse-worker + langfuse-web
+#   - Langfuse    : LLM observability via Langfuse Cloud (https://cloud.langfuse.com)
+#       └─ no local containers — traces are sent to the hosted SaaS endpoint
 #
 # Ollama runs on the HOST (not in Docker) to avoid port conflicts and let the
 # host GPU/Metal acceleration handle generation + embeddings directly.
@@ -13,8 +13,6 @@
 #
 # Resource policy (project rule: minimal containers — 1 CPU, 1 GB RAM, 5 GB disk):
 #   * Most services are capped at 1 CPU + 1 GB RAM.
-#   * Langfuse web + worker get 2 GB RAM (Next.js + Prisma need more than 1 GB
-#     during startup/migrations; documented exception to the 1 GB rule).
 #   * Per-container disk is governed by the Colima VM (100 GB) + named volumes;
 #     Docker Compose cannot portably cap container disk, so the 5 GB guideline
 #     is enforced by keeping volumes small and pruning old data.
@@ -60,7 +58,7 @@ services:
   # The backend container connects to:
   #   - Qdrant  : http://qdrant:6333  (same compose network)
   #   - Ollama  : http://host.docker.internal:11434  (host Ollama, D1)
-  #   - Langfuse: http://langfuse-web:3000  (same compose network)
+  #   - Langfuse: https://cloud.langfuse.com  (Langfuse Cloud SaaS, external)
   # The Dockerfile copies the seed corpus so /api/v1/ingest works without a
   # bind mount. The lifespan warm-up pre-loads the Ollama model on startup.
   backend:
@@ -81,8 +79,8 @@ services:
       OLLAMA_WARMUP_MODEL: ${OLLAMA_WARMUP_MODEL:-llama3.2:3b}
       FRONTEND_ORIGIN: ${FRONTEND_ORIGIN:-http://localhost:5173}
       CORPUS_DIR: data/corpus
-      # Langfuse tracing is optional — only enabled when host + keys are set.
-      LANGFUSE_HOST: ${LANGFUSE_HOST:-}
+      # Langfuse tracing is optional — only enabled when base URL + keys are set.
+      LANGFUSE_BASE_URL: ${LANGFUSE_BASE_URL:-}
       LANGFUSE_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY:-}
       LANGFUSE_SECRET_KEY: ${LANGFUSE_SECRET_KEY:-}
     healthcheck:
@@ -103,195 +101,13 @@ services:
           cpus: "1.0"
           memory: 1g
 
-  # ─────────────────────────────── Langfuse v4 ──────────────────────────────
-  # Official self-hosted stack: postgres + clickhouse + redis + minio +
-  # langfuse-worker + langfuse-web. See .env.example for the CHANGEME secrets.
-  postgres:
-    image: docker.io/postgres:${POSTGRES_VERSION:-17}
-    container_name: practice-rag-postgres
-    restart: always
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres"]
-      interval: 3s
-      timeout: 3s
-      retries: 10
-    environment:
-      POSTGRES_USER: ${POSTGRES_USER:-postgres}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres} # CHANGEME
-      POSTGRES_DB: ${POSTGRES_DB:-postgres}
-      TZ: UTC
-      PGTZ: UTC
-    ports:
-      - "127.0.0.1:5432:5432"
-    volumes:
-      - langfuse_postgres_data:/var/lib/postgresql/data
-    deploy:
-      resources:
-        limits:
-          cpus: "1.0"
-          memory: 1g
-
-  clickhouse:
-    image: docker.io/clickhouse/clickhouse-server:25.12
-    container_name: practice-rag-clickhouse
-    restart: always
-    user: "101:101"
-    environment:
-      CLICKHOUSE_DB: default
-      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-clickhouse}
-      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-clickhouse} # CHANGEME
-    volumes:
-      - langfuse_clickhouse_data:/var/lib/clickhouse
-      - langfuse_clickhouse_logs:/var/log/clickhouse-server
-    ports:
-      - "127.0.0.1:8123:8123"
-      - "127.0.0.1:9000:9000"
-    healthcheck:
-      test: wget --no-verbose --tries=1 --spider http://localhost:8123/ping || exit 1
-      interval: 5s
-      timeout: 5s
-      retries: 10
-      start_period: 1s
-    deploy:
-      resources:
-        limits:
-          cpus: "1.0"
-          memory: 1g
-
-  redis:
-    image: docker.io/redis:7
-    container_name: practice-rag-redis
-    restart: always
-    command: >
-      --requirepass ${REDIS_AUTH:-myredissecret}
-      --maxmemory-policy noeviction
-    ports:
-      - "127.0.0.1:6379:6379"
-    volumes:
-      - langfuse_redis_data:/data
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 3s
-      timeout: 10s
-      retries: 10
-    deploy:
-      resources:
-        limits:
-          cpus: "1.0"
-          memory: 1g
-
-  minio:
-    image: cgr.dev/chainguard/minio
-    container_name: practice-rag-minio
-    restart: always
-    entrypoint: sh
-    command: -c 'mkdir -p /data/langfuse && minio server --address ":9000" --console-address ":9001" /data'
-    environment:
-      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minio}
-      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-miniosecret} # CHANGEME
-    ports:
-      - "9090:9000"
-      - "127.0.0.1:9091:9001"
-    volumes:
-      - langfuse_minio_data:/data
-    healthcheck:
-      test: ["CMD", "mc", "ready", "local"]
-      interval: 1s
-      timeout: 5s
-      retries: 5
-      start_period: 1s
-    deploy:
-      resources:
-        limits:
-          cpus: "1.0"
-          memory: 1g
-
-  langfuse-worker:
-    image: docker.io/langfuse/langfuse-worker:4
-    container_name: practice-rag-langfuse-worker
-    restart: always
-    depends_on: &langfuse-depends-on
-      postgres:
-        condition: service_healthy
-      minio:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-      clickhouse:
-        condition: service_healthy
-    ports:
-      - "127.0.0.1:3030:3030"
-    environment: &langfuse-env
-      NEXTAUTH_URL: ${NEXTAUTH_URL:-http://localhost:3000}
-      DATABASE_URL: ${DATABASE_URL:-postgresql://postgres:postgres@postgres:5432/postgres} # CHANGEME
-      SALT: ${SALT:-mysalt} # CHANGEME
-      ENCRYPTION_KEY: ${ENCRYPTION_KEY:-0000000000000000000000000000000000000000000000000000000000000000} # CHANGEME
-      TELEMETRY_ENABLED: ${TELEMETRY_ENABLED:-false}
-      CLICKHOUSE_MIGRATION_URL: ${CLICKHOUSE_MIGRATION_URL:-clickhouse://clickhouse:9000}
-      CLICKHOUSE_URL: ${CLICKHOUSE_URL:-http://clickhouse:8123}
-      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-clickhouse}
-      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-clickhouse} # CHANGEME
-      CLICKHOUSE_CLUSTER_ENABLED: ${CLICKHOUSE_CLUSTER_ENABLED:-false}
-      LANGFUSE_S3_EVENT_UPLOAD_BUCKET: ${LANGFUSE_S3_EVENT_UPLOAD_BUCKET:-langfuse}
-      LANGFUSE_S3_EVENT_UPLOAD_REGION: ${LANGFUSE_S3_EVENT_UPLOAD_REGION:-auto}
-      LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID: ${LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID:-minio}
-      LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY: ${LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY:-miniosecret} # CHANGEME
-      LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT: ${LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT:-http://minio:9000}
-      LANGFUSE_S3_EVENT_UPLOAD_FORCE_PATH_STYLE: ${LANGFUSE_S3_EVENT_UPLOAD_FORCE_PATH_STYLE:-true}
-      LANGFUSE_S3_EVENT_UPLOAD_PREFIX: ${LANGFUSE_S3_EVENT_UPLOAD_PREFIX:-events/}
-      LANGFUSE_S3_MEDIA_UPLOAD_BUCKET: ${LANGFUSE_S3_MEDIA_UPLOAD_BUCKET:-langfuse}
-      LANGFUSE_S3_MEDIA_UPLOAD_REGION: ${LANGFUSE_S3_MEDIA_UPLOAD_REGION:-auto}
-      LANGFUSE_S3_MEDIA_UPLOAD_ACCESS_KEY_ID: ${LANGFUSE_S3_MEDIA_UPLOAD_ACCESS_KEY_ID:-minio}
-      LANGFUSE_S3_MEDIA_UPLOAD_SECRET_ACCESS_KEY: ${LANGFUSE_S3_MEDIA_UPLOAD_SECRET_ACCESS_KEY:-miniosecret} # CHANGEME
-      LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT: ${LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT:-http://minio:9000}
-      LANGFUSE_S3_MEDIA_UPLOAD_FORCE_PATH_STYLE: ${LANGFUSE_S3_MEDIA_UPLOAD_FORCE_PATH_STYLE:-true}
-      LANGFUSE_S3_MEDIA_UPLOAD_PREFIX: ${LANGFUSE_S3_MEDIA_UPLOAD_PREFIX:-media/}
-      LANGFUSE_S3_BATCH_EXPORT_ENABLED: ${LANGFUSE_S3_BATCH_EXPORT_ENABLED:-false}
-      REDIS_HOST: ${REDIS_HOST:-redis}
-      REDIS_PORT: ${REDIS_PORT:-6379}
-      REDIS_AUTH: ${REDIS_AUTH:-myredissecret} # CHANGEME
-    deploy:
-      resources:
-        limits:
-          cpus: "1.0"
-          memory: 2g
-
-  langfuse-web:
-    image: docker.io/langfuse/langfuse:4
-    container_name: practice-rag-langfuse-web
-    restart: always
-    depends_on: *langfuse-depends-on
-    ports:
-      - "3000:3000"
-    environment:
-      <<: *langfuse-env
-      NEXTAUTH_SECRET: ${NEXTAUTH_SECRET:-mysecret} # CHANGEME
-      LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT: ${LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT:-http://localhost:9090}
-      LANGFUSE_INIT_ORG_ID: ${LANGFUSE_INIT_ORG_ID:-}
-      LANGFUSE_INIT_ORG_NAME: ${LANGFUSE_INIT_ORG_NAME:-}
-      LANGFUSE_INIT_PROJECT_ID: ${LANGFUSE_INIT_PROJECT_ID:-}
-      LANGFUSE_INIT_PROJECT_NAME: ${LANGFUSE_INIT_PROJECT_NAME:-}
-      LANGFUSE_INIT_PROJECT_PUBLIC_KEY: ${LANGFUSE_INIT_PROJECT_PUBLIC_KEY:-}
-      LANGFUSE_INIT_PROJECT_SECRET_KEY: ${LANGFUSE_INIT_PROJECT_SECRET_KEY:-}
-      LANGFUSE_INIT_USER_EMAIL: ${LANGFUSE_INIT_USER_EMAIL:-}
-      LANGFUSE_INIT_USER_NAME: ${LANGFUSE_INIT_USER_NAME:-}
-      LANGFUSE_INIT_USER_PASSWORD: ${LANGFUSE_INIT_USER_PASSWORD:-}
-    deploy:
-      resources:
-        limits:
-          cpus: "1.0"
-          memory: 2g
+  # ─────────────────────────────── Langfuse ─────────────────────────────────
+  # Langfuse observability is now hosted on Langfuse Cloud
+  # (https://cloud.langfuse.com) — no local containers are needed. The backend
+  # sends traces to the cloud endpoint configured via LANGFUSE_BASE_URL +
+  # LANGFUSE_PUBLIC_KEY + LANGFUSE_SECRET_KEY (see .env.example). Tracing is
+  # optional and auto-disables when those env vars are unset.
 
 volumes:
   qdrant_data:
-    driver: local
-  langfuse_postgres_data:
-    driver: local
-  langfuse_clickhouse_data:
-    driver: local
-  langfuse_clickhouse_logs:
-    driver: local
-  langfuse_minio_data:
-    driver: local
-  langfuse_redis_data:
     driver: local

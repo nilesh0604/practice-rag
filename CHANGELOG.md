@@ -5,6 +5,75 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed — Langfuse tracer silently disabled (v2→v4 SDK API mismatch)
+
+The `LangfuseTracer` was written against the Langfuse **v2 SDK API**
+(`client.trace(...)`, `trace.span(...)`, `trace.score(...)`, `span.end(metadata=...)`)
+but `requirements.txt` had `langfuse>=3.0` (unbounded), which allowed
+`langfuse` v3/v4 to install. The v3/v4 SDK removed all of those methods in
+favor of the OpenTelemetry-style API (`start_observation`, `create_score`,
+`create_trace_id`, `span.update()` + `span.end()`). As a result, every
+`start_trace` / `start_span` / `record_score` call hit the `except Exception`
+graceful-degradation branch and silently fell back to structlog — **no
+traces, spans, or scores actually reached Langfuse Cloud**, even though
+`tracer.enabled` was `True` and the client constructed successfully. The
+app ran fine but observability was completely dark.
+
+Root cause was discovered via a live integration check: `trace.enabled`
+returned `True` but `trace._lf_trace` was `None` because
+`client.trace()` raised `AttributeError: 'Langfuse' object has no attribute
+'trace'`, caught by the broad `except Exception` block.
+
+Pinning to `langfuse<3` (v2 API) was attempted first but rejected because
+langfuse v2 requires `wrapt<2.0` while `unstructured 0.25.2` (used by the
+ingestion pipeline) requires `wrapt>=2.1.1` — a hard, unresolvable
+dependency conflict. The only clean fix was to upgrade the tracer code to
+the v3/v4 API.
+
+- `api/observability.py` — rewrote `LangfuseTracer` to use the v3/v4 SDK:
+  `start_trace` now calls `client.create_trace_id()` +
+  `client.start_observation(as_type="span", trace_context=...)` to create a
+  root span; `start_span` nests via `root.start_observation(...)`; `end_span`
+  calls `span.update(metadata=...)` then `span.end()`; new `end_trace` method
+  closes the root span; `record_score` uses `client.create_score(trace_id=...)`
+  instead of `trace.score(...)` (this also fixes the feedback route, which
+  constructs a `TraceHandle` with just an id and no root span object).
+  `TraceHandle._lf_trace` renamed to `_lf_root`. Updated the class docstring
+  with the full SDK method mapping and the module docstring to reference v3/v4.
+- `rag/orchestrator.py` — wrapped both `stream_answer` (generator) and
+  `answer` (non-streaming) bodies in `try/finally` that calls
+  `self.tracer.end_trace(trace)` so the root span is always closed even on
+  early returns (input-blocked, classification short-circuit) and exceptions.
+- `tests/test_observability.py` — rewrote `TestLangfuseTracerEnabled` for the
+  new API shape: mock client now stubs `create_trace_id` / `start_observation`
+  / `create_score`; `TraceHandle` uses `_lf_root`; `end_span` asserts
+  `update`+`end` call sequence; added 6 new tests for `end_trace` (with/without
+  metadata, noop-when-root-None, degrades-on-error) and `record_score` with
+  an id-only handle (feedback-route scenario). 73 tests total (was 67).
+- `requirements.txt` — `langfuse>=3.0` (unchanged from original; the code now
+  targets the v3/v4 API so the unbounded upper is correct).
+
+### Changed — Migrate Langfuse from self-hosted to Langfuse Cloud (langfuse.com)
+
+Replaced the self-hosted Langfuse v4 Docker stack (postgres, clickhouse, redis, minio, langfuse-worker, langfuse-web) with the hosted Langfuse Cloud SaaS. Traces, spans, and feedback scores are now sent to the cloud endpoint (US region: `https://us.cloud.langfuse.com`) instead of a local container stack. The env var was renamed from `LANGFUSE_HOST` to `LANGFUSE_BASE_URL` to match Langfuse Cloud conventions.
+
+- `docker-compose.yml` — removed the six self-hosted Langfuse services (postgres, clickhouse, redis, minio, langfuse-worker, langfuse-web) and their five named volumes. The compose stack now contains only Qdrant + the FastAPI backend. Backend env var passthrough renamed from `LANGFUSE_HOST` to `LANGFUSE_BASE_URL`. Updated the header and backend-service comments to reference the cloud endpoint.
+- `.env.example` — removed the Langfuse core (NEXTAUTH\_\*, SALT, ENCRYPTION_KEY, TELEMETRY_ENABLED), Postgres, ClickHouse, Redis, and MinIO sections. `LANGFUSE_BASE_URL` now defaults to `https://us.cloud.langfuse.com` (Langfuse Cloud US region); `LANGFUSE_PUBLIC_KEY` / `LANGFUSE_SECRET_KEY` remain blank by default (tracing disabled until the user creates a project at cloud.langfuse.com and pastes the API keys).
+- `api/observability.py` — `DEFAULT_LANGFUSE_BASE_URL` set to `https://us.cloud.langfuse.com`. The env var was renamed from `LANGFUSE_HOST` to `LANGFUSE_BASE_URL` across the tracer (`__init__`, `_detect_enabled`) and the module docstring. Updated the `LangfuseTracer` docstring to reference Langfuse Cloud instead of the self-hosted container.
+- `api/main.py` — `_langfuse_enabled()` now reads `LANGFUSE_BASE_URL` instead of `LANGFUSE_HOST`.
+- `api/deps.py` — `get_tracer()` docstring updated to reference `LANGFUSE_BASE_URL`.
+- `tests/test_observability.py` — updated the `LANGFUSE_BASE_URL` values in the enable-detection tests to `https://us.cloud.langfuse.com`.
+- `README.md` — updated the cost table, architecture diagram, repo-layout comment, quick-start health-check step, and observability section to reference Langfuse Cloud instead of the self-hosted stack.
+
+### Notes — Langfuse Cloud migration
+
+- **Env var rename:** `LANGFUSE_HOST` → `LANGFUSE_BASE_URL`. The Langfuse Python SDK constructor parameter is still `host=`, but the env var name is a project-level choice; `LANGFUSE_BASE_URL` aligns with Langfuse Cloud's documented convention and avoids ambiguity with `LANGFUSE_HOST` (which the SDK reads by default for self-hosted deployments).
+- **US region:** the default base URL is `https://us.cloud.langfuse.com` (Langfuse Cloud US). EU region is `https://cloud.langfuse.com` — set `LANGFUSE_BASE_URL` accordingly if your project is in the EU region.
+- **No code behavior change:** the `LangfuseTracer` already auto-disables when `LANGFUSE_BASE_URL` / keys are unset and lazily constructs the client from env vars, so the only code change is the default constant + env var name. The tracer, orchestrator span wiring, and feedback-score correlation are unchanged.
+- **Operational change:** `docker compose up -d` now brings up only Qdrant + the backend (2 containers) instead of 8 containers. Langfuse traces are viewed at https://us.cloud.langfuse.com instead of http://localhost:3000.
+- **Cost:** Langfuse Cloud has a free tier (sufficient for this practice project); the self-hosted stack was free but consumed ~8 GB RAM across 6 containers. This trades local resource usage for a managed SaaS dependency.
+- **Enterprise note:** the architecture doc (`ai-rag-chat-architecture-2026.md`) still references "Langfuse self-hosted in Docker" as a design decision (D4) and cost constraint. That doc is a historical design reference and is not updated here; the operational reality is now Langfuse Cloud.
+
 ### Added — Chat assistant feature status register
 
 - `docs/CHAT_ASSISTANT_FEATURES.md` — documents the full list of chat assistant features (core chat, React widget UI, retrieval, APIs, guardrails, responsible AI, performance & cost, RBAC) from the production AEM/Azure target in `ai-rag-chat-architecture-2026.md`, mapped to their **actual implementation status** in this local practice codebase. Each feature is tagged ✅ Implemented / 🟡 Partial / ❌ Not implemented, with the stack substitution table (Ollama vs Azure OpenAI, Qdrant vs Azure AI Search, SQLite vs Redis/Cosmos, standalone Vite SPA vs AEM SPA Editor) and per-feature file references. Includes a summary count table and a bottom-line assessment pointing to `docs/F500_ENTERPRISE_ACTION_ITEMS.md` for the deferred enterprise gaps.

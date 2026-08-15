@@ -8,7 +8,7 @@ Hardening):
 - **structlog JSON logging** — emits structured JSON log lines to stdout;
   falls back to the stdlib logger if structlog is unavailable.
 - **Langfuse** — optional. If the ``langfuse`` package is importable and
-  ``LANGFUSE_HOST`` is set, the chat flow is traced; otherwise tracing is a
+  ``LANGFUSE_BASE_URL`` is set, the chat flow is traced; otherwise tracing is a
   no-op so the app runs fine with Langfuse down or absent (per the doc's
   "falls back gracefully if Langfuse is down"). Full Langfuse span wiring
   is in ``rag/orchestrator.py`` (Step 7); the enabled-flag seam is here.
@@ -68,8 +68,8 @@ def _configure_structlog() -> None:
 
 
 def _langfuse_enabled() -> bool:
-    """True only if langfuse is importable AND ``LANGFUSE_HOST`` is set."""
-    if not os.getenv("LANGFUSE_HOST"):
+    """True only if langfuse is importable AND ``LANGFUSE_BASE_URL`` is set."""
+    if not os.getenv("LANGFUSE_BASE_URL"):
         return False
     try:
         import langfuse  # noqa: F401

@@ -344,60 +344,111 @@ class TestLangfuseTracerEnabled:
     def _make_enabled_tracer(self):
         """Tracer with a mock client forced enabled."""
         mock_client = MagicMock()
+        mock_client.create_trace_id.return_value = "mock-trace-id"
         return LangfuseTracer(enabled=True, client=mock_client)
 
     def test_start_trace_creates_langfuse_trace(self):
         t = self._make_enabled_tracer()
-        mock_trace = MagicMock()
-        t._client.trace.return_value = mock_trace
+        mock_root = MagicMock()
+        t._client.start_observation.return_value = mock_root
         trace = t.start_trace("chat", metadata={"q": "hi"})
         assert trace.enabled
-        assert trace._lf_trace is mock_trace
-        t._client.trace.assert_called_once()
+        assert trace._lf_root is mock_root
+        assert trace.id == "mock-trace-id"
+        t._client.create_trace_id.assert_called_once()
+        t._client.start_observation.assert_called_once()
+        call_kwargs = t._client.start_observation.call_args.kwargs
+        assert call_kwargs["name"] == "chat"
+        assert call_kwargs["as_type"] == "span"
+        assert call_kwargs["trace_context"] == {"trace_id": "mock-trace-id"}
+        assert call_kwargs["metadata"] == {"q": "hi"}
 
     def test_start_span_creates_langfuse_span(self):
         t = self._make_enabled_tracer()
-        mock_trace = MagicMock()
+        mock_root = MagicMock()
         mock_span = MagicMock()
-        mock_trace.span.return_value = mock_span
-        trace = TraceHandle(id="x", enabled=True, _lf_trace=mock_trace)
+        mock_root.start_observation.return_value = mock_span
+        trace = TraceHandle(id="x", enabled=True, _lf_root=mock_root)
         span = t.start_span(trace, "retrieval", metadata={"k": "v"})
         assert span.enabled
         assert span._lf_span is mock_span
-        mock_trace.span.assert_called_once()
+        mock_root.start_observation.assert_called_once()
+        call_kwargs = mock_root.start_observation.call_args.kwargs
+        assert call_kwargs["name"] == "retrieval"
+        assert call_kwargs["as_type"] == "span"
+        assert call_kwargs["metadata"] == {"k": "v"}
 
-    def test_end_span_calls_lf_end(self):
+    def test_end_span_calls_update_then_end(self):
         t = self._make_enabled_tracer()
         mock_span = MagicMock()
         span = SpanHandle(name="gen", start=time.time(), enabled=True, _lf_span=mock_span)
         t.end_span(span, metadata={"len": 10})
-        mock_span.end.assert_called_once_with(metadata={"len": 10})
+        mock_span.update.assert_called_once_with(metadata={"len": 10})
+        mock_span.end.assert_called_once()
 
     def test_end_span_without_metadata(self):
         t = self._make_enabled_tracer()
         mock_span = MagicMock()
         span = SpanHandle(name="gen", start=time.time(), enabled=True, _lf_span=mock_span)
         t.end_span(span)
-        mock_span.end.assert_called_once_with()
+        mock_span.update.assert_not_called()
+        mock_span.end.assert_called_once()
 
-    def test_record_score_calls_lf_score(self):
+    def test_end_trace_calls_update_then_end(self):
         t = self._make_enabled_tracer()
-        mock_trace = MagicMock()
-        trace = TraceHandle(id="x", enabled=True, _lf_trace=mock_trace)
+        mock_root = MagicMock()
+        trace = TraceHandle(id="x", enabled=True, _lf_root=mock_root)
+        t.end_trace(trace, metadata={"status": "ok"})
+        mock_root.update.assert_called_once_with(metadata={"status": "ok"})
+        mock_root.end.assert_called_once()
+
+    def test_end_trace_without_metadata(self):
+        t = self._make_enabled_tracer()
+        mock_root = MagicMock()
+        trace = TraceHandle(id="x", enabled=True, _lf_root=mock_root)
+        t.end_trace(trace)
+        mock_root.update.assert_not_called()
+        mock_root.end.assert_called_once()
+
+    def test_end_trace_is_noop_when_root_is_none(self):
+        t = self._make_enabled_tracer()
+        trace = TraceHandle(id="x", enabled=True, _lf_root=None)
+        t.end_trace(trace)  # should not raise
+
+    def test_record_score_calls_create_score(self):
+        t = self._make_enabled_tracer()
+        trace = TraceHandle(id="x", enabled=True, _lf_root=MagicMock())
         t.record_score(trace, "feedback", 1.0, comment="good")
-        mock_trace.score.assert_called_once_with(name="feedback", value=1.0, comment="good")
+        t._client.create_score.assert_called_once_with(
+            trace_id="x", name="feedback", value=1.0, comment="good",
+        )
+
+    def test_record_score_works_with_id_only_handle(self):
+        """Feedback route constructs a TraceHandle with just an id (no _lf_root)."""
+        t = self._make_enabled_tracer()
+        trace = TraceHandle(id="fb-trace-id", enabled=True, _lf_root=None)
+        t.record_score(trace, "user_feedback", 0.0, comment="bad")
+        t._client.create_score.assert_called_once_with(
+            trace_id="fb-trace-id", name="user_feedback", value=0.0, comment="bad",
+        )
 
     def test_start_trace_degrades_on_sdk_error(self):
         t = self._make_enabled_tracer()
-        t._client.trace.side_effect = RuntimeError("langfuse down")
+        t._client.create_trace_id.side_effect = RuntimeError("langfuse down")
         trace = t.start_trace("chat")
         assert not trace.enabled  # falls back to disabled handle
 
+    def test_start_trace_degrades_on_observation_error(self):
+        t = self._make_enabled_tracer()
+        t._client.start_observation.side_effect = RuntimeError("langfuse down")
+        trace = t.start_trace("chat")
+        assert not trace.enabled
+
     def test_start_span_degrades_on_sdk_error(self):
         t = self._make_enabled_tracer()
-        mock_trace = MagicMock()
-        mock_trace.span.side_effect = RuntimeError("langfuse down")
-        trace = TraceHandle(id="x", enabled=True, _lf_trace=mock_trace)
+        mock_root = MagicMock()
+        mock_root.start_observation.side_effect = RuntimeError("langfuse down")
+        trace = TraceHandle(id="x", enabled=True, _lf_root=mock_root)
         span = t.start_span(trace, "retrieval")
         assert not span.enabled
 
@@ -408,11 +459,17 @@ class TestLangfuseTracerEnabled:
         span = SpanHandle(name="gen", start=time.time(), enabled=True, _lf_span=mock_span)
         t.end_span(span)  # should not raise
 
+    def test_end_trace_degrades_on_sdk_error(self):
+        t = self._make_enabled_tracer()
+        mock_root = MagicMock()
+        mock_root.end.side_effect = RuntimeError("langfuse down")
+        trace = TraceHandle(id="x", enabled=True, _lf_root=mock_root)
+        t.end_trace(trace)  # should not raise
+
     def test_record_score_degrades_on_sdk_error(self):
         t = self._make_enabled_tracer()
-        mock_trace = MagicMock()
-        mock_trace.score.side_effect = RuntimeError("langfuse down")
-        trace = TraceHandle(id="x", enabled=True, _lf_trace=mock_trace)
+        t._client.create_score.side_effect = RuntimeError("langfuse down")
+        trace = TraceHandle(id="x", enabled=True, _lf_root=MagicMock())
         t.record_score(trace, "feedback", 1.0)  # should not raise
 
     def test_flush_calls_client_flush(self):
@@ -434,32 +491,32 @@ class TestLangfuseTracerEnabled:
 
     def test_span_context_manager_ends_on_exit(self):
         t = self._make_enabled_tracer()
-        mock_trace = MagicMock()
+        mock_root = MagicMock()
         mock_span = MagicMock()
-        mock_trace.span.return_value = mock_span
-        trace = TraceHandle(id="x", enabled=True, _lf_trace=mock_trace)
+        mock_root.start_observation.return_value = mock_span
+        trace = TraceHandle(id="x", enabled=True, _lf_root=mock_root)
         with t.span(trace, "retrieval"):
             pass
         mock_span.end.assert_called_once()
 
     def test_span_context_manager_records_error_on_exception(self):
         t = self._make_enabled_tracer()
-        mock_trace = MagicMock()
+        mock_root = MagicMock()
         mock_span = MagicMock()
-        mock_trace.span.return_value = mock_span
-        trace = TraceHandle(id="x", enabled=True, _lf_trace=mock_trace)
+        mock_root.start_observation.return_value = mock_span
+        trace = TraceHandle(id="x", enabled=True, _lf_root=mock_root)
         with pytest.raises(ValueError):
             with t.span(trace, "retrieval"):
                 raise ValueError("boom")
         mock_span.end.assert_called_once()
-        call_kwargs = mock_span.end.call_args
-        assert "error" in call_kwargs.kwargs.get("metadata", {})
+        update_kwargs = mock_span.update.call_args.kwargs
+        assert "error" in update_kwargs.get("metadata", {})
 
 
 class TestLangfuseTracerDetection:
     def test_enabled_when_host_and_keys_set_and_importable(self):
         with patch.dict("os.environ", {
-            "LANGFUSE_HOST": "http://localhost:3000",
+            "LANGFUSE_BASE_URL": "https://us.cloud.langfuse.com",
             "LANGFUSE_PUBLIC_KEY": "pk-xxx",
             "LANGFUSE_SECRET_KEY": "sk-xxx",
         }):
@@ -478,14 +535,14 @@ class TestLangfuseTracerDetection:
 
     def test_disabled_when_keys_missing(self):
         with patch.dict("os.environ", {
-            "LANGFUSE_HOST": "http://localhost:3000",
+            "LANGFUSE_BASE_URL": "https://us.cloud.langfuse.com",
         }, clear=True):
             t = LangfuseTracer()
             assert not t.enabled
 
     def test_disabled_when_langfuse_not_importable(self):
         with patch.dict("os.environ", {
-            "LANGFUSE_HOST": "http://localhost:3000",
+            "LANGFUSE_BASE_URL": "https://us.cloud.langfuse.com",
             "LANGFUSE_PUBLIC_KEY": "pk",
             "LANGFUSE_SECRET_KEY": "sk",
         }):
