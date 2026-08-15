@@ -25,7 +25,7 @@ from api.conversation import DEFAULT_DB_PATH, ConversationStore
 from api.guardrails import GuardrailSuite, InputGuardrail, OutputGuardrail, QueryClassifier
 from api.observability import CircuitBreaker, LangfuseTracer, MetricsCollector
 from rag.context_assembler import ContextAssembler
-from rag.generator import Generator
+from rag.nim_generator import build_generator
 from rag.orchestrator import RAGOrchestrator
 from rag.post_processor import PostProcessor
 from rag.qdrant_collection import get_qdrant_client
@@ -97,7 +97,7 @@ def get_orchestrator() -> RAGOrchestrator:
     return RAGOrchestrator(
         get_retriever(),
         ContextAssembler(),
-        Generator(circuit_breaker=get_circuit_breaker()),
+        build_generator(circuit_breaker=get_circuit_breaker()),
         PostProcessor(get_embedder()),
         query_rewriter=LLMQueryRewriter(),
         guardrail_suite=get_guardrail_suite(),

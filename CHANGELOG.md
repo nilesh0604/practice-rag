@@ -5,6 +5,102 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed — NVIDIA NIM default model swapped after live integration test
+
+- `NIM_GENERATION_MODEL` default changed from `moonshotai/kimi-k2.6` to
+  `meta/llama-3.1-8b-instruct`. A live integration test against
+  `https://integrate.api.nvidia.com/v1` (2026-08-15) confirmed the API key
+  is valid and SSE streaming works end-to-end, but `moonshotai/kimi-k2.6`
+  returns HTTP 404 on `/chat/completions` (retired/undeployed on the free
+  tier, despite still appearing in `GET /v1/models`). `meta/llama-3.1-8b-
+instruct` is the integration plan's own production target and streams
+  correctly (~0.35–1s). Updated `test_default_model` assertion to match.
+  See `docs/F500_ENTERPRISE_ACTION_ITEMS.md` #11 for the catalog-drift
+  workaround record.
+
+### Added — NVIDIA NIM generator integration (Phase 1 — comparison testing)
+
+- `rag/nim_generator.py` — new module implementing the Phase 1 generator
+  comparison test from `docs/NVIDIA_NIM_INTEGRATION_PLAN.md`:
+  - `NIMGenerator` — streaming OpenAI-compatible chat client for the
+    NVIDIA NIM free tier (`https://integrate.api.nvidia.com/v1`). Uses
+    `httpx` (already a dependency) to POST to `/chat/completions` with
+    `stream=True` and parses the SSE response. Shares the system prompt
+    template + generation settings with the Ollama generator so answers
+    are directly comparable. Maps 429/404/timeout/connection errors to
+    `NIMError` for fallback. Default model: `meta/llama-3.1-8b-instruct`
+    (originally `moonshotai/kimi-k2.6` per integration plan §2.1, but that
+    model was retired/undeployed on the NIM free tier — returns 404 on
+    `/chat/completions` as of 2026-08-15 despite still being listed in
+    `GET /v1/models`; switched to the plan's own production target, which
+    is reliably available on the free tier at ~0.35–1s latency and matches
+    the Ollama `llama3.1:8b` for apples-to-apples comparison).
+  - `FallbackGenerator` — wraps a primary + fallback generator with a
+    `CircuitBreaker`. When the primary fails before yielding any tokens
+    (or the circuit is open), transparently falls back to the secondary.
+    If both fail, yields a canned refusal. Mid-stream failures propagate
+    (no confusing duplicate answers). The breaker is checked _before_
+    attempting the primary and failures are recorded after a pre-first-
+    token failure.
+  - `build_generator()` factory — reads `NIM_ENABLED` env var. When
+    `true` (case-insensitive, also accepts `1`/`yes`), returns a
+    `FallbackGenerator(NIM → Ollama)` with a dedicated NIM circuit
+    breaker. When disabled (default), returns the plain Ollama
+    `Generator` — no change to the default local-first path.
+- `api/deps.py` — `get_orchestrator` now uses `build_generator()` instead
+  of constructing `Generator` directly, so the NIM path is wired through
+  the config flag with zero change to the default behavior.
+- `.env.example` — added `NIM_ENABLED=false` + `NVIDIA_API_KEY=` with a
+  warning about the free-tier limitations (no SLA, shared 40 RPM, data
+  egress, no PII).
+- `tests/test_rag_nim_generator.py` — 29 new unit tests covering
+  `NIMGenerator` (SSE parsing, message construction, auth header, lazy
+  client, error mapping for 429/404/500/timeout/connect), `FallbackGenerator`
+  (primary success, primary-fail→fallback, both-fail→refusal, mid-stream
+  failure propagation, circuit-open skip, breaker failure recording,
+  close semantics), and `build_generator` (default→Ollama, NIM-enabled→
+  FallbackGenerator, case-insensitive flag). All mocked — no network.
+- `docs/NVIDIA_NIM_INTEGRATION_PLAN.md` — marked Phase 1 as ✅ (code
+  landed) with a note that the comparison eval run is the remaining
+  manual step.
+
+**F500 enterprise gap notice:** This is a **practice-stage comparison
+test only**, not a production promotion. All 10 gaps in
+`docs/F500_ENTERPRISE_ACTION_ITEMS.md` item #8 remain open. The default
+path (NIM disabled) is unchanged — Ollama stays primary, local-first,
+$0-cost. NIM must not be enabled on corpora with real PII.
+
+### Added — Ollama model recommendations per component
+
+- `docs/OLLAMA_MODEL_RECOMMENDATIONS.md` — new planning doc mapping every
+  Ollama model usage point in the codebase (generator, guardrails, query
+  rewriter, embedder, warm-up, eval judge) to a recommended model with
+  reasoning. Key finding: `qwen2.5:14b` (9 GB) is already pulled but not used
+  anywhere — recommended for generator + eval judge + warm-up. Two new pulls
+  recommended: `llama3.1:8b` (injection judge, doc's production target) and
+  `llama-guard3:8b` (purpose-built content safety classifier, addresses F500
+  item #1). `llama3.2:3b` kept for classifier + rewriter (fast, short-output
+  tasks). `nomic-embed-text` kept for embeddings (changing requires
+  re-indexing). Includes memory budget analysis for M1 32 GB, `.env.example`
+  additions, and optional embedding upgrade path (`bge-m3`, `mxbai-embed-large`).
+
+### Added — NVIDIA NIM integration plan + F500 enterprise gap analysis
+
+- `docs/NVIDIA_NIM_INTEGRATION_PLAN.md` — new planning doc documenting the
+  per-component NIM model selections with reasoning (generator, guardrails,
+  topic control, PII, embeddings, reranker), the fallback architecture
+  (configurable primary with graceful degradation: NIM → Ollama → regex),
+  what does NOT change (default stays Ollama/local-first), and a 5-phase
+  integration roadmap. Corrects the fallback direction: Ollama remains the
+  default primary when NIM is not opted into; Ollama becomes the automatic
+  fallback only when NIM is explicitly enabled via config flag.
+- `docs/F500_ENTERPRISE_ACTION_ITEMS.md` — added item #8 (NVIDIA NIM as
+  optional cloud provider) recording 10 enterprise-grade gaps (no SLA,
+  shared rate limit, data egress/DPA, secrets management, model version
+  pinning, eval gate, failover, retry/backoff, audit trail, PII scrubbing)
+  that must be closed before any production promotion. Updated the summary
+  table and stage-justification paragraph.
+
 ### Fixed — Langfuse tracer silently disabled (v2→v4 SDK API mismatch)
 
 The `LangfuseTracer` was written against the Langfuse **v2 SDK API**
