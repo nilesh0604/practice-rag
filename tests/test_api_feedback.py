@@ -68,3 +68,32 @@ class TestFeedbackEndpoint:
             },
         )
         assert resp.status_code == 422
+
+    def test_trace_id_accepted(self, client, mem_store):
+        """Step 7: feedback with a trace_id is accepted and recorded."""
+        sid = mem_store.create_session()
+        mem_store.add_message(sid, "user", "q")
+        resp = client.post(
+            "/api/v1/feedback",
+            json={
+                "session_id": sid,
+                "message_index": 0,
+                "rating": "up",
+                "trace_id": "trace-123",
+            },
+        )
+        assert resp.status_code == 200
+
+    def test_trace_id_optional(self, client, mem_store):
+        """Feedback without trace_id still works (backward compatible)."""
+        sid = mem_store.create_session()
+        mem_store.add_message(sid, "user", "q")
+        resp = client.post(
+            "/api/v1/feedback",
+            json={
+                "session_id": sid,
+                "message_index": 0,
+                "rating": "down",
+            },
+        )
+        assert resp.status_code == 200

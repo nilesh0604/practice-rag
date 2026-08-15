@@ -56,6 +56,53 @@ services:
           cpus: "1.0"
           memory: 1g
 
+  # ─────────────────────────────── FastAPI backend (Step 7) ──────────────────
+  # The backend container connects to:
+  #   - Qdrant  : http://qdrant:6333  (same compose network)
+  #   - Ollama  : http://host.docker.internal:11434  (host Ollama, D1)
+  #   - Langfuse: http://langfuse-web:3000  (same compose network)
+  # The Dockerfile copies the seed corpus so /api/v1/ingest works without a
+  # bind mount. The lifespan warm-up pre-loads the Ollama model on startup.
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: practice-rag-backend:latest
+    container_name: practice-rag-backend
+    restart: unless-stopped
+    depends_on:
+      qdrant:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+    environment:
+      QDRANT_URL: http://qdrant:6333
+      OLLAMA_BASE_URL: http://host.docker.internal:11434
+      OLLAMA_WARMUP_MODEL: ${OLLAMA_WARMUP_MODEL:-llama3.2:3b}
+      FRONTEND_ORIGIN: ${FRONTEND_ORIGIN:-http://localhost:5173}
+      CORPUS_DIR: data/corpus
+      # Langfuse tracing is optional — only enabled when host + keys are set.
+      LANGFUSE_HOST: ${LANGFUSE_HOST:-}
+      LANGFUSE_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY:-}
+      LANGFUSE_SECRET_KEY: ${LANGFUSE_SECRET_KEY:-}
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python3",
+          "-c",
+          "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/api/v1/health',timeout=3).status==200 else 1)",
+        ]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1g
+
   # ─────────────────────────────── Langfuse v4 ──────────────────────────────
   # Official self-hosted stack: postgres + clickhouse + redis + minio +
   # langfuse-worker + langfuse-web. See .env.example for the CHANGEME secrets.

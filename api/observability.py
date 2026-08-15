@@ -1,0 +1,579 @@
+"""Observability & hardening — Langfuse tracing, metrics, circuit breaker (Step 7).
+
+Implements build-order items 39–41 (Phase 6 — Monitoring & Hardening):
+
+**39. Langfuse traces** — ``LangfuseTracer`` wraps the langfuse Python SDK so
+the orchestrator can emit a trace per chat request with child spans for
+retrieval, generation, and guardrail phases, plus a feedback score event.
+The tracer degrades gracefully: when the ``langfuse`` package is absent or
+``LANGFUSE_HOST`` is unset, every method is a safe no-op that still logs
+span lifecycle events via ``structlog``/stdlib — this is the doc's
+"Langfuse-down fallback to structlog" mitigation. The lazy-client pattern
+(like ``Generator`` / ``Embedder``) keeps unit tests network-free.
+
+**40. Metrics** — ``MetricsCollector`` is a thread-safe in-memory store for
+online serving metrics: TTFT (time-to-first-token) samples, request count,
+cache hits/misses, and error count. ``snapshot()`` returns a dict with mean
+/ p50 / p95 TTFT and the cache hit rate — surfaced via ``GET /api/v1/metrics``.
+The offline metrics (retrieval recall@5, faithfulness, answer relevancy)
+come from the Step 6 eval gate; this collector covers the *online* half.
+
+**41. Resilience** — ``CircuitBreaker`` is the in-process breaker from the
+doc's "Circuit Breaker (Optional)" snippet, wrapped around Ollama calls so
+a flaky/unreachable Ollama does not stall every request. After
+``threshold`` consecutive failures the circuit opens for ``timeout``
+seconds; calls during that window raise ``CircuitOpenError`` instead of
+hitting the network. A success resets the failure count.
+
+All three components are independently injectable so the orchestrator,
+generator, and routes stay unit-testable with mocks.
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import statistics
+import threading
+import time
+from collections import deque
+from dataclasses import dataclass, field
+from typing import Any, ContextManager, Iterator, Protocol
+
+logger = logging.getLogger(__name__)
+
+# ── Langfuse constants ─────────────────────────────────────────────────
+
+DEFAULT_LANGFUSE_HOST: str = "http://localhost:3000"
+"""Default Langfuse web host (the self-hosted Docker container)."""
+
+MAX_TTFT_SAMPLES: int = 200
+"""Cap on retained TTFT samples for percentile computation (memory-bounded)."""
+
+
+# ════════════════════════════════════════════════════════════════════════
+# Circuit breaker (build-order item 41)
+# ════════════════════════════════════════════════════════════════════════
+
+
+class CircuitOpenError(Exception):
+    """Raised when a call is attempted while the circuit breaker is open."""
+
+
+class CircuitBreaker:
+    """In-process circuit breaker around an unreliable dependency (Ollama).
+
+    After ``threshold`` consecutive failures the circuit *opens*: subsequent
+    ``call()`` invocations raise ``CircuitOpenError`` immediately, without
+    hitting the network. After ``timeout`` seconds the circuit *half-opens*:
+    one call is allowed through; if it succeeds the circuit closes, if it
+    fails the open window restarts. A success at any point resets the
+    failure counter to zero.
+
+    Thread-safe via a ``threading.Lock``. This is the practice-project
+    equivalent of the doc's "Circuit Breaker (Optional)" snippet — simple,
+    in-process, no external state.
+    """
+
+    def __init__(self, threshold: int = 3, timeout: float = 30.0) -> None:
+        if threshold < 1:
+            raise ValueError("threshold must be >= 1")
+        if timeout <= 0:
+            raise ValueError("timeout must be > 0")
+        self.threshold = threshold
+        self.timeout = timeout
+        self._failures = 0
+        self._last_failure: float | None = None
+        self._lock = threading.Lock()
+
+    @property
+    def failures(self) -> int:
+        with self._lock:
+            return self._failures
+
+    @property
+    def state(self) -> str:
+        """``"closed"``, ``"open"``, or ``"half_open"``."""
+        with self._lock:
+            if self._failures < self.threshold:
+                return "closed"
+            if self._last_failure is None:
+                return "closed"
+            if time.time() - self._last_failure >= self.timeout:
+                return "half_open"
+            return "open"
+
+    def is_open(self) -> bool:
+        """True when the circuit is open (calls should be rejected)."""
+        return self.state == "open"
+
+    def call(self, fn, *args, **kwargs):
+        """Invoke ``fn(*args, **kwargs)`` through the breaker.
+
+        Raises ``CircuitOpenError`` if the circuit is open. On success the
+        failure count resets; on exception the count increments and the
+        circuit may open.
+        """
+        with self._lock:
+            if self._failures >= self.threshold:
+                if (
+                    self._last_failure is not None
+                    and time.time() - self._last_failure < self.timeout
+                ):
+                    raise CircuitOpenError(
+                        f"Circuit breaker is open "
+                        f"({self._failures} failures, "
+                        f"last {time.time() - self._last_failure:.1f}s ago)"
+                    )
+                # Half-open: allow one probe call through.
+                logger.info("Circuit breaker half-open — probing with one call")
+        try:
+            result = fn(*args, **kwargs)
+        except CircuitOpenError:
+            raise
+        except Exception:
+            self.record_failure()
+            raise
+        else:
+            self.record_success()
+            return result
+
+    def record_success(self) -> None:
+        """Reset the failure count (call succeeded)."""
+        with self._lock:
+            if self._failures > 0:
+                logger.debug("Circuit breaker reset (was %d failures)", self._failures)
+            self._failures = 0
+            self._last_failure = None
+
+    def record_failure(self) -> None:
+        """Increment the failure count, possibly opening the circuit."""
+        with self._lock:
+            self._failures += 1
+            self._last_failure = time.time()
+            if self._failures >= self.threshold:
+                logger.warning(
+                    "Circuit breaker opened after %d failures", self._failures,
+                )
+
+    def reset(self) -> None:
+        """Force-reset the breaker to the closed state (for tests / admin)."""
+        with self._lock:
+            self._failures = 0
+            self._last_failure = None
+
+
+# ════════════════════════════════════════════════════════════════════════
+# Metrics collector (build-order item 40)
+# ════════════════════════════════════════════════════════════════════════
+
+
+@dataclass
+class _MetricsState:
+    """Mutable counters + TTFT sample ring buffer."""
+
+    requests: int = 0
+    errors: int = 0
+    cache_hits: int = 0
+    cache_misses: int = 0
+    ttft_samples: deque = field(default_factory=lambda: deque(maxlen=MAX_TTFT_SAMPLES))
+
+
+class MetricsCollector:
+    """Thread-safe in-memory collector for online serving metrics.
+
+    Tracks request count, error count, cache hit/miss, and TTFT (time-to-
+    first-token) samples. ``snapshot()`` computes mean / p50 / p95 TTFT and
+    the cache hit rate. Intended for a single-process FastAPI deployment;
+    for multi-process or multi-instance, export these via Prometheus instead.
+    """
+
+    def __init__(self) -> None:
+        self._state = _MetricsState()
+        self._lock = threading.Lock()
+
+    def record_request(self) -> None:
+        with self._lock:
+            self._state.requests += 1
+
+    def record_error(self) -> None:
+        with self._lock:
+            self._state.errors += 1
+
+    def record_cache_hit(self) -> None:
+        with self._lock:
+            self._state.cache_hits += 1
+
+    def record_cache_miss(self) -> None:
+        with self._lock:
+            self._state.cache_misses += 1
+
+    def record_ttft(self, seconds: float) -> None:
+        """Record a time-to-first-token sample (seconds)."""
+        if seconds < 0:
+            return
+        with self._lock:
+            self._state.ttft_samples.append(seconds)
+
+    def snapshot(self) -> dict[str, Any]:
+        """Return a point-in-time metrics snapshot as a JSON-serialisable dict."""
+        with self._lock:
+            samples = list(self._state.ttft_samples)
+            hits = self._state.cache_hits
+            misses = self._state.cache_misses
+            total_cache = hits + misses
+            return {
+                "requests": self._state.requests,
+                "errors": self._state.errors,
+                "cache": {
+                    "hits": hits,
+                    "misses": misses,
+                    "hit_rate": (hits / total_cache) if total_cache else 0.0,
+                },
+                "ttft": {
+                    "count": len(samples),
+                    "mean_s": statistics.fmean(samples) if samples else 0.0,
+                    "p50_s": _percentile(samples, 50) if samples else 0.0,
+                    "p95_s": _percentile(samples, 95) if samples else 0.0,
+                    "min_s": min(samples) if samples else 0.0,
+                    "max_s": max(samples) if samples else 0.0,
+                },
+            }
+
+    def reset(self) -> None:
+        """Clear all counters and samples (for tests)."""
+        with self._lock:
+            self._state = _MetricsState()
+
+
+def _percentile(samples: list[float], pct: float) -> float:
+    """Linear-interpolation percentile of a sorted sample list."""
+    if not samples:
+        return 0.0
+    ordered = sorted(samples)
+    if len(ordered) == 1:
+        return ordered[0]
+    k = (len(ordered) - 1) * (pct / 100.0)
+    lo = int(k)
+    hi = min(lo + 1, len(ordered) - 1)
+    frac = k - lo
+    return ordered[lo] + (ordered[hi] - ordered[lo]) * frac
+
+
+# ════════════════════════════════════════════════════════════════════════
+# Langfuse tracer (build-order item 39)
+# ════════════════════════════════════════════════════════════════════════
+
+
+@dataclass
+class TraceHandle:
+    """Opaque handle for a Langfuse trace.
+
+    Carries a correlation ``id`` (a UUID-ish string) so the feedback
+    endpoint can attach a score to the right trace even when Langfuse is
+    disabled (the id is still logged via structlog for correlation).
+    """
+
+    id: str
+    enabled: bool = True
+    _lf_trace: Any = None  # the real langfuse trace object (None when disabled)
+
+
+@dataclass
+class SpanHandle:
+    """Opaque handle for a Langfuse span."""
+
+    name: str
+    start: float
+    enabled: bool = True
+    _lf_span: Any = None  # the real langfuse span object (None when disabled)
+
+
+class LangfuseTracer:
+    """Thin wrapper around the Langfuse SDK with graceful degradation.
+
+    When Langfuse is available (``langfuse`` importable + ``LANGFUSE_HOST``
+    set + public/secret keys configured), traces and spans are sent to the
+    self-hosted Langfuse container. When any of those conditions fail, every
+    method is a safe no-op that still emits a structured log line — this is
+    the doc's "Langfuse-down fallback to structlog" mitigation. The
+    orchestrator calls tracer methods unconditionally; the tracer decides
+    whether to ship to Langfuse or just log.
+
+    The Langfuse client is lazily constructed (like ``Generator``) so unit
+    tests inject a mock client or simply construct a disabled tracer.
+    """
+
+    def __init__(
+        self,
+        enabled: bool | None = None,
+        client: Any = None,
+        host: str | None = None,
+        public_key: str | None = None,
+        secret_key: str | None = None,
+    ) -> None:
+        self._client = client
+        self._host = host or os.getenv("LANGFUSE_HOST", DEFAULT_LANGFUSE_HOST)
+        self._public_key = public_key or os.getenv("LANGFUSE_PUBLIC_KEY")
+        self._secret_key = secret_key or os.getenv("LANGFUSE_SECRET_KEY")
+        if enabled is None:
+            enabled = self._detect_enabled()
+        self._enabled = enabled
+
+    def _detect_enabled(self) -> bool:
+        """True only if langfuse is importable AND host + keys are configured.
+
+        Checks the *raw* env vars (not the defaulted ``self._host``) so that
+        an unset ``LANGFUSE_HOST`` disables tracing even though the host
+        attribute has a localhost default for client construction.
+        """
+        if (
+            not os.getenv("LANGFUSE_HOST")
+            or not self._public_key
+            or not self._secret_key
+        ):
+            return False
+        try:
+            import langfuse  # noqa: F401
+
+            return True
+        except ImportError:
+            return False
+
+    @property
+    def enabled(self) -> bool:
+        return self._enabled
+
+    @property
+    def client(self):
+        """Lazily construct the Langfuse client (or return the injected one)."""
+        if not self._enabled:
+            return None
+        if self._client is None:
+            from langfuse import Langfuse
+
+            self._client = Langfuse(
+                host=self._host,
+                public_key=self._public_key,
+                secret_key=self._secret_key,
+            )
+        return self._client
+
+    # ── trace + span lifecycle ──────────────────────────────────────────
+
+    def start_trace(self, name: str, metadata: dict | None = None) -> TraceHandle:
+        """Begin a new trace for a chat request."""
+        trace_id = _gen_id()
+        if not self._enabled:
+            logger.info("trace.start name=%s id=%s meta=%s", name, trace_id, metadata)
+            return TraceHandle(id=trace_id, enabled=False)
+        try:
+            lf_trace = self.client.trace(
+                name=name,
+                id=trace_id,
+                metadata=metadata or {},
+            )
+        except Exception:  # noqa: BLE001 — Langfuse must never break serving
+            logger.warning("Langfuse trace creation failed — falling back to log")
+            return TraceHandle(id=trace_id, enabled=False)
+        return TraceHandle(id=trace_id, enabled=True, _lf_trace=lf_trace)
+
+    def start_span(
+        self,
+        trace: TraceHandle,
+        name: str,
+        metadata: dict | None = None,
+    ) -> SpanHandle:
+        """Begin a child span on ``trace``."""
+        start = time.time()
+        if not trace.enabled or not self._enabled:
+            logger.debug("span.start name=%s trace=%s meta=%s", name, trace.id, metadata)
+            return SpanHandle(name=name, start=start, enabled=False)
+        try:
+            lf_span = trace._lf_trace.span(name=name, metadata=metadata or {})
+        except Exception:  # noqa: BLE001
+            logger.warning("Langfuse span creation failed — falling back to log")
+            return SpanHandle(name=name, start=start, enabled=False)
+        return SpanHandle(name=name, start=start, enabled=True, _lf_span=lf_span)
+
+    def end_span(self, span: SpanHandle, metadata: dict | None = None) -> None:
+        """End a span, recording its duration and optional metadata."""
+        duration = time.time() - span.start
+        if not span.enabled or not self._enabled:
+            logger.debug(
+                "span.end name=%s duration=%.4fs meta=%s",
+                span.name, duration, metadata,
+            )
+            return
+        try:
+            if metadata:
+                span._lf_span.end(metadata=metadata)
+            else:
+                span._lf_span.end()
+        except Exception:  # noqa: BLE001
+            logger.warning("Langfuse span end failed")
+
+    def span(
+        self,
+        trace: TraceHandle,
+        name: str,
+        metadata: dict | None = None,
+    ) -> ContextManager[SpanHandle]:
+        """Context-manager helper for a span that auto-ends on exit.
+
+        Convenient for retrieval / guardrail spans that wrap a single call.
+        The generation span (which wraps a streaming loop) uses explicit
+        ``start_span`` / ``end_span`` instead.
+        """
+        return _SpanContext(self, trace, name, metadata)
+
+    def record_score(
+        self,
+        trace: TraceHandle,
+        name: str,
+        value: float,
+        comment: str | None = None,
+    ) -> None:
+        """Attach a score (e.g. user feedback thumbs up/down) to a trace."""
+        if not trace.enabled or not self._enabled:
+            logger.info(
+                "score name=%s value=%s trace=%s comment=%s",
+                name, value, trace.id, comment,
+            )
+            return
+        try:
+            trace._lf_trace.score(name=name, value=value, comment=comment or "")
+        except Exception:  # noqa: BLE001
+            logger.warning("Langfuse score recording failed")
+
+    def flush(self) -> None:
+        """Flush any buffered events to Langfuse (call at shutdown)."""
+        if not self._enabled or self._client is None:
+            return
+        try:
+            self._client.flush()
+        except Exception:  # noqa: BLE001
+            logger.warning("Langfuse flush failed")
+
+    def close(self) -> None:
+        """Release the Langfuse client if one was constructed."""
+        if self._client is not None:
+            try:
+                self._client.flush()
+            except Exception:  # noqa: BLE001
+                pass
+        self._client = None
+
+
+class _SpanContext:
+    """Context manager returned by ``LangfuseTracer.span()``."""
+
+    def __init__(
+        self,
+        tracer: LangfuseTracer,
+        trace: TraceHandle,
+        name: str,
+        metadata: dict | None,
+    ) -> None:
+        self._tracer = tracer
+        self._trace = trace
+        self._name = name
+        self._metadata = metadata
+        self._span: SpanHandle | None = None
+
+    def __enter__(self) -> SpanHandle:
+        self._span = self._tracer.start_span(self._trace, self._name, self._metadata)
+        return self._span
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        if self._span is not None:
+            end_meta = dict(self._metadata or {})
+            if exc is not None:
+                end_meta["error"] = str(exc)
+            self._tracer.end_span(self._span, end_meta)
+
+
+# ── helpers ────────────────────────────────────────────────────────────
+
+
+def _gen_id() -> str:
+    """Generate a short unique trace id (hex timestamp + counter)."""
+    return f"{int(time.time() * 1000):x}-{threading.get_ident() & 0xFFFF:x}"
+
+
+# ════════════════════════════════════════════════════════════════════════
+# Ollama warm-up + readiness (build-order item 41)
+# ════════════════════════════════════════════════════════════════════════
+
+
+def warm_up_ollama(
+    ollama_url: str = "http://localhost:11434",
+    model: str = "llama3.2:3b",
+    timeout: float = 10.0,
+) -> bool:
+    """Ping Ollama and pre-load ``model`` so the first real query is fast.
+
+    Sends a tiny one-token generation request to force the model into
+    memory (the doc's "warm-up call on startup" mitigation). Returns True
+    on success, False if Ollama is unreachable — the app starts either way
+    (degrades to circuit-breaker / error handling at query time).
+    """
+    import urllib.error
+    import urllib.request
+    import json as _json
+
+    # 1. Liveness ping: GET /api/tags
+    try:
+        with urllib.request.urlopen(
+            f"{ollama_url}/api/tags", timeout=timeout,
+        ) as resp:
+            if resp.status != 200:
+                logger.warning("Ollama warm-up: /api/tags returned %s", resp.status)
+                return False
+    except (urllib.error.URLError, OSError) as exc:
+        logger.warning("Ollama warm-up: unreachable at %s — %s", ollama_url, exc)
+        return False
+
+    # 2. Model pre-load: a minimal generate call (num_predict=1).
+    payload = _json.dumps({"model": model, "prompt": "hi", "stream": False, "options": {"num_predict": 1}}).encode()
+    req = urllib.request.Request(
+        f"{ollama_url}/api/generate",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            if resp.status != 200:
+                logger.warning("Ollama warm-up: generate returned %s", resp.status)
+                return False
+    except (urllib.error.URLError, OSError) as exc:
+        logger.warning("Ollama warm-up: model pre-load failed for %s — %s", model, exc)
+        return False
+
+    logger.info("Ollama warm-up complete (model=%s)", model)
+    return True
+
+
+def check_ollama(ollama_url: str = "http://localhost:11434", timeout: float = 2.0) -> bool:
+    """Lightweight liveness check for Ollama (GET /api/tags)."""
+    import urllib.error
+    import urllib.request
+
+    try:
+        with urllib.request.urlopen(f"{ollama_url}/api/tags", timeout=timeout) as resp:
+            return resp.status == 200
+    except (urllib.error.URLError, OSError):
+        return False
+
+
+def check_qdrant(qdrant_url: str = "http://localhost:6333", timeout: float = 2.0) -> bool:
+    """Lightweight liveness check for Qdrant (GET /healthz)."""
+    import urllib.error
+    import urllib.request
+
+    try:
+        with urllib.request.urlopen(f"{qdrant_url}/healthz", timeout=timeout) as resp:
+            return resp.status == 200
+    except (urllib.error.URLError, OSError):
+        return False

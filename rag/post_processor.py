@@ -53,6 +53,10 @@ class PostProcessResult:
     citations: list[Citation] = field(default_factory=list)
     confidence: float = 0.0
     low_confidence: bool = False
+    trace_id: str | None = None
+    """Langfuse trace id (Step 7). Set by the orchestrator when tracing is
+    enabled so the chat route can surface it in the ``ChatResponse`` and the
+    frontend can pass it back with feedback for score correlation."""
 
 
 class PostProcessor:

@@ -28,6 +28,7 @@ spinning up the HTTP layer.
 from __future__ import annotations
 
 import logging
+import time
 from typing import Iterator
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -35,7 +36,8 @@ from fastapi.responses import StreamingResponse
 
 from api.cache import LRUCache
 from api.conversation import ConversationStore
-from api.deps import get_cache, get_conversation_store, get_orchestrator
+from api.deps import get_cache, get_conversation_store, get_metrics, get_orchestrator
+from api.observability import MetricsCollector
 from rag.orchestrator import RAGOrchestrator
 from rag.post_processor import PostProcessResult
 from schemas.chat import ChatRequest, ChatResponse
@@ -55,40 +57,61 @@ def build_event_stream(
     session_id: str,
     store: ConversationStore,
     cache: LRUCache,
+    metrics: MetricsCollector | None = None,
 ) -> Iterator[str]:
     """Build the SSE generator for a chat request.
 
     Yields SSE-formatted strings (``data: ...\\n\\n`` etc.). Side effects:
     records the user + assistant messages in the session store and stores
-    the completed ``ChatResponse`` in the LRU cache.
+    the completed ``ChatResponse`` in the LRU cache. When a ``metrics``
+    collector is provided (Step 7), records the request count, TTFT (time
+    to first token), and any errors.
 
     This is a sync generator — FastAPI's ``StreamingResponse`` runs sync
     iterators in a threadpool, which is exactly what we want for the
     blocking Ollama streaming call.
     """
+    if metrics is not None:
+        metrics.record_request()
+    start = time.time()
     # Record the user's message before generation so the session is
     # persisted even if generation fails partway.
     store.add_message(session_id, "user", query)
 
     answer_text = ""
     result: PostProcessResult | None = None
-    for item in orchestrator.stream_answer(query, history):
-        if isinstance(item, str):
-            answer_text += item
-            yield f"data: {item}\n\n"
-        else:
-            result = item
+    first_token_time: float | None = None
+    try:
+        for item in orchestrator.stream_answer(query, history):
+            if isinstance(item, str):
+                if first_token_time is None:
+                    first_token_time = time.time()
+                    if metrics is not None:
+                        metrics.record_ttft(first_token_time - start)
+                answer_text += item
+                yield f"data: {item}\n\n"
+            else:
+                result = item
+    except Exception:
+        if metrics is not None:
+            metrics.record_error()
+        raise
 
     if result is None:
         # No PostProcessResult was yielded (e.g. empty stream) — synthesize
         # an empty result so the session + cache stay consistent.
         result = PostProcessResult(answer=answer_text)
 
+    # Step 7: surface the Langfuse trace id so the frontend can pass it
+    # back with feedback (the score is then attached to the right trace).
+    trace_id = getattr(result, "trace_id", None)
+
     response = ChatResponse(
         session_id=session_id,
         answer=result.answer,
         citations=result.citations,
         confidence=result.confidence,
+        trace_id=trace_id,
     )
     store.add_message(
         session_id,
@@ -128,6 +151,7 @@ def chat(
     orchestrator: RAGOrchestrator = Depends(get_orchestrator),
     store: ConversationStore = Depends(get_conversation_store),
     cache: LRUCache = Depends(get_cache),
+    metrics: MetricsCollector = Depends(get_metrics),
 ) -> StreamingResponse:
     """Stream a RAG answer for the user's message as Server-Sent Events."""
     query = request.message
@@ -143,15 +167,18 @@ def chat(
     cached = cache.get(query)
     if cached is not None:
         logger.info("Cache hit — replaying cached answer for session %s", session_id)
+        metrics.record_cache_hit()
+        metrics.record_request()
         return StreamingResponse(
             build_replay_stream(cached, session_id),
             media_type=SSE_MEDIA_TYPE,
             headers={"X-Cache": "HIT"},
         )
 
+    metrics.record_cache_miss()
     history = store.format_history(session_id)
     return StreamingResponse(
-        build_event_stream(orchestrator, query, history, session_id, store, cache),
+        build_event_stream(orchestrator, query, history, session_id, store, cache, metrics),
         media_type=SSE_MEDIA_TYPE,
         headers={"X-Cache": "MISS"},
     )

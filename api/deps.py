@@ -23,6 +23,7 @@ from qdrant_client import QdrantClient
 from api.cache import DEFAULT_MAX_SIZE, LRUCache
 from api.conversation import DEFAULT_DB_PATH, ConversationStore
 from api.guardrails import GuardrailSuite, InputGuardrail, OutputGuardrail, QueryClassifier
+from api.observability import CircuitBreaker, LangfuseTracer, MetricsCollector
 from rag.context_assembler import ContextAssembler
 from rag.generator import Generator
 from rag.orchestrator import RAGOrchestrator
@@ -57,6 +58,35 @@ def get_retriever() -> HybridRetriever:
     return HybridRetriever(get_qdrant_client_dep(), get_embedder())
 
 
+@lru_cache
+def get_circuit_breaker() -> CircuitBreaker:
+    """Process-wide Ollama circuit breaker (Step 7, build-order item 41).
+
+    Opens after 3 consecutive Ollama failures, stays open for 30 s, then
+    half-opens for one probe call. Shared by the generator so all Ollama
+    generation calls go through one breaker.
+    """
+    return CircuitBreaker(threshold=3, timeout=30.0)
+
+
+@lru_cache
+def get_tracer() -> LangfuseTracer:
+    """Process-wide Langfuse tracer (Step 7, build-order item 39).
+
+    Auto-disables when the ``langfuse`` package is absent or
+    ``LANGFUSE_HOST`` / public / secret keys are unset — in that mode every
+    method is a no-op that logs via structlog (the doc's "Langfuse-down
+    fallback to structlog" mitigation).
+    """
+    return LangfuseTracer()
+
+
+@lru_cache
+def get_metrics() -> MetricsCollector:
+    """Process-wide online metrics collector (Step 7, build-order item 40)."""
+    return MetricsCollector()
+
+
 def get_orchestrator() -> RAGOrchestrator:
     """Construct the RAG orchestrator from its real collaborators.
 
@@ -66,9 +96,10 @@ def get_orchestrator() -> RAGOrchestrator:
     return RAGOrchestrator(
         get_retriever(),
         ContextAssembler(),
-        Generator(),
+        Generator(circuit_breaker=get_circuit_breaker()),
         PostProcessor(get_embedder()),
         guardrail_suite=get_guardrail_suite(),
+        tracer=get_tracer(),
     )
 
 

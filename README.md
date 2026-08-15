@@ -73,13 +73,14 @@ practice-rag/
 ├── requirements.txt                   # Python deps (installed via pip3 in conda env)
 ├── pyproject.toml                     # pytest config (pythonpath=. , testpaths=tests)
 ├── .gitignore                         # macOS, Python, Node, .env, Colima volumes
-├── docker-compose.yml                 # Qdrant, Postgres, Langfuse (Phase 1)
+├── docker-compose.yml                 # Qdrant, Postgres, Langfuse + backend (Phase 1 + Step 7)
 │                                      #   Ollama runs on the host, not in Docker
+├── Dockerfile                         # Backend image (Step 7) ✅
 ├── schemas/                           # Shared Pydantic contracts (Step 1) ✅
 │   ├── __init__.py                    # Re-exports all contracts
 │   ├── documents.py                   # DocumentChunk, RetrievedDoc
-│   ├── chat.py                        # ChatRequest, ChatResponse, Citation
-│   └── feedback.py                    # FeedbackRequest
+│   ├── chat.py                        # ChatRequest, ChatResponse, Citation (+ trace_id Step 7)
+│   └── feedback.py                    # FeedbackRequest (+ trace_id Step 7)
 ├── ingestion/                         # Offline pipeline (Step 2) ✅
 │   ├── __init__.py
 │   ├── sync.py                        # Doc discovery (local folder / git clone)
@@ -100,17 +101,19 @@ practice-rag/
 │   └── orchestrator.py                # Ties rewrite→retrieve→assemble→generate→post-process + guardrails ✅
 ├── api/                               # FastAPI serving layer (Step 4) ✅
 │   ├── __init__.py
-│   ├── main.py                        # app + middleware (CORS, structlog, Langfuse optional) ✅
-│   ├── deps.py                        # FastAPI dependency injection wiring ✅
+│   ├── main.py                        # app + middleware (CORS, structlog, Langfuse, warm-up lifespan) ✅
+│   ├── deps.py                        # FastAPI dependency injection wiring (+ tracer, metrics, breaker) ✅
 │   ├── conversation.py                # SQLite session store, last-10-turns window ✅
 │   ├── cache.py                       # In-memory LRU response cache ✅
+│   ├── observability.py               # CircuitBreaker, MetricsCollector, LangfuseTracer, warm-up (Step 7) ✅
 │   ├── routes/
 │   │   ├── __init__.py
-│   │   ├── chat.py                    # POST /api/v1/chat (SSE) ✅
-│   │   ├── feedback.py                # POST /api/v1/feedback ✅
+│   │   ├── chat.py                    # POST /api/v1/chat (SSE + TTFT/cache metrics) ✅
+│   │   ├── feedback.py                # POST /api/v1/feedback (+ Langfuse score) ✅
 │   │   ├── history.py                 # GET  /api/v1/history/{session_id} ✅
 │   │   ├── ingest.py                  # POST /api/v1/ingest ✅
-│   │   └── health.py                  # GET  /api/v1/health (compose healthcheck) ✅
+│   │   ├── health.py                  # GET /api/v1/health + /health/ready (liveness + readiness) ✅
+│   │   └── metrics.py                 # GET /api/v1/metrics (TTFT, cache hit rate, request/error) ✅
 │   └── guardrails.py                  # Input/output guardrails + query classifier (Step 6) ✅
 ├── frontend/                          # React + Vite chat widget (Step 5) ✅
 │   ├── package.json                   # Vite + React 18 + Jest + RTL ✅
@@ -153,18 +156,21 @@ practice-rag/
     ├── test_ingestion_run.py          # orchestrator integration (mocked) ✅
     ├── test_rag_retriever.py           # hybrid dense+sparse + RRF fusion (mocked) ✅
     ├── test_rag_context_assembler.py   # CONTEXT block formatting ✅
-    ├── test_rag_generator.py           # Ollama streaming + system prompt (mocked) ✅
+    ├── test_rag_generator.py           # Ollama streaming + system prompt + circuit breaker (mocked) ✅
     ├── test_rag_post_processor.py      # citations + groundedness score (mocked) ✅
     ├── test_rag_query_rewriter.py      # passthrough + LLM rewrite (mocked) ✅
-    ├── test_rag_orchestrator.py        # full RAG flow + guardrail integration (mocked) ✅
+    ├── test_rag_orchestrator.py        # full RAG flow + guardrail + tracer integration (mocked) ✅
     ├── test_guardrails.py              # input/output guardrails + classifier (61 tests) ✅
     ├── test_eval.py                    # golden dataset + threshold gate + CSV (25 tests) ✅
+    ├── test_observability.py           # CircuitBreaker, MetricsCollector, LangfuseTracer, warm-up (67 tests) ✅
     ├── test_api_cache.py               # LRU response cache (normalization, eviction, stats) ✅
     ├── test_api_conversation.py        # SQLite session store + history window + feedback ✅
-    ├── test_api_health.py              # GET /api/v1/health ✅
-    ├── test_api_chat.py                # POST /api/v1/chat SSE (stream, cache, session, 404) ✅
+    ├── test_api_health.py              # GET /api/v1/health (liveness) ✅
+    ├── test_api_health_ready.py        # GET /api/v1/health/ready (readiness, Qdrant+Ollama) ✅
+    ├── test_api_metrics.py             # GET /api/v1/metrics (TTFT, cache hit rate, counts) ✅
+    ├── test_api_chat.py                # POST /api/v1/chat SSE (stream, cache, session, 404, metrics) ✅
     ├── test_api_history.py             # GET /api/v1/history/{session_id} ✅
-    ├── test_api_feedback.py            # POST /api/v1/feedback ✅
+    ├── test_api_feedback.py            # POST /api/v1/feedback (+ trace_id score) ✅
     └── test_api_ingest.py              # POST /api/v1/ingest (mocked pipeline) ✅
 ```
 
@@ -231,7 +237,7 @@ The calendar phases (one weekend) are reordered below into the actual build grap
 | **4** | `api/` FastAPI layer (`/health` before `/chat`) ✅           | Step 3     | Phase 3 — Core RAG               |
 | **5** | `frontend/` React + SSE consumer ✅                          | Step 4     | Phase 4 — Frontend               |
 | **6** | `guardrails` + `eval/` golden dataset + Ragas gate ✅        | Step 4     | Phase 5 — Guardrails & Eval      |
-| **7** | Langfuse traces + resilience + optional cloud showcase       | Steps 3–6  | Phase 6 — Monitoring & Hardening |
+| **7** | Langfuse traces + resilience + optional cloud showcase ✅    | Steps 3–6  | Phase 6 — Monitoring & Hardening |
 
 > **Rule of thumb:** never mock something you haven't built yet. Follow the order left-to-right.
 
@@ -479,9 +485,13 @@ Request/response examples and the SSE format: [`ai-rag-chat-architecture-2026.md
 
 ## Observability & evaluation
 
-- **Langfuse (self-hosted)** traces every chat request: retrieval span, generation span, guardrail span, feedback event.
+- **Langfuse (self-hosted)** traces every chat request: retrieval span, generation span, guardrail span, feedback score. The `LangfuseTracer` (`api/observability.py`) degrades to structlog logging when Langfuse is down or unconfigured — serving never breaks.
 - **structlog** emits JSON logs to stdout; falls back gracefully if Langfuse is down.
-- **Ragas offline eval** runs against `eval/golden-dataset.json` (30–50 Q&A pairs) with `llama3.1:8b` as the local judge. Optional Groq free tier for a stronger judge.
+- **Online metrics** (`GET /api/v1/metrics`) — TTFT (mean/p50/p95), request count, error count, cache hit rate. Collected in-process by `MetricsCollector`.
+- **Circuit breaker** (`CircuitBreaker`) wraps Ollama generation calls — opens after 3 consecutive failures, half-opens after 30 s, never stalls serving on a flaky model.
+- **Ollama warm-up** — on startup a tiny generation call pre-loads the model so the first real query is not slow.
+- **Readiness probe** (`GET /api/v1/health/ready`) — pings Qdrant + Ollama, returns 503 if either is down (liveness `/health` stays 200).
+- **Ragas offline eval** runs against `eval/golden-dataset.json` (36 Q&A pairs) with a local Ollama judge (Ragas fallback when the library can't import). Threshold gate: `faithfulness >= 0.75`, `context_recall >= 0.70`, `answer_relevancy >= 0.70`.
 
 Metrics tracked: TTFT, retrieval recall@5, faithfulness, answer relevancy, user feedback, cache hit rate.
 

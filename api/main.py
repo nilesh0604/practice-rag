@@ -1,6 +1,7 @@
 """FastAPI application factory — app + middleware + router wiring.
 
-Assembles the Step 4 serving layer:
+Assembles the Step 4 serving layer (extended in Step 7 — Monitoring &
+Hardening):
 
 - **CORS** — allows the Vite dev server origin (default ``http://localhost:5173``)
   so the React frontend can call the API during development.
@@ -10,9 +11,12 @@ Assembles the Step 4 serving layer:
   ``LANGFUSE_HOST`` is set, the chat flow is traced; otherwise tracing is a
   no-op so the app runs fine with Langfuse down or absent (per the doc's
   "falls back gracefully if Langfuse is down"). Full Langfuse span wiring
-  is elaborated in Step 7 (Monitoring & Hardening); the seam is here so the
-  decorator is available from day one.
-- **Routers** — all five endpoint groups mounted under ``/api/v1``.
+  is in ``rag/orchestrator.py`` (Step 7); the enabled-flag seam is here.
+- **Ollama warm-up** — on startup a tiny generation call pre-loads the
+  model so the first real query is not slow (the doc's "warm-up call on
+  startup" mitigation). Degrades to a warning if Ollama is unreachable.
+- **Routers** — all endpoint groups mounted under ``/api/v1``, including
+  the Step 7 ``/metrics`` and ``/health/ready`` endpoints.
 
 Run with::
 
@@ -23,11 +27,13 @@ from __future__ import annotations
 
 import logging
 import os
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from api.routes import chat, feedback, health, history, ingest
+from api.observability import warm_up_ollama
+from api.routes import chat, feedback, health, history, ingest, metrics
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +42,9 @@ API_PREFIX: str = "/api/v1"
 
 DEFAULT_FRONTEND_ORIGIN: str = "http://localhost:5173"
 """Default Vite dev server origin for CORS. Override with ``FRONTEND_ORIGIN``."""
+
+OLLAMA_WARMUP_MODEL: str = os.getenv("OLLAMA_WARMUP_MODEL", "llama3.2:3b")
+"""Model to pre-load on startup (matches the generator's dev model, D2)."""
 
 
 def _configure_structlog() -> None:
@@ -72,12 +81,28 @@ def _langfuse_enabled() -> bool:
 
 def create_app() -> FastAPI:
     """Build the FastAPI app with middleware and all routers mounted."""
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        """Startup: warm up Ollama. Shutdown: flush Langfuse."""
+        ollama_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+        warm_up_ollama(ollama_url=ollama_url, model=OLLAMA_WARMUP_MODEL)
+        yield
+        # Shutdown: flush any buffered Langfuse events.
+        try:
+            from api.deps import get_tracer
+
+            get_tracer().flush()
+        except Exception:  # noqa: BLE001
+            pass
+
     _configure_structlog()
 
     app = FastAPI(
         title="practice-rag API",
-        description="RAG knowledge assistant — FastAPI serving layer (Step 4).",
-        version="0.4.0",
+        description="RAG knowledge assistant — FastAPI serving layer (Step 7).",
+        version="0.7.0",
+        lifespan=lifespan,
     )
 
     # ── CORS ───────────────────────────────────────────────────────────
@@ -92,6 +117,7 @@ def create_app() -> FastAPI:
 
     # ── routers ────────────────────────────────────────────────────────
     app.include_router(health.router, prefix=API_PREFIX)
+    app.include_router(metrics.router, prefix=API_PREFIX)
     app.include_router(chat.router, prefix=API_PREFIX)
     app.include_router(history.router, prefix=API_PREFIX)
     app.include_router(feedback.router, prefix=API_PREFIX)

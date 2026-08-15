@@ -22,7 +22,10 @@ with ``{context}`` and ``{history}`` placeholders filled by the caller.
 from __future__ import annotations
 
 import logging
-from typing import Iterator
+from typing import TYPE_CHECKING, Iterator
+
+if TYPE_CHECKING:
+    from api.observability import CircuitBreaker
 
 logger = logging.getLogger(__name__)
 
@@ -82,6 +85,7 @@ class Generator:
         num_ctx: int = NUM_CTX,
         top_p: float = TOP_P,
         num_predict: int = NUM_PREDICT,
+        circuit_breaker: "CircuitBreaker | None" = None,
     ) -> None:
         self.model = model
         self.ollama_url = ollama_url
@@ -89,6 +93,7 @@ class Generator:
         self.num_ctx = num_ctx
         self.top_p = top_p
         self.num_predict = num_predict
+        self.circuit_breaker = circuit_breaker
         self._client = None
 
     @property
@@ -110,6 +115,11 @@ class Generator:
 
         Yields content strings (tokens). Empty content chunks (e.g. tool-call
         metadata) are skipped so the caller only receives visible text.
+
+        When a ``circuit_breaker`` is configured (Step 7), the initial Ollama
+        ``chat`` call is routed through it: if the circuit is open
+        ``CircuitOpenError`` is raised before any network call, and a
+        connection failure increments the breaker's failure count.
         """
         system_prompt = build_system_prompt(context, history)
         messages = [
@@ -123,12 +133,25 @@ class Generator:
             "num_predict": self.num_predict,
         }
         logger.debug("Streaming generation for query %r (model=%s)", query, self.model)
-        for chunk in self.client.chat(
-            model=self.model,
-            messages=messages,
-            stream=True,
-            options=options,
-        ):
+
+        def _do_chat():
+            return self.client.chat(
+                model=self.model,
+                messages=messages,
+                stream=True,
+                options=options,
+            )
+
+        if self.circuit_breaker is not None:
+            chat_iter = self.circuit_breaker.call(_do_chat)
+        else:
+            chat_iter = self.client.chat(
+                model=self.model,
+                messages=messages,
+                stream=True,
+                options=options,
+            )
+        for chunk in chat_iter:
             content = chunk.get("message", {}).get("content", "")
             if content:
                 yield content

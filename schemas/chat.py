@@ -59,6 +59,12 @@ class ChatResponse(BaseModel):
         le=1.0,
         description="Groundedness/confidence score in [0, 1].",
     )
+    trace_id: str | None = Field(
+        default=None,
+        description="Langfuse trace id (Step 7). Present when tracing is enabled; "
+        "passed back by the frontend with feedback so the score can be "
+        "attached to the right trace. None when Langfuse is disabled.",
+    )
 
     @model_validator(mode="after")
     def _dedupe_citations(self) -> "ChatResponse":

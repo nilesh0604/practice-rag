@@ -32,3 +32,8 @@ class FeedbackRequest(BaseModel):
         max_length=2000,
         description="Optional free-text feedback.",
     )
+    trace_id: str | None = Field(
+        default=None,
+        description="Langfuse trace id from the chat response (Step 7). When "
+        "present, the feedback score is attached to this trace.",
+    )

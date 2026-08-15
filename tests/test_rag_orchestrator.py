@@ -349,3 +349,127 @@ class TestOrchestratorGuardrailsAnswer:
         orch = self._build_with_guardrails(suite, tokens=["raw answer"])
         answer, _, _ = orch.answer("q")
         assert answer == "scrubbed answer"
+
+
+# ── Step 7: tracer integration ─────────────────────────────────────────
+
+
+def _mock_tracer():
+    """Build a MagicMock LangfuseTracer with realistic span/trace handles."""
+    from api.observability import SpanHandle, TraceHandle
+
+    tracer = MagicMock()
+    tracer.start_trace.return_value = TraceHandle(id="trace-1", enabled=True)
+    # start_span returns a SpanHandle so end_span can be called on it
+    tracer.start_span.side_effect = lambda trace, name, metadata=None: SpanHandle(
+        name=name, start=0.0, enabled=True,
+    )
+    return tracer
+
+
+class TestOrchestratorTracerStream:
+    def _build_with_tracer(self, tracer, tokens=None, docs=None):
+        if tokens is None:
+            tokens = ["Hello", " world"]
+        if docs is None:
+            docs = [_make_doc(title="D", content="c")]
+        retriever = MagicMock()
+        retriever.retrieve.return_value = docs
+        assembler = MagicMock()
+        assembler.assemble.return_value = "ctx"
+        generator = MagicMock()
+        generator.stream.return_value = iter(tokens)
+        pp = MagicMock()
+        pp.post_process.side_effect = lambda answer, retrieved_docs: PostProcessResult(
+            answer=answer, confidence=0.9,
+        )
+        return RAGOrchestrator(
+            retriever, assembler, generator, pp, tracer=tracer,
+        )
+
+    def test_start_trace_called(self):
+        tracer = _mock_tracer()
+        orch = self._build_with_tracer(tracer)
+        list(orch.stream_answer("query"))
+        tracer.start_trace.assert_called_once()
+
+    def test_retrieval_span_created_and_ended(self):
+        tracer = _mock_tracer()
+        orch = self._build_with_tracer(tracer)
+        list(orch.stream_answer("query"))
+        span_names = [c.args[1] for c in tracer.start_span.call_args_list]
+        assert "retrieval" in span_names
+        assert tracer.end_span.call_count >= 2  # retrieval + generation
+
+    def test_generation_span_created(self):
+        tracer = _mock_tracer()
+        orch = self._build_with_tracer(tracer)
+        list(orch.stream_answer("query"))
+        span_names = [c.args[1] for c in tracer.start_span.call_args_list]
+        assert "generation" in span_names
+
+    def test_trace_id_set_on_result(self):
+        tracer = _mock_tracer()
+        tracer.start_trace.return_value.id = "trace-abc"
+        orch = self._build_with_tracer(tracer)
+        items = list(orch.stream_answer("query"))
+        result = [i for i in items if isinstance(i, PostProcessResult)][0]
+        assert result.trace_id == "trace-abc"
+
+    def test_no_tracer_unchanged_behavior(self):
+        orch, _ = _build_orchestrator(tokens=["x", "y"])
+        items = list(orch.stream_answer("query"))
+        tokens = [i for i in items if isinstance(i, str)]
+        assert tokens == ["x", "y"]
+        result = [i for i in items if isinstance(i, PostProcessResult)][0]
+        assert result.trace_id is None
+
+    def test_guardrail_spans_created_with_suite(self):
+        tracer = _mock_tracer()
+        suite = _mock_guardrail_suite()
+        orch = self._build_with_tracer(tracer)
+        orch.guardrail_suite = suite
+        list(orch.stream_answer("query"))
+        span_names = [c.args[1] for c in tracer.start_span.call_args_list]
+        assert "guardrail_input" in span_names
+        assert "guardrail_output" in span_names
+
+
+class TestOrchestratorTracerAnswer:
+    def _build_with_tracer(self, tracer, tokens=None):
+        if tokens is None:
+            tokens = ["Hello", " world"]
+        retriever = MagicMock()
+        retriever.retrieve.return_value = [_make_doc()]
+        assembler = MagicMock()
+        assembler.assemble.return_value = "ctx"
+        generator = MagicMock()
+        generator.stream.return_value = iter(tokens)
+        pp = MagicMock()
+        pp.post_process.side_effect = lambda answer, retrieved_docs: PostProcessResult(
+            answer=answer, confidence=0.9,
+        )
+        return RAGOrchestrator(
+            retriever, assembler, generator, pp, tracer=tracer,
+        )
+
+    def test_start_trace_called(self):
+        tracer = _mock_tracer()
+        orch = self._build_with_tracer(tracer)
+        orch.answer("query")
+        tracer.start_trace.assert_called_once()
+
+    def test_trace_id_set_on_result(self):
+        tracer = _mock_tracer()
+        tracer.start_trace.return_value.id = "trace-xyz"
+        orch = self._build_with_tracer(tracer)
+        _, result, _ = orch.answer("query")
+        assert result.trace_id == "trace-xyz"
+
+    def test_spans_created(self):
+        tracer = _mock_tracer()
+        orch = self._build_with_tracer(tracer)
+        orch.answer("query")
+        span_names = [c.args[1] for c in tracer.start_span.call_args_list]
+        assert "retrieval" in span_names
+        assert "generation" in span_names

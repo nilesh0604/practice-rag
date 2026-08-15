@@ -38,6 +38,7 @@ if TYPE_CHECKING:
     # rag, but rag is imported widely; keeping this under TYPE_CHECKING
     # means the orchestrator has no hard dependency on the api package.
     from api.guardrails import GuardrailSuite
+    from api.observability import LangfuseTracer
 
 logger = logging.getLogger(__name__)
 
@@ -75,6 +76,7 @@ class RAGOrchestrator:
         post_processor: PostProcessor,
         query_rewriter: QueryRewriter | None = None,
         guardrail_suite: "GuardrailSuite | None" = None,
+        tracer: "LangfuseTracer | None" = None,
     ) -> None:
         self.retriever = retriever
         self.context_assembler = context_assembler
@@ -82,6 +84,7 @@ class RAGOrchestrator:
         self.post_processor = post_processor
         self.query_rewriter = query_rewriter or PassthroughQueryRewriter()
         self.guardrail_suite = guardrail_suite
+        self.tracer = tracer
 
     def stream_answer(
         self,
@@ -98,11 +101,22 @@ class RAGOrchestrator:
             ``str`` tokens as they stream from the generator, followed by a
             single ``PostProcessResult`` with citations + confidence.
         """
+        # ── Step 7: start a Langfuse trace for this request ────────────
+        trace = None
+        if self.tracer is not None:
+            trace = self.tracer.start_trace("chat", metadata={"query": query})
+
         # ── Step 6: input guardrail + query classification ─────────────
         if self.guardrail_suite is not None:
+            gr_span = (
+                self.tracer.start_span(trace, "guardrail_input")
+                if trace is not None else None
+            )
             decision = self.guardrail_suite.check_input(query)
             if decision.blocked:
                 logger.info("Orchestrator: input blocked — %s", decision.reason)
+                if gr_span is not None:
+                    self.tracer.end_span(gr_span, metadata={"blocked": True, "reason": decision.reason})
                 yield from self._refusal_stream(
                     "I can't process that request. Please ask a question about "
                     "FastAPI, Pydantic v2, or SQLModel.",
@@ -110,6 +124,11 @@ class RAGOrchestrator:
                 return
 
             classification = self.guardrail_suite.classify(query)
+            if gr_span is not None:
+                self.tracer.end_span(
+                    gr_span,
+                    metadata={"blocked": False, "class": classification.label},
+                )
             if classification.handled:
                 logger.info("Orchestrator: query classified as %s — short-circuit", classification.label)
                 yield from self._refusal_stream(classification.answer)
@@ -118,16 +137,37 @@ class RAGOrchestrator:
         rewritten = self.query_rewriter.rewrite(query, history)
         logger.debug("Orchestrator: query=%r → rewritten=%r", query, rewritten)
 
+        # ── Step 7: retrieval span ─────────────────────────────────────
+        ret_span = (
+            self.tracer.start_span(trace, "retrieval", metadata={"rewritten": rewritten})
+            if trace is not None else None
+        )
         docs = self.retriever.retrieve(rewritten)
+        if ret_span is not None:
+            self.tracer.end_span(ret_span, metadata={"num_docs": len(docs)})
+
         context = self.context_assembler.assemble(docs)
 
+        # ── Step 7: generation span (wraps the streaming loop) ─────────
+        gen_span = (
+            self.tracer.start_span(trace, "generation")
+            if trace is not None else None
+        )
         answer = ""
         for token in self.generator.stream(rewritten, context, history):
             answer += token
             yield token
+        if gen_span is not None:
+            self.tracer.end_span(
+                gen_span, metadata={"answer_len": len(answer)},
+            )
 
         # ── Step 6: output guardrail (PII scrub + harmful-content judge) ──
         if self.guardrail_suite is not None:
+            out_span = (
+                self.tracer.start_span(trace, "guardrail_output")
+                if trace is not None else None
+            )
             out_decision = self.guardrail_suite.check_output(answer)
             if out_decision.blocked:
                 logger.info("Orchestrator: output blocked — %s", out_decision.reason)
@@ -141,8 +181,15 @@ class RAGOrchestrator:
                 )
             else:
                 answer = out_decision.scrubbed or answer
+            if out_span is not None:
+                self.tracer.end_span(
+                    out_span,
+                    metadata={"blocked": out_decision.blocked, "reason": out_decision.reason},
+                )
 
         result = self.post_processor.post_process(answer, docs)
+        if trace is not None:
+            result.trace_id = trace.id
         yield result
 
     def _refusal_stream(self, answer: str) -> Iterator[StreamItem]:
@@ -168,28 +215,61 @@ class RAGOrchestrator:
         history endpoint. Applies the same guardrail checks as
         ``stream_answer``. Returns ``(answer_text, post_process_result, retrieved_docs)``.
         """
+        # ── Step 7: start a Langfuse trace for this request ────────────
+        trace = None
+        if self.tracer is not None:
+            trace = self.tracer.start_trace("chat", metadata={"query": query})
+
         # ── Step 6: input guardrail + query classification ─────────────
         if self.guardrail_suite is not None:
+            gr_span = (
+                self.tracer.start_span(trace, "guardrail_input")
+                if trace is not None else None
+            )
             decision = self.guardrail_suite.check_input(query)
             if decision.blocked:
                 refusal = (
                     "I can't process that request. Please ask a question about "
                     "FastAPI, Pydantic v2, or SQLModel."
                 )
+                if gr_span is not None:
+                    self.tracer.end_span(gr_span, metadata={"blocked": True})
                 return refusal, PostProcessResult(answer=refusal), []
 
             classification = self.guardrail_suite.classify(query)
+            if gr_span is not None:
+                self.tracer.end_span(
+                    gr_span, metadata={"blocked": False, "class": classification.label},
+                )
             if classification.handled:
                 return classification.answer, PostProcessResult(answer=classification.answer), []
 
         rewritten = self.query_rewriter.rewrite(query, history)
+
+        ret_span = (
+            self.tracer.start_span(trace, "retrieval", metadata={"rewritten": rewritten})
+            if trace is not None else None
+        )
         docs = self.retriever.retrieve(rewritten)
+        if ret_span is not None:
+            self.tracer.end_span(ret_span, metadata={"num_docs": len(docs)})
+
         context = self.context_assembler.assemble(docs)
 
+        gen_span = (
+            self.tracer.start_span(trace, "generation")
+            if trace is not None else None
+        )
         answer = "".join(self.generator.stream(rewritten, context, history))
+        if gen_span is not None:
+            self.tracer.end_span(gen_span, metadata={"answer_len": len(answer)})
 
         # ── Step 6: output guardrail (PII scrub + harmful-content judge) ──
         if self.guardrail_suite is not None:
+            out_span = (
+                self.tracer.start_span(trace, "guardrail_output")
+                if trace is not None else None
+            )
             out_decision = self.guardrail_suite.check_output(answer)
             if out_decision.blocked:
                 answer = (
@@ -198,6 +278,12 @@ class RAGOrchestrator:
                 )
             else:
                 answer = out_decision.scrubbed or answer
+            if out_span is not None:
+                self.tracer.end_span(
+                    out_span, metadata={"blocked": out_decision.blocked},
+                )
 
         result = self.post_processor.post_process(answer, docs)
+        if trace is not None:
+            result.trace_id = trace.id
         return answer, result, docs

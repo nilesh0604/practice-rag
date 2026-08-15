@@ -156,3 +156,77 @@ class TestGeneratorStream:
 
         answer = "".join(gen.stream("q", "c"))
         assert answer == "FastAPI uses Depends"
+
+
+# ── Step 7: circuit breaker integration ────────────────────────────────
+
+
+class TestGeneratorCircuitBreaker:
+    def test_stream_uses_circuit_breaker(self):
+        from api.observability import CircuitBreaker
+
+        cb = CircuitBreaker(threshold=3)
+        gen = Generator(circuit_breaker=cb)
+        mock_client = MagicMock()
+        mock_client.chat.return_value = iter(_chat_chunks(["tok1", "tok2"]))
+        gen._client = mock_client
+
+        tokens = list(gen.stream("q", "c"))
+        assert tokens == ["tok1", "tok2"]
+        assert cb.failures == 0
+
+    def test_circuit_breaker_records_failure_on_ollama_error(self):
+        from api.observability import CircuitBreaker
+
+        cb = CircuitBreaker(threshold=3)
+        gen = Generator(circuit_breaker=cb)
+        mock_client = MagicMock()
+        mock_client.chat.side_effect = ConnectionError("ollama down")
+        gen._client = mock_client
+
+        with pytest.raises(ConnectionError):
+            list(gen.stream("q", "c"))
+        assert cb.failures == 1
+
+    def test_circuit_open_raises_circuit_open_error(self):
+        from api.observability import CircuitBreaker, CircuitOpenError
+
+        cb = CircuitBreaker(threshold=2, timeout=30)
+        # Force the circuit open
+        cb.record_failure()
+        cb.record_failure()
+        assert cb.is_open()
+
+        gen = Generator(circuit_breaker=cb)
+        mock_client = MagicMock()
+        gen._client = mock_client
+
+        with pytest.raises(CircuitOpenError):
+            list(gen.stream("q", "c"))
+        # Client.chat was never called because the circuit was open
+        mock_client.chat.assert_not_called()
+
+    def test_no_circuit_breaker_unchanged_behavior(self):
+        gen = Generator()
+        mock_client = MagicMock()
+        mock_client.chat.return_value = iter(_chat_chunks(["a", "b"]))
+        gen._client = mock_client
+
+        tokens = list(gen.stream("q", "c"))
+        assert tokens == ["a", "b"]
+
+    def test_circuit_breaker_success_resets(self):
+        from api.observability import CircuitBreaker
+
+        cb = CircuitBreaker(threshold=3)
+        cb.record_failure()
+        cb.record_failure()
+        assert cb.failures == 2
+
+        gen = Generator(circuit_breaker=cb)
+        mock_client = MagicMock()
+        mock_client.chat.return_value = iter(_chat_chunks(["ok"]))
+        gen._client = mock_client
+
+        list(gen.stream("q", "c"))
+        assert cb.failures == 0
