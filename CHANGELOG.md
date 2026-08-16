@@ -5,6 +5,57 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed — ChatWidget is now a floating widget (`position: fixed` + `ChatBubble` trigger)
+
+The `ChatWidget` was an inline root component laid out inside the `.app`
+flex container — not `position: fixed`, with no floating trigger button.
+The architecture doc's listed component tree includes a `ChatBubble`
+(floating trigger) and a `ChatPanel` (`position: fixed`). The widget is
+now a **floating chat assistant**: a round `ChatBubble` button fixed in
+the bottom-right corner is always rendered, and the `ChatPanel` (header +
+`MessageList` + `InputBox`) is `position: fixed` and conditionally
+rendered based on `panelOpen`.
+
+- `frontend/src/ChatBubble.jsx` (new):
+  - Floating round trigger button (`position: fixed`, bottom-right,
+    `z-index: 1001`). Shows a chat icon (💬) when the panel is closed and
+    a close icon (✕) when open. `aria-label`/`aria-expanded`/`aria-controls`
+    reflect the open state and point at the panel id. `data-testid="chat-bubble"`.
+- `frontend/src/ChatWidget.jsx`:
+  - Renders `<ChatBubble open={panelOpen} onClick={handleTogglePanel} />`
+    always, plus the panel (`header` + `MessageList` + `InputBox`) inside
+    `.chat-widget__panel` only when `panelOpen` is true. The header (with
+    title, Collapse button, New chat button) moved **inside** the panel so
+    a collapsed widget shows only the bubble. Both the bubble and the
+    header Collapse button dispatch `TOGGLE_PANEL`. `panelOpen` still
+    defaults to `true`, preserving the always-visible behavior.
+- `frontend/src/styles.css`:
+  - `.chat-widget` is now just a positioning context (children are fixed).
+  - New `.chat-bubble` — `position: fixed`, 56px round button, bottom-right,
+    brand color, hover scale, `z-index: 1001`.
+  - `.chat-widget__panel` is now `position: fixed` (bottom-right, above the
+    bubble), 380×560px (clamped to viewport), `z-index: 1000`, with the
+    header (`flex-shrink: 0`) + `MessageList` (`flex: 1`) + `InputBox` laid
+    out as a flex column. `.app` no longer centers/flexes the widget.
+- `frontend/__tests__/ChatBubble.test.jsx` (new): 7 tests (render, icon
+  swap open/closed, onClick, aria-label/expanded/controls).
+- `frontend/__tests__/ChatWidget.test.jsx`: header/placeholder/input test
+  now also asserts the bubble; 2 new tests (bubble toggles panel
+  open/collapsed, header Collapse button toggles panel + bubble reopens).
+- `frontend/__tests__/App.test.jsx`: new assertion that the floating
+  `ChatBubble` trigger is rendered.
+- `docs/CHAT_ASSISTANT_FEATURES.md`: `ChatAssistantWidget` row 🟡→✅,
+  `ChatBubble` row ❌→✅, `ChatPanel` row 🟡→✅; state-management bullet
+  rewritten to describe the floating layout; React Chat Widget UI summary
+  count updated (✅ 1→4, 🟡 8→7, ❌ 2→1).
+- All 87 frontend tests pass (`npm test`); production build succeeds
+  (`npm run build`).
+
+> **F500 enterprise note:** this closes the floating-widget UI gap only.
+> The widget is still a standalone Vite SPA (no AEM SPA Editor integration,
+> no page-template `<script>` embed) — that remains a target-only
+> enterprise feature tracked separately.
+
 ### Changed — ChatWidget state management: `useReducer` with named action types
 
 The React `ChatWidget` previously managed its state with a collection of

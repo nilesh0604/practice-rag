@@ -12,4 +12,9 @@ describe("App", () => {
     render(<App />);
     expect(screen.getByTestId("chat-input")).toBeInTheDocument();
   });
+
+  it("renders the floating ChatBubble trigger", () => {
+    render(<App />);
+    expect(screen.getByTestId("chat-bubble")).toBeInTheDocument();
+  });
 });

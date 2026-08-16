@@ -21,45 +21,84 @@ body {
 
 /* ── App layout ───────────────────────────────────────────────── */
 .app {
-  display: flex;
-  justify-content: center;
   height: 100%;
-  padding: 16px;
 }
 
-/* ── ChatWidget ───────────────────────────────────────────────── */
+/* ── ChatWidget (floating) ────────────────────────────────────── */
+/* The root container is just a positioning context — the bubble and
+   the panel are both `position: fixed` relative to the viewport. */
 .chat-widget {
+  position: relative;
+}
+
+/* ChatBubble — floating trigger button (bottom-right, always visible) */
+.chat-bubble {
+  position: fixed;
+  bottom: 24px;
+  right: 24px;
+  width: 56px;
+  height: 56px;
+  border: none;
+  border-radius: 50%;
+  background: #4a6cf7;
+  color: #fff;
+  font-size: 24px;
+  line-height: 1;
+  cursor: pointer;
+  box-shadow: 0 4px 12px rgba(74, 108, 247, 0.4);
+  z-index: 1001;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition:
+    transform 0.15s,
+    background 0.15s;
+}
+.chat-bubble:hover {
+  background: #3b5de7;
+  transform: scale(1.05);
+}
+.chat-bubble:active {
+  transform: scale(0.98);
+}
+
+/* ChatPanel — floating panel (position: fixed, above the bubble) */
+.chat-widget__panel {
+  position: fixed;
+  bottom: 96px;
+  right: 24px;
+  width: 380px;
+  max-width: calc(100vw - 48px);
+  height: 560px;
+  max-height: calc(100vh - 132px);
   display: flex;
   flex-direction: column;
-  width: 100%;
-  max-width: 720px;
-  height: 100%;
+  min-height: 0;
   background: #fff;
   border-radius: 12px;
-  box-shadow: 0 2px 12px rgba(0, 0, 0, 0.08);
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.18);
   overflow: hidden;
+  z-index: 1000;
 }
 
 .chat-widget__header {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 16px 20px;
+  gap: 8px;
+  padding: 14px 16px;
   border-bottom: 1px solid #e8e8ec;
   background: #fafafa;
+  flex-shrink: 0;
 }
 
 .chat-widget__title {
-  font-size: 18px;
+  font-size: 15px;
   font-weight: 600;
   margin: 0;
-}
-
-.chat-widget__panel {
-  display: flex;
-  flex-direction: column;
-  flex: 1;
-  min-height: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 /* ── MessageList ──────────────────────────────────────────────── */

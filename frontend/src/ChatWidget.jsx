@@ -1,4 +1,5 @@
 import React, { useReducer, useRef, useCallback } from "react";
+import ChatBubble from "./ChatBubble.jsx";
 import MessageList from "./MessageList.jsx";
 import InputBox from "./InputBox.jsx";
 import ErrorBoundary from "./ErrorBoundary.jsx";
@@ -23,6 +24,13 @@ import { chatReducer, initialState } from "./chatReducer.js";
  *  - feedbackState: { [messageIndex]: 'up' | 'down' }
  *  - panelOpen: whether the chat panel body is expanded
  *
+ * The widget is a **floating** chat assistant: a `ChatBubble` trigger
+ * (`position: fixed`, bottom-right) is always rendered, and the
+ * `ChatPanel` (header + MessageList + InputBox) is `position: fixed` and
+ * conditionally rendered based on `panelOpen` (defaults to `true`,
+ * preserving the always-visible behavior). Both the bubble and the header
+ * Collapse button dispatch `TOGGLE_PANEL`.
+ *
  * The SSE consumer (api.js streamChat) calls onToken for each delta,
  * onSources with the parsed citations, onMetadata with the session id +
  * confidence + trace id, onGuardrailReplacement when the output guardrail
@@ -30,7 +38,8 @@ import { chatReducer, initialState } from "./chatReducer.js";
  * refusal), and onDone when the terminal event is received.
  *
  * Per the architecture doc:
- *   App → ChatWidget → MessageList + InputBox + ErrorBoundary
+ *   App → ChatWidget → ChatBubble + ChatPanel + ErrorBoundary
+ *   ChatPanel → MessageList + InputBox
  *   MessageList → CitationChip
  */
 export default function ChatWidget() {
@@ -135,29 +144,31 @@ export default function ChatWidget() {
   return (
     <ErrorBoundary>
       <div className="chat-widget">
-        <header className="chat-widget__header">
-          <h1 className="chat-widget__title">RAG Knowledge Assistant</h1>
-          <button
-            className="btn btn--ghost"
-            onClick={handleTogglePanel}
-            aria-expanded={panelOpen}
-            aria-controls="chat-widget__panel"
-            data-testid="toggle-panel-button"
-          >
-            {panelOpen ? "Collapse" : "Expand"}
-          </button>
-          <button
-            className="btn btn--ghost"
-            onClick={handleNewChat}
-            disabled={isStreaming}
-            data-testid="new-chat-button"
-          >
-            New chat
-          </button>
-        </header>
+        <ChatBubble open={panelOpen} onClick={handleTogglePanel} />
 
         {panelOpen && (
           <div id="chat-widget__panel" className="chat-widget__panel">
+            <header className="chat-widget__header">
+              <h1 className="chat-widget__title">RAG Knowledge Assistant</h1>
+              <button
+                className="btn btn--ghost"
+                onClick={handleTogglePanel}
+                aria-expanded={panelOpen}
+                aria-controls="chat-widget__panel"
+                data-testid="toggle-panel-button"
+              >
+                Collapse
+              </button>
+              <button
+                className="btn btn--ghost"
+                onClick={handleNewChat}
+                disabled={isStreaming}
+                data-testid="new-chat-button"
+              >
+                New chat
+              </button>
+            </header>
+
             <MessageList
               messages={messages}
               sessionId={sessionId}

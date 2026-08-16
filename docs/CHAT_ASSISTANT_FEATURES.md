@@ -59,20 +59,20 @@
 
 Implemented components (see <ref_file file="/Users/Nilesh_Shinde/iSpace/practice-rag/frontend/src/" />):
 
-| Listed component      | Status | Actual component(s)                                                                                       |
-| --------------------- | ------ | --------------------------------------------------------------------------------------------------------- |
-| `ChatAssistantWidget` | 🟡     | `ChatWidget` (root, not `position: fixed`)                                                                |
-| `ChatBubble`          | ❌     | No floating trigger button                                                                                |
-| `ChatPanel`           | 🟡     | Panel body toggles via `TOGGLE_PANEL` (Collapse/Expand button); not `position: fixed`, no floating bubble |
-| `MessageHistory`      | 🟡     | `MessageList`                                                                                             |
-| `MessageInput`        | 🟡     | `InputBox`                                                                                                |
-| `MessageBubble`       | 🟡     | Rendered inline within `MessageList`                                                                      |
-| `SourceCard`          | 🟡     | `CitationChip` (chip with snippet + score + date, not a full card)                                        |
-| `FeedbackButtons`     | 🟡     | Thumbs up/down rendered inside `MessageList`                                                              |
-| `TypingIndicator`     | 🟡     | Streaming flag / blinking cursor (no separate comp.)                                                      |
-| `ErrorBoundary`       | ✅     | `ErrorBoundary`                                                                                           |
+| Listed component      | Status | Actual component(s)                                                                                  |
+| --------------------- | ------ | ---------------------------------------------------------------------------------------------------- |
+| `ChatAssistantWidget` | ✅     | `ChatWidget` (root; floating — `position: fixed` panel + bubble)                                     |
+| `ChatBubble`          | ✅     | `ChatBubble` (floating round trigger button, `position: fixed` bottom-right; toggles `TOGGLE_PANEL`) |
+| `ChatPanel`           | ✅     | `.chat-widget__panel` (`position: fixed` floating panel; header + `MessageList` + `InputBox`)        |
+| `MessageHistory`      | 🟡     | `MessageList`                                                                                        |
+| `MessageInput`        | 🟡     | `InputBox`                                                                                           |
+| `MessageBubble`       | 🟡     | Rendered inline within `MessageList`                                                                 |
+| `SourceCard`          | 🟡     | `CitationChip` (chip with snippet + score + date, not a full card)                                   |
+| `FeedbackButtons`     | 🟡     | Thumbs up/down rendered inside `MessageList`                                                         |
+| `TypingIndicator`     | 🟡     | Streaming flag / blinking cursor (no separate comp.)                                                 |
+| `ErrorBoundary`       | ✅     | `ErrorBoundary`                                                                                      |
 
-- ✅ State is managed via a single `useReducer` (`chatReducer`) with the listed action types: `TOGGLE_PANEL`, `ADD_USER_MESSAGE`, `ADD_ASSISTANT_MESSAGE`, `STREAM_DELTA`, `SET_SOURCES`, `SET_METADATA`, `GUARDRAIL_REPLACEMENT`, `STREAM_DONE`, `STREAM_ERROR`, `SET_STREAMING`, `SET_FEEDBACK`, `CLEAR_FEEDBACK`, `NEW_CHAT`. See <ref_file file="/Users/Nilesh_Shinde/iSpace/practice-rag/frontend/src/chatReducer.js" /> (reducer) and <ref_file file="/Users/Nilesh_Shinde/iSpace/practice-rag/frontend/src/ChatWidget.jsx" /> (dispatch wiring). The `TOGGLE_PANEL` action is wired to a header Collapse/Expand button that conditionally renders the panel body (`panelOpen` defaults to `true`, preserving the always-visible behavior); the panel is still not `position: fixed` and there is no floating `ChatBubble` trigger.
+- ✅ State is managed via a single `useReducer` (`chatReducer`) with the listed action types: `TOGGLE_PANEL`, `ADD_USER_MESSAGE`, `ADD_ASSISTANT_MESSAGE`, `STREAM_DELTA`, `SET_SOURCES`, `SET_METADATA`, `GUARDRAIL_REPLACEMENT`, `STREAM_DONE`, `STREAM_ERROR`, `SET_STREAMING`, `SET_FEEDBACK`, `CLEAR_FEEDBACK`, `NEW_CHAT`. See <ref_file file="/Users/Nilesh_Shinde/iSpace/practice-rag/frontend/src/chatReducer.js" /> (reducer) and <ref_file file="/Users/Nilesh_Shinde/iSpace/practice-rag/frontend/src/ChatWidget.jsx" /> (dispatch wiring). The widget is a **floating** chat assistant: a `ChatBubble` trigger (`position: fixed`, bottom-right, always rendered) and a `ChatPanel` (`position: fixed`, conditionally rendered based on `panelOpen`, defaults to `true` preserving the always-visible behavior). Both the bubble and a header Collapse button dispatch `TOGGLE_PANEL`; clicking either collapses the panel to just the bubble, and clicking the bubble again re-expands it.
 - ❌ **Not embedded into AEM portal** — it is a standalone Vite SPA served via `npm run dev` / `npx serve -s dist`. No SPA Editor integration, no page-template `<script>` tag.
 
 ---
@@ -151,7 +151,7 @@ Additional endpoints not in the listed spec but present: `POST /api/v1/ingest`, 
 | Category             | ✅ Implemented | 🟡 Partial | ❌ Not implemented |
 | -------------------- | -------------- | ---------- | ------------------ |
 | Core Chat            | 7              | 2          | 0                  |
-| React Chat Widget UI | 1              | 8          | 2                  |
+| React Chat Widget UI | 4              | 7          | 1                  |
 | Retrieval            | 2              | 1          | 3                  |
 | APIs                 | 0              | 4          | 0 (within scope)   |
 | Guardrails           | 2              | 2          | 3                  |

@@ -60,12 +60,47 @@ describe("ChatWidget", () => {
     sendFeedback.mockReset();
   });
 
-  it("renders the header, empty placeholder, and input", () => {
+  it("renders the header, empty placeholder, input, and floating bubble", () => {
     render(<ChatWidget />);
     expect(screen.getByText("RAG Knowledge Assistant")).toBeInTheDocument();
     expect(
       screen.getByText(/Ask a question about FastAPI/),
     ).toBeInTheDocument();
+    expect(screen.getByTestId("chat-input")).toBeInTheDocument();
+    // The floating ChatBubble trigger is always rendered.
+    expect(screen.getByTestId("chat-bubble")).toBeInTheDocument();
+  });
+
+  it("toggles the panel open/collapsed via the floating bubble", () => {
+    render(<ChatWidget />);
+    // Panel is open by default — input + title visible.
+    expect(screen.getByTestId("chat-input")).toBeInTheDocument();
+    expect(screen.getByText("RAG Knowledge Assistant")).toBeInTheDocument();
+
+    // Click the bubble → panel collapses (input + title removed).
+    fireEvent.click(screen.getByTestId("chat-bubble"));
+    expect(screen.queryByTestId("chat-input")).not.toBeInTheDocument();
+    expect(
+      screen.queryByText("RAG Knowledge Assistant"),
+    ).not.toBeInTheDocument();
+    // The bubble remains visible so the user can reopen.
+    expect(screen.getByTestId("chat-bubble")).toBeInTheDocument();
+
+    // Click again → panel re-expands.
+    fireEvent.click(screen.getByTestId("chat-bubble"));
+    expect(screen.getByTestId("chat-input")).toBeInTheDocument();
+    expect(screen.getByText("RAG Knowledge Assistant")).toBeInTheDocument();
+  });
+
+  it("toggles the panel via the header Collapse button", () => {
+    render(<ChatWidget />);
+    expect(screen.getByTestId("chat-input")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByTestId("toggle-panel-button"));
+    expect(screen.queryByTestId("chat-input")).not.toBeInTheDocument();
+
+    // Reopen via the bubble (the Collapse button is inside the hidden panel).
+    fireEvent.click(screen.getByTestId("chat-bubble"));
     expect(screen.getByTestId("chat-input")).toBeInTheDocument();
   });
 
