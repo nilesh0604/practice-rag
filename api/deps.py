@@ -31,6 +31,8 @@ from rag.nim_reranker import build_reranker, get_rerank_candidate_k
 from rag.orchestrator import RAGOrchestrator
 from rag.post_processor import PostProcessor
 from rag.qdrant_collection import get_qdrant_client
+from rag.query_decomposer import LLMQueryDecomposer
+from rag.query_clarifier import LLMQueryClarifier
 from rag.query_rewriter import LLMQueryRewriter
 from rag.retriever import DEFAULT_TOP_K, HybridRetriever
 
@@ -110,6 +112,8 @@ def get_orchestrator() -> RAGOrchestrator:
         guardrail_suite=get_guardrail_suite(),
         tracer=get_tracer(),
         reranker=get_reranker(),
+        query_decomposer=LLMQueryDecomposer(),
+        query_clarifier=LLMQueryClarifier(),
     )
 
 

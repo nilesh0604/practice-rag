@@ -25,7 +25,10 @@ from api.observability import (
     MetricsCollector,
     SpanHandle,
     TraceHandle,
+    TTFT_SLO_PERCENTILE,
+    TTFT_SLO_TARGET_S,
     _percentile,
+    _ttft_slo,
     check_ollama,
     check_qdrant,
     warm_up_ollama,
@@ -278,6 +281,132 @@ class TestPercentile:
 
     def test_p100_returns_max(self):
         assert _percentile([3, 1, 2], 100) == pytest.approx(3.0)
+
+
+# ════════════════════════════════════════════════════════════════════════
+# TTFT SLO gate (build-order item 40 — "TTFT < 800ms")
+# ════════════════════════════════════════════════════════════════════════
+
+
+class TestTtftSloConstants:
+    def test_target_is_800ms(self):
+        assert TTFT_SLO_TARGET_S == pytest.approx(0.8)
+
+    def test_default_percentile_is_p95(self):
+        assert TTFT_SLO_PERCENTILE == pytest.approx(95.0)
+
+
+class TestTtftSloHelper:
+    def test_no_data_when_no_samples(self):
+        result = _ttft_slo([], target_s=0.8, percentile=95.0)
+        assert result["status"] == "no_data"
+        assert result["met"] is None
+        assert result["samples"] == 0
+        assert result["value_s"] == 0.0
+        assert result["target_s"] == pytest.approx(0.8)
+        assert result["percentile"] == pytest.approx(95.0)
+
+    def test_met_when_p95_below_target(self):
+        # 20 samples 0.1–0.3s → p95 ~0.295s, well under 0.8s.
+        samples = [0.1 + i * 0.01 for i in range(20)]
+        result = _ttft_slo(samples, target_s=0.8, percentile=95.0)
+        assert result["status"] == "met"
+        assert result["met"] is True
+        assert result["samples"] == 20
+        assert result["value_s"] < 0.8
+
+    def test_breached_when_p95_at_or_above_target(self):
+        # 20 samples 0.7–1.3s → p95 ~1.245s, above 0.8s.
+        samples = [0.7 + i * 0.03 for i in range(20)]
+        result = _ttft_slo(samples, target_s=0.8, percentile=95.0)
+        assert result["status"] == "breached"
+        assert result["met"] is False
+        assert result["value_s"] >= 0.8
+
+    def test_boundary_target_equal_is_breached(self):
+        # p95 exactly equal to target → not strictly below → breached.
+        result = _ttft_slo([0.8], target_s=0.8, percentile=95.0)
+        assert result["status"] == "breached"
+        assert result["met"] is False
+
+    def test_custom_target_and_percentile(self):
+        # p99 of [0.1..0.5] ~0.496, target 0.5 → breached (not strictly below).
+        samples = [0.1 + i * 0.04 for i in range(11)]
+        result = _ttft_slo(samples, target_s=0.5, percentile=99.0)
+        assert result["target_s"] == pytest.approx(0.5)
+        assert result["percentile"] == pytest.approx(99.0)
+
+
+class TestMetricsCollectorTtftSlo:
+    def test_evaluate_slo_no_data_initially(self):
+        mc = MetricsCollector()
+        result = mc.evaluate_ttft_slo()
+        assert result["status"] == "no_data"
+        assert result["met"] is None
+        assert result["samples"] == 0
+
+    def test_evaluate_slo_met(self):
+        mc = MetricsCollector()
+        for v in [0.1, 0.2, 0.3, 0.4, 0.5]:
+            mc.record_ttft(v)
+        result = mc.evaluate_ttft_slo()
+        assert result["status"] == "met"
+        assert result["met"] is True
+        assert result["samples"] == 5
+        assert result["value_s"] < 0.8
+
+    def test_evaluate_slo_breached(self):
+        mc = MetricsCollector()
+        for v in [0.7, 0.8, 0.9, 1.0, 1.1]:
+            mc.record_ttft(v)
+        result = mc.evaluate_ttft_slo()
+        assert result["status"] == "breached"
+        assert result["met"] is False
+        assert result["value_s"] >= 0.8
+
+    def test_evaluate_slo_respects_custom_target(self):
+        mc = MetricsCollector()
+        for v in [0.1, 0.2, 0.3]:
+            mc.record_ttft(v)
+        # p95 of [0.1,0.2,0.3] = 0.3; with a tight 0.25 target → breached.
+        result = mc.evaluate_ttft_slo(target_s=0.25)
+        assert result["status"] == "breached"
+        assert result["met"] is False
+        assert result["target_s"] == pytest.approx(0.25)
+
+    def test_snapshot_includes_slo_block(self):
+        mc = MetricsCollector()
+        mc.record_ttft(0.2)
+        mc.record_ttft(0.3)
+        snap = mc.snapshot()
+        assert "slo" in snap
+        slo = snap["slo"]
+        assert slo["status"] == "met"
+        assert slo["met"] is True
+        assert slo["target_s"] == pytest.approx(0.8)
+        assert slo["percentile"] == pytest.approx(95.0)
+        assert slo["samples"] == 2
+
+    def test_snapshot_slo_no_data_when_empty(self):
+        mc = MetricsCollector()
+        slo = mc.snapshot()["slo"]
+        assert slo["status"] == "no_data"
+        assert slo["met"] is None
+
+    def test_snapshot_slo_consistent_with_ttft_p95(self):
+        mc = MetricsCollector()
+        for v in [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]:
+            mc.record_ttft(v)
+        snap = mc.snapshot()
+        assert snap["slo"]["value_s"] == pytest.approx(snap["ttft"]["p95_s"])
+
+    def test_reset_clears_slo_samples(self):
+        mc = MetricsCollector()
+        mc.record_ttft(1.0)
+        assert mc.evaluate_ttft_slo()["samples"] == 1
+        mc.reset()
+        assert mc.evaluate_ttft_slo()["status"] == "no_data"
+        assert mc.evaluate_ttft_slo()["samples"] == 0
 
 
 # ════════════════════════════════════════════════════════════════════════

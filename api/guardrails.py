@@ -121,11 +121,13 @@ CLASS_GREETING: str = "greeting"
 CLASS_OFF_TOPIC: str = "off_topic"
 CLASS_COMPARE: str = "compare"
 CLASS_FOLLOW_UP: str = "follow_up"
+CLASS_AMBIGUOUS: str = "ambiguous"
 
 VALID_CLASSES: frozenset[str] = frozenset(
-    {CLASS_DOCUMENTATION, CLASS_GREETING, CLASS_OFF_TOPIC, CLASS_COMPARE, CLASS_FOLLOW_UP},
+    {CLASS_DOCUMENTATION, CLASS_GREETING, CLASS_OFF_TOPIC, CLASS_COMPARE, CLASS_FOLLOW_UP, CLASS_AMBIGUOUS},
 )
-"""The routing classes from the architecture doc plus ``follow_up``."""
+"""The routing classes from the architecture doc plus ``follow_up`` and
+``ambiguous``."""
 
 # Keyword fallback for the classifier (used when Ollama is unavailable).
 _GREETING_KEYWORDS = frozenset(
@@ -136,6 +138,20 @@ _COMPARE_KEYWORDS = frozenset(
 )
 _OFF_TOPIC_KEYWORDS = frozenset(
     {"weather", "sports", "game", "movie", "recipe", "cook", "news", "politics", "stock", "crypto"},
+)
+# Ambiguity markers (keyword fallback): bare pronoun references or short
+# queries that name a concept shared across the documented libraries without
+# specifying which one. The LLM classifier is the primary detector; this
+# keyword tier is a conservative fallback for when Ollama is unavailable.
+_AMBIGUOUS_MARKERS = frozenset(
+    {"it", "that", "this", "one", "the model", "the validator", "the cache", "the field"},
+)
+_AMBIGUOUS_MIN_WORDS = 1
+_AMBIGUOUS_MAX_WORDS = 6
+# Library qualifiers — when any of these appear in the query, it is specific
+# enough to not be ambiguous regardless of pronoun usage.
+_LIBRARY_QUALIFIERS = frozenset(
+    {"fastapi", "pydantic", "sqlmodel", "flask", "sqlalchemy", "starlette"},
 )
 
 # ── LLM judge / classifier prompts ─────────────────────────────────────
@@ -181,6 +197,10 @@ Classify the user's question for a technical documentation chatbot \
 - "follow_up" — a follow-up that references prior turns in the conversation \
 (summarize the above, what about the second one) and is on-topic for the \
 documented libraries
+- "ambiguous" — an on-topic question that is too vague to answer without \
+clarification (e.g. "how do I use validators?" without specifying Pydantic \
+vs FastAPI dependency validators, or a bare pronoun reference like "how do \
+I configure it?" with no prior context that disambiguates "it")
 
 Conversation history:
 {history}
@@ -276,15 +296,24 @@ def classify_keywords(query: str) -> str:
     # short tail ("hi there", "hello!"). Questions like "hello how do I
     # use FastAPI" are long enough to fall through to documentation.
     stripped = lowered.rstrip("!.,?;:")
-    first_word = stripped.split()[0] if stripped.split() else ""
+    words = stripped.split()
+    first_word = words[0] if words else ""
     if stripped in _GREETING_KEYWORDS:
         return CLASS_GREETING
-    if first_word in _GREETING_KEYWORDS and len(stripped.split()) <= 2:
+    if first_word in _GREETING_KEYWORDS and len(words) <= 2:
         return CLASS_GREETING
     if any(k in lowered for k in _COMPARE_KEYWORDS):
         return CLASS_COMPARE
     if any(k in lowered for k in _OFF_TOPIC_KEYWORDS):
         return CLASS_OFF_TOPIC
+    # Ambiguity: a short query (1-6 words) that contains a bare pronoun
+    # or a shared-concept noun without a library qualifier. Conservative —
+    # only fires when the query is too short to carry enough specificity AND
+    # no library name (FastAPI/Pydantic/SQLModel) is present.
+    if _AMBIGUOUS_MIN_WORDS <= len(words) <= _AMBIGUOUS_MAX_WORDS:
+        if not any(q in lowered for q in _LIBRARY_QUALIFIERS):
+            if any(stripped == m or m in lowered for m in _AMBIGUOUS_MARKERS):
+                return CLASS_AMBIGUOUS
     return CLASS_DOCUMENTATION
 
 
@@ -525,7 +554,10 @@ class QueryClassifier:
             return QueryClassification(label=label, handled=True, answer=_GREETING_ANSWER)
         if label == CLASS_OFF_TOPIC:
             return QueryClassification(label=label, handled=True, answer=_OFF_TOPIC_ANSWER)
-        # documentation + compare + follow_up all go through the RAG flow.
+        # documentation + compare + follow_up + ambiguous all go through the
+        # orchestrator. ``ambiguous`` is short-circuited by the query
+        # clarifier (which generates a clarification prompt); the others
+        # proceed through the full RAG flow.
         return QueryClassification(label=label, handled=False)
 
     def close(self) -> None:

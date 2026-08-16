@@ -5,6 +5,178 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added — TTFT < 800ms SLO gate (online-serving latency threshold)
+
+TTFT (time-to-first-token) was collected by `MetricsCollector` and exposed
+in the `GET /api/v1/metrics` snapshot (mean/p50/p95), but there was no
+threshold gate asserting the doc's "TTFT < 800ms" online-serving SLO — the
+metric was observed but never evaluated against the target. The collector
+now evaluates the SLO and surfaces the met/breached status.
+
+- `api/observability.py`:
+  - New constants `TTFT_SLO_TARGET_S = 0.8` (seconds) and
+    `TTFT_SLO_PERCENTILE = 95.0` (the SLO is evaluated on p95 over the
+    retained sample window).
+  - New `MetricsCollector.evaluate_ttft_slo(target_s, percentile)` —
+    computes the configured percentile of the TTFT samples and returns
+    `{target_s, percentile, value_s, status, met, samples}` where
+    `status` is `"met"` (value < target), `"breached"` (value >= target),
+    or `"no_data"` (no samples recorded yet; `met = None`).
+  - New lock-free pure helper `_ttft_slo(samples, target_s, percentile)`
+    so `snapshot()` can compute the SLO block while already holding the
+    collector lock (avoids reentrant-lock deadlock).
+  - `snapshot()` now includes an `slo` key with the gate result, surfaced
+    via `GET /api/v1/metrics`.
+  - Module docstring updated to document the SLO gate.
+- `tests/test_observability.py` — new `TestTtftSloConstants`,
+  `TestTtftSloHelper`, and `TestMetricsCollectorTtftSlo` classes (SLO
+  constants, no-data / met / breached / boundary-equal / custom-target
+  cases, snapshot `slo` block, consistency with `ttft.p95_s`, reset
+  clears samples).
+- `tests/test_api_metrics.py` — `slo` key assertion + no-data / met /
+  breached endpoint cases.
+- `docs/CHAT_ASSISTANT_FEATURES.md` — TTFT < 800ms row updated from ❌
+  to 🟡 (gate in place; enterprise gap = in-process ring buffer, no
+  rolling time window, no alerting on SLO burn).
+- `docs/F500_ENTERPRISE_ACTION_ITEMS.md` — item 6 (observability) partial
+  progress note recording the SLO gate and the remaining enterprise gaps.
+
+### Added — Ambiguous query → clarification prompt
+
+Queries the classifier labels `ambiguous` (e.g. "how do I use validators?"
+without specifying Pydantic vs FastAPI dependency validators, or a bare
+pronoun reference like "how do I configure it?" with no disambiguating
+context) previously went through the full RAG flow and likely produced a
+vague or wrong answer. The orchestrator now short-circuits `ambiguous`-
+labeled queries with a clarification prompt instead — no retrieval, no
+generation. The user is asked to disambiguate before any answer is
+attempted.
+
+- `api/guardrails.py` — new `CLASS_AMBIGUOUS` label added to `VALID_CLASSES`;
+  `CLASSIFIER_PROMPT` updated with an `ambiguous` label description;
+  `classify_keywords` keyword fallback now detects short queries (1–6 words)
+  with bare pronoun/shared-concept markers (`it`/`that`/`the model`/`the
+validator`/…) and no library qualifier (FastAPI/Pydantic/SQLModel) →
+  `ambiguous`; `_to_classification` routes `ambiguous` through the
+  orchestrator (not `handled`).
+- `rag/query_clarifier.py` — new module:
+  - `QueryClarifier` protocol + `PassthroughQueryClarifier` (returns `None`,
+    no LLM call — zero latency, zero risk).
+  - `LLMQueryClarifier` — sends a short clarify prompt to Ollama and parses
+    the response into a single clarification question (leading
+    `Clarification:`/`Q:` labels stripped via `_strip_label_prefix`). Falls
+    back to a deterministic heuristic clarifier (`_heuristic_clarify` —
+    detects shared-concept nouns like `validator`/`model`/`field`/`cache`/
+    `schema`/`session`/`dependency` and proposes a "Do you mean X or Y?"
+    prompt) when Ollama is unavailable, returns nothing useful, or errors.
+    When both LLM and heuristic find no candidates, returns `None` so the
+    orchestrator uses `GENERIC_CLARIFICATION`. Shares the lazy-client
+    pattern from `Generator`/`Embedder`/`LLMQueryRewriter`/
+    `LLMQueryDecomposer`.
+- `rag/orchestrator.py` — new optional `query_clarifier` collaborator
+  (defaults to `PassthroughQueryClarifier`); both `stream_answer` and
+  `answer` short-circuit `ambiguous`-labeled queries with the clarifier's
+  prompt (or `GENERIC_CLARIFICATION` when the clarifier returns `None`).
+  The clarifier runs on the **original** query (before rewriting) since the
+  user's actual words are what need disambiguation. No retrieval, no
+  generation, no rewrite.
+- `api/deps.py` — `get_orchestrator` now wires `LLMQueryClarifier()`.
+- `tests/test_rag_query_clarifier.py` — new test module (heuristic concept
+  detection, label-prefix stripping, passthrough, LLM with fallbacks,
+  prompt template, generic clarification).
+- `tests/test_guardrails.py` — `CLASS_AMBIGUOUS` import; ambiguity keyword
+  fallback tests; LLM `ambiguous` label test + error-fallback test.
+- `tests/test_rag_orchestrator.py` — `TestOrchestratorAmbiguity` class
+  (short-circuit with clarifier prompt, generic fallback, passthrough
+  clarifier, rewriter not called, history forwarding, non-ambiguous labels
+  skip clarifier, `answer` method short-circuit).
+
+### Added — Query decomposition for `compare`-labeled queries (multi-query retrieval)
+
+Complex/multi-part queries labeled `compare` by the query classifier (e.g.
+"Compare FastAPI and Flask for building REST APIs") previously went through
+a single retrieval pass, which often missed chunks strongly relevant to
+only one side of the comparison. The orchestrator now decomposes a
+`compare`-labeled query into one sub-query per compared subject, runs
+retrieval once per sub-query, and merges + deduplicates the results before
+assembly/generation — so the generator sees balanced context for both
+sides.
+
+- `rag/query_decomposer.py` — new module:
+  - `QueryDecomposer` protocol + `PassthroughQueryDecomposer` (returns
+    `[query]`, no split, no LLM call — zero latency, zero risk).
+  - `LLMQueryDecomposer` — sends a short split prompt to Ollama and parses
+    the response into one sub-query per non-empty line (leading
+    numbering/bullet prefixes stripped via `_strip_prefix`). Falls back to
+    a deterministic heuristic splitter (`_heuristic_decompose` — splits on
+    `vs`/`versus`/`compared to`/`difference between`/`and`, `maxsplit=1`)
+    when Ollama is unavailable, returns nothing useful, returns a single
+    line equal to the original (no decomposition), or errors. Shares the
+    lazy-client pattern from `Generator`/`Embedder`/`LLMQueryRewriter` so
+    unit tests inject mocks and never touch the network.
+- `rag/orchestrator.py` — new optional `query_decomposer` collaborator
+  (defaults to `PassthroughQueryDecomposer`); new `_retrieve` helper runs
+  multi-query retrieval only when the classifier labeled the query
+  `compare` AND the decomposer returns >1 sub-query (all other labels and
+  single-sub-query decompositions stay single-retrieval-pass, identical to
+  the prior flow); new `_merge_docs` static helper deduplicates by doc id
+  (max RRF score kept) and sorts by score descending. Decomposition runs
+  on the **rewritten** query (after coreference resolution), and the
+  merged candidate pool is what the optional NIM reranker reranks. Both
+  `stream_answer` and `answer` use `_retrieve`.
+- `api/deps.py` — `get_orchestrator()` now wires
+  `LLMQueryDecomposer()` into the orchestrator.
+- `tests/test_rag_query_decomposer.py` — new test file (40 tests):
+  `_heuristic_decompose` (15 tests: all connectors, no-connector
+  passthrough, empty/whitespace, empty-part guard, case-insensitivity,
+  first-connector-only split, connector priority), `_strip_prefix` (9
+  tests: numbered/paren/dash/asterisk/bullet prefixes, no-prefix
+  passthrough, inline-number no-strip), `PassthroughQueryDecomposer`
+  (3 tests), `LLMQueryDecomposer` (13 tests: multi-line split, prefix
+  stripping, single-line-equal-to-original heuristic fallback, empty/
+  missing/exception fallback, `use_llm=False`, whitespace-line dropping,
+  stream/query-in-prompt/close/lazy-client), `DECOMPOSE_PROMPT_TEMPLATE`
+  (4 tests).
+- `tests/test_rag_orchestrator.py` — new `TestOrchestratorDecomposition`
+  (9 tests: compare → multiple retrievals, single-sub-query → single
+  retrieval, non-compare label skips decomposition, no-guardrail-suite
+  skips decomposition, merged docs deduped by id with max score, merged
+  docs sorted by score desc, reranker receives merged pool, `answer`
+  method decomposes, decomposition uses rewritten query) +
+  `TestMergeDocs` (7 tests for the static merge helper).
+- `docs/CHAT_ASSISTANT_FEATURES.md` — Query Classification & Routing
+  "Complex/multi-part" line upgraded from ❌ to 🟡 Partial (decomposition
+  implemented for the `compare` label; general multi-part compound
+  questions are not detected). Core Chat summary updated (🟡 1→2, ❌ 2→1).
+  Bottom-line paragraph updated.
+- All 832 backend tests pass (`python -m pytest -q`); all 62 frontend
+  tests pass (`npm test`).
+
+**F500 enterprise gap:** the decomposer uses a 3B local model with no
+eval gate/SLO, no decompose-quality eval (does retrieval recall improve?
+does it ever break a good query?), and no audit log of the split. Tracked
+in `docs/F500_ENTERPRISE_ACTION_ITEMS.md`.
+
+### Changed — corrected session-store feature status to ✅ Implemented
+
+The "No Redis (SQLite instead) and no Cosmos DB" bullet in
+`docs/CHAT_ASSISTANT_FEATURES.md` was mislabeled ❌ Not implemented. The
+bullet text describes the _actual practice implementation_, which is fully
+working and tested:
+
+- SQLite single-file session store (`api/conversation.py`), no Redis.
+- No Cosmos DB; full per-session history lives in SQLite (`get_messages`
+  returns every message — no pruning, no TTL, no 90-day retention).
+- No 30-min sliding window; the prompt-context window is a fixed turn
+  count (`HISTORY_WINDOW=10` turns) via `get_history`/`format_history`.
+
+Relabeled ❌ → ✅ and updated the Core Chat summary count
+(✅ 5→6, ❌ 3→2). The production Redis (last 10) + Cosmos DB (90d) tiering
+remains a target-only enterprise feature. No code change —
+`tests/test_api_conversation.py` (18 tests) already covers session
+creation, full-history retrieval, history-window truncation/turn-boundary,
+and feedback CRUD.
+
 ### Added — `guardrail_replacement` SSE event for output-guardrail blocks
 
 The stream-then-verify guardrail pattern previously had a UX gap: when the

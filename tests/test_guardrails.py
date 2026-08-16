@@ -21,6 +21,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from api.guardrails import (
+    CLASS_AMBIGUOUS,
     CLASS_COMPARE,
     CLASS_DOCUMENTATION,
     CLASS_FOLLOW_UP,
@@ -170,6 +171,25 @@ class TestClassifyKeywords:
         # (the keyword fallback is conservative; the LLM classifier handles
         # nuanced greetings when available).
         assert classify_keywords("hello how do I use FastAPI") == CLASS_DOCUMENTATION
+
+    def test_ambiguous_bare_pronoun(self):
+        assert classify_keywords("how do I configure it?") == CLASS_AMBIGUOUS
+
+    def test_ambiguous_that_reference(self):
+        assert classify_keywords("how does that work?") == CLASS_AMBIGUOUS
+
+    def test_ambiguous_the_model(self):
+        assert classify_keywords("how do I use the model?") == CLASS_AMBIGUOUS
+
+    def test_ambiguous_the_validator(self):
+        assert classify_keywords("how do I use the validator?") == CLASS_AMBIGUOUS
+
+    def test_long_query_not_ambiguous(self):
+        # A longer query with a pronoun still has enough specificity → documentation.
+        assert classify_keywords("how do I configure it in FastAPI with Depends?") == CLASS_DOCUMENTATION
+
+    def test_specific_query_not_ambiguous(self):
+        assert classify_keywords("how do I use Pydantic validators?") == CLASS_DOCUMENTATION
 
 
 # ── InputGuardrail ─────────────────────────────────────────────────────
@@ -466,6 +486,22 @@ class TestQueryClassifier:
         result = clf.classify("please summarize all above 3 answers", "")
         assert result.label == CLASS_OFF_TOPIC
         assert result.handled is True
+
+    def test_llm_labels_ambiguous_not_handled(self):
+        clf = QueryClassifier()
+        clf._client = _mock_ollama("ambiguous")
+        result = clf.classify("how do I use validators?")
+        assert result.label == CLASS_AMBIGUOUS
+        assert result.handled is False
+        assert result.answer == ""
+
+    def test_llm_error_falls_back_ambiguous_keyword(self):
+        clf = QueryClassifier()
+        client = MagicMock()
+        client.chat.side_effect = ConnectionError("no ollama")
+        clf._client = client
+        result = clf.classify("how do I configure it?")
+        assert result.label == CLASS_AMBIGUOUS
 
     def test_history_default_is_empty(self):
         clf = QueryClassifier()

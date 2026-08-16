@@ -204,6 +204,18 @@ Guardrail decisions are logged via `logger.info(...)` and emitted as Langfuse sp
 3. Add Langfuse **trace attributes** for `judge_verdict`, `history_length`, `matched_regex` (already partially there via span metadata — formalize as attributes for querying).
 4. Define an **alert**: block rate > 2× baseline over 1h → page (requires an alerting backend; defer until deployed).
 
+**Partial progress (2026-08-15):** The **TTFT < 800ms SLO gate** is now in
+place (`MetricsCollector.evaluate_ttft_slo()` + `_ttft_slo` in
+`api/observability.py`; `TTFT_SLO_TARGET_S = 0.8s`, `TTFT_SLO_PERCENTILE =
+95.0`). The `GET /api/v1/metrics` snapshot now carries an `slo` block with
+`status` (`met` / `breached` / `no_data`), `met`, `value_s`, `samples`. This
+closes the "TTFT collected but no threshold gate" gap from
+`docs/CHAT_ASSISTANT_FEATURES.md`. What remains enterprise-grade: the gate
+runs in-process over a 200-sample ring buffer with **no rolling time window**
+and **no alerting on SLO burn** — an F500 deployment would evaluate the SLO
+over a Prometheus-style window and page on sustained burn. Guardrail-specific
+metrics (items 1–3 above) are still not collected.
+
 ---
 
 ## 7. No adversarial / red-team regression suite
@@ -291,18 +303,93 @@ Before promoting NIM (or any hosted LLM provider) to the production generation/g
 
 ---
 
+## 9. Query decomposer as an injection/quality surface (`compare`-label decomposition)
+
+**Files:** `rag/query_decomposer.py` (`LLMQueryDecomposer`, `DECOMPOSE_PROMPT_TEMPLATE`), `rag/orchestrator.py` (`_retrieve`, `_merge_docs`)
+
+### Enterprise-standard practice
+
+Query decomposition (splitting a complex/multi-part query into sub-queries and running retrieval per sub-query) is a known RAG quality lever, but an enterprise would:
+
+- **Sanitize the query** before it reaches the decomposer (the decomposer runs on the rewritten query, which is already attacker-influenced via history).
+- **Audit-log** `{original_query, rewritten_query, sub_queries}` for incident forensics and quality regression triage.
+- **Eval decompose quality** — does multi-query retrieval improve recall/answer quality vs. single-query on a labeled comparison dataset? Does the decomposer ever break a good query (over-splitting a non-comparison query, or producing sub-queries that retrieve worse than the original)?
+- **Gate the split** with a budget cap / latency SLO (the LLM path adds one Ollama round-trip per `compare` query; the heuristic fallback is free).
+- **Detect general multi-part queries**, not just `compare`-labeled ones — compound non-comparison questions ("How do I set up FastAPI and configure Pydantic validators?") are not decomposed today.
+
+### Workaround shipped
+
+`LLMQueryDecomposer` is wired into `get_orchestrator()` and runs on every `compare`-labeled query. No query sanitization, no audit log of the split, no decompose-quality eval, no latency SLO, no general multi-part detector (only the `compare` classifier label triggers decomposition). A heuristic fallback (`_heuristic_decompose`) means decomposition still works without Ollama, and the passthrough decomposer is the default when none is configured.
+
+### Reasoning for the workaround
+
+- The `compare` label is the highest-value decomposition target — a single retrieval pass on a comparison query is the most likely to miss one side's context. Decomposing just this label captures most of the quality uplift with the least risk.
+- The decomposer has an existing fallback (heuristic split on `vs`/`versus`/`and` etc., and passthrough on no-connector), so a bad LLM split degrades to a deterministic split rather than failing.
+- Latency is one extra local Ollama round-trip (~1-3s on M1) per `compare` query — acceptable for a single-user local app, and `compare` queries are a minority of traffic.
+- The merged candidate pool is deduped by doc id (max RRF score kept) and sorted by score, so duplicate retrievals across sub-queries don't inflate the context.
+
+### Future action item
+
+1. **Scrub the rewritten query** (PII + injection scan) before it reaches the decomposer — same surface as item 4/5.
+2. **Audit-log** `{original_query, rewritten_query, sub_queries, history_hash}` to the trace/metrics for forensics.
+3. Add a **decompose-quality eval**: retrieval recall@5 + answer faithfulness/relevancy with vs. without decomposition on a labeled comparison dataset (extend `eval/golden-dataset.json` with `compare`-labeled questions).
+4. Add a **latency SLO** (e.g. p95 < 2s for the decompose round-trip) and a budget cap (skip the LLM split when the heuristic already produced ≥2 sub-queries — cheap, deterministic).
+5. **Generalize multi-part detection** beyond `compare` — a compound-question detector (LLM or syntactic) that splits non-comparison multi-part queries ("How do I do X and configure Y?") into sub-queries too.
+6. **Guard the sub-queries** through the input guardrail regex tier (currently the split happens after the guardrail, so a malicious sub-query could bypass the regex scan — same as item 4.5 for the rewriter).
+
+---
+
+## 10. Query clarifier as an injection/quality surface (`ambiguous`-label clarification)
+
+**Files:** `rag/query_clarifier.py` (`LLMQueryClarifier`, `CLARIFY_PROMPT_TEMPLATE`), `rag/orchestrator.py` (`stream_answer` / `answer` ambiguous short-circuit), `api/guardrails.py` (`CLASS_AMBIGUOUS`, `classify_keywords` ambiguity heuristic)
+
+### Enterprise-standard practice
+
+Ambiguity detection + clarification is a known conversational-AI quality lever, but an enterprise would:
+
+- **Sanitize the query** before it reaches the clarifier (the clarifier runs on the original user query, which is attacker-influenced).
+- **Audit-log** `{original_query, clarification_prompt}` for incident forensics and quality regression triage.
+- **Eval clarification quality** — does the clarification prompt actually help the user disambiguate? Does the classifier over-flag ambiguous (false positives → annoying clarification prompts on clear questions) or under-flag (false negatives → vague answers)? Precision/recall on a labeled ambiguous-vs-clear dataset.
+- **Gate the clarification** with a budget cap / latency SLO (the LLM path adds one Ollama round-trip per `ambiguous` query; the heuristic fallback is free).
+- **Use a purpose-trained model** for ambiguity detection rather than a 3B general-purpose chat model (same gap as item 1).
+- **Multi-turn clarification state** — track that a clarification was issued and route the user's follow-up answer back through the RAG flow with the disambiguated intent, rather than treating the follow-up as a fresh query.
+
+### Workaround shipped
+
+`LLMQueryClarifier` is wired into `get_orchestrator()` and runs on every `ambiguous`-labeled query. No query sanitization, no audit log of the clarification, no clarification-quality eval, no latency SLO, no multi-turn clarification state (the clarification is a one-shot short-circuit; the user's next message is treated as a fresh query). The classifier's keyword fallback (`classify_keywords`) uses a conservative heuristic (short queries with bare pronoun/shared-concept markers and no library qualifier). A heuristic fallback (`_heuristic_clarify`) means clarification still works without Ollama, and the passthrough clarifier is the default when none is configured. When both LLM and heuristic find no candidates, a `GENERIC_CLARIFICATION` prompt is used.
+
+### Reasoning for the workaround
+
+- Ambiguous queries that proceed to the RAG flow produce vague or wrong answers — the single most user-visible quality win is to ask for clarification instead.
+- The clarifier has an existing fallback (heuristic shared-concept detection, and `GENERIC_CLARIFICATION` when no concept is found), so a bad LLM clarification degrades to a generic prompt rather than failing.
+- Latency is one extra local Ollama round-trip (~1-3s on M1) per `ambiguous` query — acceptable for a single-user local app, and `ambiguous` queries are a minority of traffic.
+- The clarifier runs on the **original** query (before rewriting) since the user's actual words are what need disambiguation — this avoids the rewriter masking the ambiguity.
+
+### Future action item
+
+1. **Scrub the original query** (PII + injection scan) before it reaches the clarifier — same surface as item 4/5/9.
+2. **Audit-log** `{original_query, clarification_prompt, history_hash}` to the trace/metrics for forensics.
+3. Add a **clarification-quality eval**: classifier precision/recall on a labeled ambiguous-vs-clear dataset (extend `eval/guardrail-dataset.json` with `ambiguous`-labeled examples); clarification prompt helpfulness scored by an LLM judge or human review.
+4. Add a **latency SLO** (e.g. p95 < 2s for the clarify round-trip) and a budget cap (skip the LLM clarify when the heuristic already produced a specific "Do you mean X or Y?" prompt — cheap, deterministic).
+5. **Multi-turn clarification state** — track that a clarification was issued (e.g. a `pending_clarification` flag on the session) and route the user's follow-up answer back through the RAG flow with the disambiguated intent, rather than treating it as a fresh query.
+6. **Swap the clarifier model** to a purpose-trained model (same as item 1) — a 3B general-purpose chat model is not an enterprise-grade ambiguity detector.
+
+---
+
 ## Summary table
 
-| #   | Gap                                   | Workaround                                                     | Severity | Blocks production?                                                 |
-| --- | ------------------------------------- | -------------------------------------------------------------- | -------- | ------------------------------------------------------------------ |
-| 1   | 3B judge model                        | `llama3.2:3b` dev substitute                                   | High     | Yes (for F500)                                                     |
-| 2   | No eval gate / SLO                    | Mocked unit tests only                                         | High     | Yes (for F500)                                                     |
-| 3   | History synthesis hallucination risk  | Soft "don't invent" instruction                                | Medium   | Yes (for F500)                                                     |
-| 4   | Rewriter as injection surface         | No sanitization/audit/eval                                     | Medium   | Yes (for F500)                                                     |
-| 5   | PII/injection in judge history        | Raw history to local judge                                     | Medium   | Yes if hosted model                                                |
-| 6   | No guardrail metrics                  | Log + Langfuse span only                                       | Low      | No (observability gap)                                             |
-| 7   | No red-team suite                     | Functional tests only                                          | High     | Yes (for F500)                                                     |
-| 8   | NVIDIA NIM as optional cloud provider | Comparison-test-only, behind config flag                       | High     | Yes (for F500) — 10 gaps to close before production promotion      |
-| 11  | NIM default model catalog drift       | Hard-coded swap to `meta/llama-3.1-8b-instruct` after live 404 | Medium   | No (fallback masked it) — but blocks reliable NIM use until probed |
+| #   | Gap                                     | Workaround                                                     | Severity | Blocks production?                                                 |
+| --- | --------------------------------------- | -------------------------------------------------------------- | -------- | ------------------------------------------------------------------ |
+| 1   | 3B judge model                          | `llama3.2:3b` dev substitute                                   | High     | Yes (for F500)                                                     |
+| 2   | No eval gate / SLO                      | Mocked unit tests only                                         | High     | Yes (for F500)                                                     |
+| 3   | History synthesis hallucination risk    | Soft "don't invent" instruction                                | Medium   | Yes (for F500)                                                     |
+| 4   | Rewriter as injection surface           | No sanitization/audit/eval                                     | Medium   | Yes (for F500)                                                     |
+| 5   | PII/injection in judge history          | Raw history to local judge                                     | Medium   | Yes if hosted model                                                |
+| 6   | No guardrail metrics                    | Log + Langfuse span only                                       | Low      | No (observability gap)                                             |
+| 7   | No red-team suite                       | Functional tests only                                          | High     | Yes (for F500)                                                     |
+| 8   | NVIDIA NIM as optional cloud provider   | Comparison-test-only, behind config flag                       | High     | Yes (for F500) — 10 gaps to close before production promotion      |
+| 9   | Decomposer as injection/quality surface | `compare`-label-only decomposition, no eval/audit/SLO          | Medium   | Yes (for F500)                                                     |
+| 10  | Clarifier as injection/quality surface  | `ambiguous`-label short-circuit, no eval/audit/SLO/multi-turn  | Medium   | Yes (for F500)                                                     |
+| 11  | NIM default model catalog drift         | Hard-coded swap to `meta/llama-3.1-8b-instruct` after live 404 | Medium   | No (fallback masked it) — but blocks reliable NIM use until probed |
 
 **Current stage justification:** This is a local, $0-cost, single-user practice project (per README + architecture doc deviations D1/D2). The workarounds are acceptable for the practice/learning stage. Items 1, 2, 5, 7, and 8 become **blockers** the moment the app is deployed to a hosted/multi-user environment or the judge/generator moves to a hosted model.

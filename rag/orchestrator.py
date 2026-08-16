@@ -29,9 +29,15 @@ from typing import TYPE_CHECKING, Iterator, Union
 from rag.context_assembler import ContextAssembler
 from rag.generator import Generator
 from rag.post_processor import PostProcessor, PostProcessResult
+from rag.query_clarifier import GENERIC_CLARIFICATION, PassthroughQueryClarifier, QueryClarifier
+from rag.query_decomposer import PassthroughQueryDecomposer, QueryDecomposer
 from rag.query_rewriter import PassthroughQueryRewriter, QueryRewriter
 from rag.retriever import HybridRetriever
 from schemas.documents import RetrievedDoc
+
+# Runtime import is safe: api.guardrails imports nothing from rag (the
+# TYPE_CHECKING guard below is purely defensive for the heavier types).
+from api.guardrails import CLASS_AMBIGUOUS, CLASS_COMPARE
 
 if TYPE_CHECKING:
     # Avoid a runtime circular import: api.guardrails imports nothing from
@@ -80,6 +86,24 @@ class RAGOrchestrator:
        ``PostProcessResult.guardrail_replacement`` so the SSE layer can
        emit a ``guardrail_replacement`` event and the frontend can swap
        the visible message.
+
+    An optional ``query_decomposer`` splits a query the classifier labeled
+    ``compare`` into one sub-query per compared subject. Retrieval runs once
+    per sub-query and the results are merged + deduplicated (by doc id, max
+    score kept) so the generator sees balanced context for both sides of the
+    comparison. When the decomposer returns a single sub-query (the original
+    query — either because the query is not a comparison or the passthrough
+    decomposer is configured), the retrieval flow is identical to the
+    non-decomposed path.
+
+    An optional ``query_clarifier`` handles queries the classifier labeled
+    ``ambiguous``. Instead of running retrieval + generation (which would
+    likely produce a wrong or vague answer), the orchestrator asks the user
+    to clarify. The clarifier generates a specific clarification prompt
+    (ideally listing candidate interpretations); when it returns ``None``
+    (passthrough clarifier, or the LLM/heuristic found no candidates), a
+    generic clarification prompt is used so the user is always asked to
+    disambiguate. No retrieval, no generation.
     """
 
     def __init__(
@@ -92,6 +116,8 @@ class RAGOrchestrator:
         guardrail_suite: "GuardrailSuite | None" = None,
         tracer: "LangfuseTracer | None" = None,
         reranker: "NIMReranker | None" = None,
+        query_decomposer: QueryDecomposer | None = None,
+        query_clarifier: QueryClarifier | None = None,
     ) -> None:
         self.retriever = retriever
         self.context_assembler = context_assembler
@@ -101,6 +127,8 @@ class RAGOrchestrator:
         self.guardrail_suite = guardrail_suite
         self.tracer = tracer
         self.reranker = reranker
+        self.query_decomposer = query_decomposer or PassthroughQueryDecomposer()
+        self.query_clarifier = query_clarifier or PassthroughQueryClarifier()
 
     def stream_answer(
         self,
@@ -150,6 +178,18 @@ class RAGOrchestrator:
                     logger.info("Orchestrator: query classified as %s — short-circuit", classification.label)
                     yield from self._refusal_stream(classification.answer)
                     return
+                classify_label = classification.label
+            else:
+                classify_label = ""
+
+            # ── Ambiguous query → clarification prompt (no retrieval/generation) ──
+            if classify_label == CLASS_AMBIGUOUS:
+                clarification = self.query_clarifier.clarify(query, history)
+                if not clarification:
+                    clarification = GENERIC_CLARIFICATION
+                logger.info("Orchestrator: ambiguous query — clarification prompt")
+                yield from self._refusal_stream(clarification)
+                return
 
             rewritten = self.query_rewriter.rewrite(query, history)
             logger.debug("Orchestrator: query=%r → rewritten=%r", query, rewritten)
@@ -159,7 +199,7 @@ class RAGOrchestrator:
                 self.tracer.start_span(trace, "retrieval", metadata={"rewritten": rewritten})
                 if trace is not None else None
             )
-            docs = self.retriever.retrieve(rewritten)
+            docs = self._retrieve(rewritten, classify_label)
             if ret_span is not None:
                 self.tracer.end_span(ret_span, metadata={"num_docs": len(docs)})
 
@@ -237,6 +277,50 @@ class RAGOrchestrator:
         yield answer
         yield PostProcessResult(answer=answer)
 
+    # ── retrieval (single + multi-query) ─────────────────────────────────
+
+    def _retrieve(self, rewritten: str, classify_label: str) -> list[RetrievedDoc]:
+        """Run retrieval, decomposing into sub-queries for ``compare`` queries.
+
+        When a query decomposer is configured AND the classifier labeled the
+        query ``compare``, the rewritten query is split into sub-queries and
+        retrieval runs once per sub-query. The per-sub-query result lists are
+        merged and deduplicated (by doc id, max score kept) so the generator
+        sees balanced context for both sides of a comparison. For all other
+        labels (or when decomposition yields a single sub-query), a single
+        retrieval pass runs — identical to the non-decomposed path.
+        """
+        if classify_label != CLASS_COMPARE:
+            return self.retriever.retrieve(rewritten)
+        sub_queries = self.query_decomposer.decompose(rewritten)
+        if len(sub_queries) <= 1:
+            return self.retriever.retrieve(rewritten)
+        logger.info(
+            "Orchestrator: compare query decomposed into %d sub-queries", len(sub_queries),
+        )
+        merged: list[RetrievedDoc] = []
+        for sq in sub_queries:
+            merged = self._merge_docs(merged, self.retriever.retrieve(sq))
+        return merged
+
+    @staticmethod
+    def _merge_docs(
+        acc: list[RetrievedDoc],
+        new: list[RetrievedDoc],
+    ) -> list[RetrievedDoc]:
+        """Merge two retrieved-doc lists, deduplicating by doc id.
+
+        When a doc appears in both lists, the higher RRF score is kept. The
+        merged list is sorted by score (descending) so the most relevant
+        chunks surface first to the context assembler / reranker.
+        """
+        by_id: dict[str, RetrievedDoc] = {}
+        for doc in (*acc, *new):
+            existing = by_id.get(doc.id)
+            if existing is None or doc.score > existing.score:
+                by_id[doc.id] = doc
+        return sorted(by_id.values(), key=lambda d: d.score, reverse=True)
+
     # ── convenience: non-streaming single-shot ─────────────────────────
 
     def answer(
@@ -279,6 +363,16 @@ class RAGOrchestrator:
                     )
                 if classification.handled:
                     return classification.answer, PostProcessResult(answer=classification.answer), []
+                classify_label = classification.label
+            else:
+                classify_label = ""
+
+            # ── Ambiguous query → clarification prompt (no retrieval/generation) ──
+            if classify_label == CLASS_AMBIGUOUS:
+                clarification = self.query_clarifier.clarify(query, history)
+                if not clarification:
+                    clarification = GENERIC_CLARIFICATION
+                return clarification, PostProcessResult(answer=clarification), []
 
             rewritten = self.query_rewriter.rewrite(query, history)
 
@@ -286,7 +380,7 @@ class RAGOrchestrator:
                 self.tracer.start_span(trace, "retrieval", metadata={"rewritten": rewritten})
                 if trace is not None else None
             )
-            docs = self.retriever.retrieve(rewritten)
+            docs = self._retrieve(rewritten, classify_label)
             if ret_span is not None:
                 self.tracer.end_span(ret_span, metadata={"num_docs": len(docs)})
 

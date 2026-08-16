@@ -532,3 +532,346 @@ class TestOrchestratorTracerAnswer:
         span_names = [c.args[1] for c in tracer.start_span.call_args_list]
         assert "retrieval" in span_names
         assert "generation" in span_names
+
+
+# ── Query decomposition (compare → multi-query retrieval) ──────────────
+
+
+def _make_doc_id(doc_id, title="Doc", content="content", score=0.9):
+    return RetrievedDoc(
+        id=doc_id,
+        content=content,
+        title=title,
+        source_url=f"https://example.com/{doc_id}",
+        section=None,
+        score=score,
+    )
+
+
+class TestOrchestratorDecomposition:
+    """Verify the orchestrator decomposes ``compare`` queries into
+    sub-queries and merges the per-sub-query retrieval results."""
+
+    def _build(self, *, suite=None, decomposer=None, reranker=None, docs_per_sq=None):
+        """Build an orchestrator whose retriever returns a different doc list
+        per sub-query (via ``docs_per_sq`` side_effect) so merge behavior is
+        observable."""
+        retriever = MagicMock()
+        if docs_per_sq is not None:
+            retriever.retrieve.side_effect = docs_per_sq
+        else:
+            retriever.retrieve.return_value = [_make_doc_id("d1")]
+        assembler = MagicMock()
+        assembler.assemble.return_value = "ctx"
+        generator = MagicMock()
+        generator.stream.return_value = iter(["answer"])
+        pp = MagicMock()
+        pp.post_process.side_effect = lambda answer, retrieved_docs: PostProcessResult(
+            answer=answer, confidence=0.9,
+        )
+        return RAGOrchestrator(
+            retriever, assembler, generator, pp,
+            guardrail_suite=suite, query_decomposer=decomposer, reranker=reranker,
+        ), retriever
+
+    def test_compare_decomposes_into_multiple_retrievals(self):
+        suite = _mock_guardrail_suite(classification_label="compare")
+        decomposer = MagicMock()
+        decomposer.decompose.return_value = ["FastAPI routing", "Flask routing"]
+        orch, retriever = self._build(
+            suite=suite, decomposer=decomposer,
+            docs_per_sq=[[_make_doc_id("a")], [_make_doc_id("b")]],
+        )
+        list(orch.stream_answer("compare FastAPI and Flask"))
+        assert retriever.retrieve.call_count == 2
+        retriever.retrieve.assert_any_call("FastAPI routing")
+        retriever.retrieve.assert_any_call("Flask routing")
+
+    def test_compare_single_sub_query_single_retrieval(self):
+        """Decomposer returns one sub-query → single retrieval pass."""
+        suite = _mock_guardrail_suite(classification_label="compare")
+        decomposer = MagicMock()
+        decomposer.decompose.return_value = ["compare FastAPI and Flask"]
+        orch, retriever = self._build(suite=suite, decomposer=decomposer)
+        list(orch.stream_answer("compare FastAPI and Flask"))
+        retriever.retrieve.assert_called_once_with("compare FastAPI and Flask")
+
+    def test_documentation_label_skips_decomposition(self):
+        """Non-compare labels never invoke the decomposer."""
+        suite = _mock_guardrail_suite(classification_label="documentation")
+        decomposer = MagicMock()
+        orch, retriever = self._build(suite=suite, decomposer=decomposer)
+        list(orch.stream_answer("How do I use FastAPI?"))
+        retriever.retrieve.assert_called_once()
+        decomposer.decompose.assert_not_called()
+
+    def test_no_guardrail_suite_skips_decomposition(self):
+        """Without a guardrail suite there is no classify label, so the
+        decomposer is never invoked (single retrieval)."""
+        decomposer = MagicMock()
+        orch, retriever = self._build(decomposer=decomposer)
+        list(orch.stream_answer("compare FastAPI and Flask"))
+        retriever.retrieve.assert_called_once()
+        decomposer.decompose.assert_not_called()
+
+    def test_merged_docs_deduped_by_id(self):
+        """A doc retrieved by both sub-queries appears once in the merged
+        list (dedup by id, max score kept)."""
+        suite = _mock_guardrail_suite(classification_label="compare")
+        decomposer = MagicMock()
+        decomposer.decompose.return_value = ["sq1", "sq2"]
+        shared_low = _make_doc_id("shared", score=0.5)
+        shared_high = _make_doc_id("shared", score=0.9)
+        orch, retriever = self._build(
+            suite=suite, decomposer=decomposer,
+            docs_per_sq=[[shared_low, _make_doc_id("a", score=0.8)],
+                         [shared_high, _make_doc_id("b", score=0.7)]],
+        )
+        list(orch.stream_answer("compare A and B"))
+        # Post-processor receives the merged + deduped doc list.
+        merged = orch.post_processor.post_process.call_args[0][1]
+        ids = [d.id for d in merged]
+        assert ids.count("shared") == 1
+        assert set(ids) == {"shared", "a", "b"}
+        # The higher score for the shared doc is kept.
+        shared = next(d for d in merged if d.id == "shared")
+        assert shared.score == 0.9
+
+    def test_merged_docs_sorted_by_score_desc(self):
+        suite = _mock_guardrail_suite(classification_label="compare")
+        decomposer = MagicMock()
+        decomposer.decompose.return_value = ["sq1", "sq2"]
+        orch, retriever = self._build(
+            suite=suite, decomposer=decomposer,
+            docs_per_sq=[[_make_doc_id("low", score=0.3)],
+                         [_make_doc_id("high", score=0.95)]],
+        )
+        list(orch.stream_answer("compare A and B"))
+        merged = orch.post_processor.post_process.call_args[0][1]
+        scores = [d.score for d in merged]
+        assert scores == sorted(scores, reverse=True)
+        assert merged[0].id == "high"
+
+    def test_reranker_receives_merged_docs(self):
+        """When both a reranker and a decomposer are configured, the
+        reranker reranks the merged candidate pool (not a single sub-
+        query's docs)."""
+        suite = _mock_guardrail_suite(classification_label="compare")
+        decomposer = MagicMock()
+        decomposer.decompose.return_value = ["sq1", "sq2"]
+        reranker = MagicMock()
+        reranker.rerank.side_effect = lambda query, docs: docs  # passthrough
+        orch, retriever = self._build(
+            suite=suite, decomposer=decomposer, reranker=reranker,
+            docs_per_sq=[[_make_doc_id("a")], [_make_doc_id("b")]],
+        )
+        list(orch.stream_answer("compare A and B"))
+        reranker.rerank.assert_called_once()
+        reranked_docs = reranker.rerank.call_args[0][1]
+        assert {d.id for d in reranked_docs} == {"a", "b"}
+
+    def test_answer_method_decomposes_compare(self):
+        """The non-streaming ``answer`` method also decomposes compare
+        queries."""
+        suite = _mock_guardrail_suite(classification_label="compare")
+        decomposer = MagicMock()
+        decomposer.decompose.return_value = ["sq1", "sq2"]
+        orch, retriever = self._build(
+            suite=suite, decomposer=decomposer,
+            docs_per_sq=[[_make_doc_id("a")], [_make_doc_id("b")]],
+        )
+        answer, result, docs = orch.answer("compare A and B")
+        assert retriever.retrieve.call_count == 2
+        assert {d.id for d in docs} == {"a", "b"}
+
+    def test_compare_decompose_uses_rewritten_query(self):
+        """Decomposition runs on the rewritten query, not the original."""
+        suite = _mock_guardrail_suite(classification_label="compare")
+        decomposer = MagicMock()
+        decomposer.decompose.return_value = ["sq1"]
+        rewriter = MagicMock()
+        rewriter.rewrite.return_value = "rewritten comparison query"
+        retriever = MagicMock()
+        retriever.retrieve.return_value = [_make_doc_id("d1")]
+        assembler = MagicMock()
+        assembler.assemble.return_value = "ctx"
+        generator = MagicMock()
+        generator.stream.return_value = iter(["tok"])
+        pp = MagicMock()
+        pp.post_process.side_effect = lambda a, d: PostProcessResult(answer=a, confidence=0.9)
+        orch = RAGOrchestrator(
+            retriever, assembler, generator, pp,
+            query_rewriter=rewriter, guardrail_suite=suite, query_decomposer=decomposer,
+        )
+        list(orch.stream_answer("compare A and B"))
+        decomposer.decompose.assert_called_once_with("rewritten comparison query")
+
+
+# ── Ambiguous query → clarification prompt ─────────────────────────────
+
+
+class TestOrchestratorAmbiguity:
+    """Verify the orchestrator short-circuits ``ambiguous`` queries with a
+    clarification prompt (no retrieval, no generation)."""
+
+    def _build(self, *, suite=None, clarifier=None):
+        retriever = MagicMock()
+        retriever.retrieve.return_value = [_make_doc_id("a")]
+        assembler = MagicMock()
+        assembler.assemble.return_value = "ctx"
+        generator = MagicMock()
+        generator.stream.return_value = iter(["tok"])
+        pp = MagicMock()
+        pp.post_process.side_effect = lambda answer, docs: PostProcessResult(
+            answer=answer, confidence=0.9,
+        )
+        return RAGOrchestrator(
+            retriever, assembler, generator, pp,
+            guardrail_suite=suite, query_clarifier=clarifier,
+        ), retriever
+
+    def test_ambiguous_short_circuits_with_clarifier_prompt(self):
+        suite = _mock_guardrail_suite(classification_label="ambiguous")
+        clarifier = MagicMock()
+        clarifier.clarify.return_value = "Do you mean Pydantic validators or FastAPI dependency validators?"
+        orch, retriever = self._build(suite=suite, clarifier=clarifier)
+        items = list(orch.stream_answer("how do I use validators?"))
+        tokens = [i for i in items if isinstance(i, str)]
+        assert tokens == ["Do you mean Pydantic validators or FastAPI dependency validators?"]
+        # No retrieval, no generation.
+        retriever.retrieve.assert_not_called()
+        orch.generator.stream.assert_not_called()
+
+    def test_ambiguous_clarifier_returns_none_uses_generic(self):
+        from rag.query_clarifier import GENERIC_CLARIFICATION
+
+        suite = _mock_guardrail_suite(classification_label="ambiguous")
+        clarifier = MagicMock()
+        clarifier.clarify.return_value = None
+        orch, retriever = self._build(suite=suite, clarifier=clarifier)
+        items = list(orch.stream_answer("how do I configure it?"))
+        tokens = [i for i in items if isinstance(i, str)]
+        assert tokens == [GENERIC_CLARIFICATION]
+        retriever.retrieve.assert_not_called()
+
+    def test_ambiguous_passthrough_clarifier_uses_generic(self):
+        from rag.query_clarifier import GENERIC_CLARIFICATION, PassthroughQueryClarifier
+
+        suite = _mock_guardrail_suite(classification_label="ambiguous")
+        orch, retriever = self._build(suite=suite, clarifier=PassthroughQueryClarifier())
+        items = list(orch.stream_answer("how do I configure it?"))
+        tokens = [i for i in items if isinstance(i, str)]
+        assert tokens == [GENERIC_CLARIFICATION]
+        retriever.retrieve.assert_not_called()
+
+    def test_ambiguous_does_not_call_rewriter(self):
+        """The clarifier runs on the original query, not the rewritten one,
+        so the rewriter is never invoked for ambiguous queries."""
+        suite = _mock_guardrail_suite(classification_label="ambiguous")
+        clarifier = MagicMock()
+        clarifier.clarify.return_value = "Do you mean X or Y?"
+        rewriter = MagicMock()
+        retriever = MagicMock()
+        assembler = MagicMock()
+        generator = MagicMock()
+        pp = MagicMock()
+        pp.post_process.side_effect = lambda a, d: PostProcessResult(answer=a)
+        orch = RAGOrchestrator(
+            retriever, assembler, generator, pp,
+            query_rewriter=rewriter, guardrail_suite=suite, query_clarifier=clarifier,
+        )
+        list(orch.stream_answer("how do I use validators?"))
+        rewriter.rewrite.assert_not_called()
+
+    def test_ambiguous_clarifier_called_with_query_and_history(self):
+        suite = _mock_guardrail_suite(classification_label="ambiguous")
+        clarifier = MagicMock()
+        clarifier.clarify.return_value = "Do you mean X or Y?"
+        orch, _ = self._build(suite=suite, clarifier=clarifier)
+        list(orch.stream_answer("how do I use it?", "prior Q&A"))
+        clarifier.clarify.assert_called_once_with("how do I use it?", "prior Q&A")
+
+    def test_documentation_label_does_not_invoke_clarifier(self):
+        """Non-ambiguous labels never invoke the clarifier."""
+        suite = _mock_guardrail_suite(classification_label="documentation")
+        clarifier = MagicMock()
+        orch, retriever = self._build(suite=suite, clarifier=clarifier)
+        list(orch.stream_answer("How do I use FastAPI?"))
+        clarifier.clarify.assert_not_called()
+        retriever.retrieve.assert_called_once()
+
+    def test_no_guardrail_suite_skips_clarifier(self):
+        """Without a guardrail suite there is no classify label, so the
+        clarifier is never invoked (normal RAG flow)."""
+        clarifier = MagicMock()
+        orch, retriever = self._build(clarifier=clarifier)
+        list(orch.stream_answer("how do I use it?"))
+        clarifier.clarify.assert_not_called()
+        retriever.retrieve.assert_called_once()
+
+    def test_answer_method_ambiguous_short_circuits(self):
+        """The non-streaming ``answer`` method also short-circuits ambiguous
+        queries with a clarification prompt."""
+        suite = _mock_guardrail_suite(classification_label="ambiguous")
+        clarifier = MagicMock()
+        clarifier.clarify.return_value = "Do you mean X or Y?"
+        orch, retriever = self._build(suite=suite, clarifier=clarifier)
+        answer, result, docs = orch.answer("how do I use validators?")
+        assert answer == "Do you mean X or Y?"
+        assert docs == []
+        retriever.retrieve.assert_not_called()
+
+    def test_answer_method_ambiguous_generic_fallback(self):
+        from rag.query_clarifier import GENERIC_CLARIFICATION
+
+        suite = _mock_guardrail_suite(classification_label="ambiguous")
+        clarifier = MagicMock()
+        clarifier.clarify.return_value = None
+        orch, _ = self._build(suite=suite, clarifier=clarifier)
+        answer, result, docs = orch.answer("how do I configure it?")
+        assert answer == GENERIC_CLARIFICATION
+        assert docs == []
+
+
+class TestMergeDocs:
+    """Unit tests for the static ``_merge_docs`` helper."""
+
+    def test_empty_both(self):
+        assert RAGOrchestrator._merge_docs([], []) == []
+
+    def test_empty_acc(self):
+        docs = [_make_doc_id("a", score=0.5)]
+        assert RAGOrchestrator._merge_docs([], docs) == docs
+
+    def test_empty_new(self):
+        docs = [_make_doc_id("a", score=0.5)]
+        assert RAGOrchestrator._merge_docs(docs, []) == docs
+
+    def test_dedup_keeps_max_score(self):
+        low = _make_doc_id("x", score=0.3)
+        high = _make_doc_id("x", score=0.9)
+        merged = RAGOrchestrator._merge_docs([low], [high])
+        assert len(merged) == 1
+        assert merged[0].score == 0.9
+
+    def test_dedup_keeps_max_score_reverse_order(self):
+        low = _make_doc_id("x", score=0.3)
+        high = _make_doc_id("x", score=0.9)
+        merged = RAGOrchestrator._merge_docs([high], [low])
+        assert len(merged) == 1
+        assert merged[0].score == 0.9
+
+    def test_sorted_by_score_desc(self):
+        merged = RAGOrchestrator._merge_docs(
+            [_make_doc_id("a", score=0.4), _make_doc_id("b", score=0.8)],
+            [_make_doc_id("c", score=0.6)],
+        )
+        scores = [d.score for d in merged]
+        assert scores == [0.8, 0.6, 0.4]
+
+    def test_distinct_ids_all_kept(self):
+        merged = RAGOrchestrator._merge_docs(
+            [_make_doc_id("a")], [_make_doc_id("b")],
+        )
+        assert {d.id for d in merged} == {"a", "b"}
+

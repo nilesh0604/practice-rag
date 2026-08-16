@@ -34,6 +34,7 @@ class TestMetricsEndpoint:
         assert "errors" in body
         assert "cache" in body
         assert "ttft" in body
+        assert "slo" in body
         assert "cache_store" in body
 
     def test_reflects_recorded_metrics(self):
@@ -65,3 +66,31 @@ class TestMetricsEndpoint:
         assert body["requests"] == 0
         assert body["ttft"]["count"] == 0
         assert body["cache"]["hit_rate"] == 0.0
+
+    def test_slo_block_no_data_when_no_ttft_samples(self):
+        client, _, _ = _make_client()
+        slo = client.get("/api/v1/metrics").json()["slo"]
+        assert slo["status"] == "no_data"
+        assert slo["met"] is None
+        assert slo["samples"] == 0
+        assert slo["target_s"] == 0.8
+        assert slo["percentile"] == 95.0
+
+    def test_slo_block_met_when_ttft_under_target(self):
+        client, mc, _ = _make_client(metrics=MetricsCollector())
+        for v in (0.1, 0.2, 0.3, 0.4, 0.5):
+            mc.record_ttft(v)
+        slo = client.get("/api/v1/metrics").json()["slo"]
+        assert slo["status"] == "met"
+        assert slo["met"] is True
+        assert slo["samples"] == 5
+        assert slo["value_s"] < 0.8
+
+    def test_slo_block_breached_when_ttft_above_target(self):
+        client, mc, _ = _make_client(metrics=MetricsCollector())
+        for v in (0.7, 0.8, 0.9, 1.0, 1.1):
+            mc.record_ttft(v)
+        slo = client.get("/api/v1/metrics").json()["slo"]
+        assert slo["status"] == "breached"
+        assert slo["met"] is False
+        assert slo["value_s"] >= 0.8

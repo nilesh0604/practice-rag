@@ -16,8 +16,12 @@ structlog" mitigation. The lazy-client pattern (like ``Generator`` /
 online serving metrics: TTFT (time-to-first-token) samples, request count,
 cache hits/misses, and error count. ``snapshot()`` returns a dict with mean
 / p50 / p95 TTFT and the cache hit rate — surfaced via ``GET /api/v1/metrics``.
-The offline metrics (retrieval recall@5, faithfulness, answer relevancy)
-come from the Step 6 eval gate; this collector covers the *online* half.
+``evaluate_ttft_slo()`` is the **threshold gate** that asserts the doc's
+"TTFT < 800ms" SLO against the p95 of the retained sample window (status:
+``met`` / ``breached`` / ``no_data``); the result is included in the
+snapshot under the ``slo`` key. The offline metrics (retrieval recall@5,
+faithfulness, answer relevancy) come from the Step 6 eval gate; this
+collector covers the *online* half.
 
 **41. Resilience** — ``CircuitBreaker`` is the in-process breaker from the
 doc's "Circuit Breaker (Optional)" snippet, wrapped around Ollama calls so
@@ -50,6 +54,12 @@ DEFAULT_LANGFUSE_BASE_URL: str = "https://us.cloud.langfuse.com"
 
 MAX_TTFT_SAMPLES: int = 200
 """Cap on retained TTFT samples for percentile computation (memory-bounded)."""
+
+TTFT_SLO_TARGET_S: float = 0.8
+"""TTFT SLO target in seconds (the doc's "TTFT < 800ms" online-serving SLO)."""
+
+TTFT_SLO_PERCENTILE: float = 95.0
+"""Percentile the TTFT SLO is evaluated against (p95 over the sample window)."""
 
 
 # ════════════════════════════════════════════════════════════════════════
@@ -216,6 +226,33 @@ class MetricsCollector:
         with self._lock:
             self._state.ttft_samples.append(seconds)
 
+    def evaluate_ttft_slo(
+        self,
+        target_s: float = TTFT_SLO_TARGET_S,
+        percentile: float = TTFT_SLO_PERCENTILE,
+    ) -> dict[str, Any]:
+        """Evaluate the TTFT SLO gate against the retained sample window.
+
+        Computes the configured percentile of the TTFT samples and compares
+        it to ``target_s``. Returns a JSON-serialisable dict:
+
+        - ``target_s`` — the SLO threshold (seconds).
+        - ``percentile`` — the percentile used (e.g. 95 for p95).
+        - ``value_s`` — the computed percentile TTFT (0.0 when no samples).
+        - ``status`` — ``"met"`` (value < target), ``"breached"`` (value >=
+          target), or ``"no_data"`` (no samples recorded yet).
+        - ``met`` — ``True`` / ``False`` / ``None`` (``None`` for ``no_data``).
+        - ``samples`` — number of TTFT samples in the window.
+
+        This is the threshold gate that turns the collected TTFT samples
+        into an asserted SLO (build-order item 40 / doc "TTFT < 800ms").
+        For a multi-process deployment the gate should be evaluated over a
+        Prometheus-style rolling window instead of the in-memory ring buffer.
+        """
+        with self._lock:
+            samples = list(self._state.ttft_samples)
+        return _ttft_slo(samples, target_s, percentile)
+
     def snapshot(self) -> dict[str, Any]:
         """Return a point-in-time metrics snapshot as a JSON-serialisable dict."""
         with self._lock:
@@ -239,6 +276,7 @@ class MetricsCollector:
                     "min_s": min(samples) if samples else 0.0,
                     "max_s": max(samples) if samples else 0.0,
                 },
+                "slo": _ttft_slo(samples, TTFT_SLO_TARGET_S, TTFT_SLO_PERCENTILE),
             }
 
     def reset(self) -> None:
@@ -259,6 +297,39 @@ def _percentile(samples: list[float], pct: float) -> float:
     hi = min(lo + 1, len(ordered) - 1)
     frac = k - lo
     return ordered[lo] + (ordered[hi] - ordered[lo]) * frac
+
+
+def _ttft_slo(
+    samples: list[float],
+    target_s: float,
+    percentile: float,
+) -> dict[str, Any]:
+    """Compute the TTFT SLO gate result from a sample list (lock-free).
+
+    Returns ``status="no_data"`` (``met=None``) when there are no samples,
+    ``"met"`` when the percentile TTFT is below ``target_s``, else
+    ``"breached"``. Pure function so ``snapshot()`` can call it while
+    already holding the collector lock.
+    """
+    if not samples:
+        return {
+            "target_s": target_s,
+            "percentile": percentile,
+            "value_s": 0.0,
+            "status": "no_data",
+            "met": None,
+            "samples": 0,
+        }
+    value = _percentile(samples, percentile)
+    met = value < target_s
+    return {
+        "target_s": target_s,
+        "percentile": percentile,
+        "value_s": value,
+        "status": "met" if met else "breached",
+        "met": met,
+        "samples": len(samples),
+    }
 
 
 # ════════════════════════════════════════════════════════════════════════
