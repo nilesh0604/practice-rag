@@ -16,7 +16,9 @@ import { streamChat, sendFeedback } from "./api.js";
  *
  * The SSE consumer (api.js streamChat) calls onToken for each delta,
  * onSources with the parsed citations, onMetadata with the session id +
- * confidence + trace id, and onDone when the terminal event is received.
+ * confidence + trace id, onGuardrailReplacement when the output guardrail
+ * blocks the streamed answer (swapping the visible message for the
+ * refusal), and onDone when the terminal event is received.
  *
  * Per the architecture doc:
  *   App → ChatWidget → MessageList + InputBox + ErrorBoundary
@@ -79,6 +81,16 @@ export default function ChatWidget() {
                 m.id === assistantMsg.id
                   ? { ...m, confidence: meta.confidence ?? null }
                   : m,
+              ),
+            );
+          },
+          onGuardrailReplacement: ({ answer }) => {
+            // The output guardrail blocked the already-streamed tokens.
+            // SSE is one-way, so swap the visible message content for the
+            // refusal instead of appending to it.
+            setMessages((prev) =>
+              prev.map((m) =>
+                m.id === assistantMsg.id ? { ...m, content: answer } : m,
               ),
             );
           },

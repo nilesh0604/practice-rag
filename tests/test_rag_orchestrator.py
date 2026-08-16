@@ -309,6 +309,25 @@ class TestOrchestratorGuardrailsStream:
         pp_arg = orch.post_processor.post_process.call_args[0][0]
         assert "can't provide" in pp_arg
 
+    def test_output_blocked_sets_guardrail_replacement(self):
+        """On output block the result carries ``guardrail_replacement`` so
+        the SSE layer can emit a swap event for the already-streamed
+        tokens (SSE is one-way)."""
+        suite = _mock_guardrail_suite(output_blocked=True, output_reason="harmful")
+        orch = self._build_with_guardrails(suite, tokens=["harmful", " text"])
+        items = list(orch.stream_answer("q"))
+        result = [i for i in items if isinstance(i, PostProcessResult)][0]
+        assert result.guardrail_replacement is not None
+        assert "can't provide" in result.guardrail_replacement
+
+    def test_output_allowed_has_no_guardrail_replacement(self):
+        """No output block → ``guardrail_replacement`` stays ``None``."""
+        suite = _mock_guardrail_suite(output_blocked=False)
+        orch = self._build_with_guardrails(suite, tokens=["ok", " answer"])
+        items = list(orch.stream_answer("q"))
+        result = [i for i in items if isinstance(i, PostProcessResult)][0]
+        assert result.guardrail_replacement is None
+
     def test_output_scrub_applies_pii_redaction(self):
         scrubbed = "Email me at [REDACTED-EMAIL]"
         suite = _mock_guardrail_suite(output_scrubbed=scrubbed)
@@ -376,6 +395,13 @@ class TestOrchestratorGuardrailsAnswer:
         orch = self._build_with_guardrails(suite, tokens=["bad", " answer"])
         answer, result, docs = orch.answer("q")
         assert "can't provide" in answer
+
+    def test_output_blocked_sets_guardrail_replacement(self):
+        suite = _mock_guardrail_suite(output_blocked=True)
+        orch = self._build_with_guardrails(suite, tokens=["bad", " answer"])
+        _answer, result, _docs = orch.answer("q")
+        assert result.guardrail_replacement is not None
+        assert "can't provide" in result.guardrail_replacement
 
     def test_output_scrub_applies(self):
         suite = _mock_guardrail_suite(output_scrubbed="scrubbed answer")

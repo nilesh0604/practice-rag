@@ -21,11 +21,25 @@ const { streamChat, sendFeedback } = require("../src/api.js");
  * Callbacks are invoked synchronously (no act() wrapping) — React 18
  * automatic batching + RTL waitFor handle the re-renders.
  */
-function mockStreamChatTokens({ tokens, result, sessionId = "sess_test" }) {
+function mockStreamChatTokens({
+  tokens,
+  result,
+  sessionId = "sess_test",
+  guardrailReplacement = null,
+}) {
   streamChat.mockImplementation(
-    async ({ onToken, onSources, onMetadata, onDone }) => {
+    async ({
+      onToken,
+      onSources,
+      onMetadata,
+      onGuardrailReplacement,
+      onDone,
+    }) => {
       for (const token of tokens) {
         onToken?.(token);
+      }
+      if (guardrailReplacement) {
+        onGuardrailReplacement?.({ answer: guardrailReplacement });
       }
       if (result !== undefined) {
         onSources?.({ citations: result?.citations ?? [] });
@@ -158,6 +172,28 @@ describe("ChatWidget", () => {
     await waitFor(() => {
       expect(screen.getByText("Network failed")).toBeInTheDocument();
     });
+  });
+
+  it("swaps streamed tokens for refusal on guardrail_replacement", async () => {
+    const refusal = "I can't provide that answer.";
+    mockStreamChatTokens({
+      tokens: ["harmful", " streamed", " text"],
+      guardrailReplacement: refusal,
+      result: { answer: refusal, citations: [], confidence: 0.0 },
+    });
+
+    render(<ChatWidget />);
+    fireEvent.change(screen.getByTestId("chat-input"), {
+      target: { value: "harmful q" },
+    });
+    fireEvent.click(screen.getByTestId("send-button"));
+
+    // The refusal replaces the streamed harmful text.
+    await waitFor(() => {
+      expect(screen.getByText(refusal)).toBeInTheDocument();
+    });
+    // The original streamed text must no longer be visible.
+    expect(screen.queryByText("harmful streamed text")).not.toBeInTheDocument();
   });
 
   it("sends feedback via sendFeedback on thumbs up click", async () => {

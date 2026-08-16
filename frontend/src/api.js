@@ -10,6 +10,7 @@
  * The SSE wire format produced by the backend uses named events:
  *
  *   event: delta\ndata: <token>\n\n             # one per generated token
+ *   event: guardrail_replacement\ndata: {json}\n\n  # only when output guardrail blocks
  *   event: sources\ndata: {"citations":[...]}\n\n  # exactly once, after the last token
  *   event: metadata\ndata: {json}\n\n           # exactly once, after sources
  *   event: done\ndata: [DONE]\n\n               # terminal sentinel
@@ -19,6 +20,12 @@
  * The `event: metadata` frame carries the session id, confidence score,
  * and trace id so the frontend can set the session, render the
  * low-confidence warning, and pass the trace id back with feedback.
+ *
+ * The optional `event: guardrail_replacement` frame is emitted only when
+ * the output guardrail blocks the already-streamed answer. SSE is one-way,
+ * so the streamed tokens cannot be un-sent; this frame carries the refusal
+ * text (`{ answer }`) and the frontend swaps the visible message content
+ * for it.
  */
 
 const API_BASE = "/api/v1";
@@ -33,8 +40,10 @@ const API_BASE = "/api/v1";
  * preserved.
  *
  * @param {string} frame - Raw SSE frame text (no trailing `\n\n`).
- * @param {object} callbacks - { onToken, onSources, onMetadata, onDone }.
- * @returns {'delta'|'sources'|'metadata'|'done'|null} frame kind, or null for empty.
+ * @param {object} callbacks - { onToken, onSources, onMetadata, onDone,
+ *   onGuardrailReplacement }.
+ * @returns {'delta'|'sources'|'metadata'|'done'|'guardrail_replacement'|null}
+ *   frame kind, or null for empty.
  */
 export function parseSseFrame(frame, callbacks = {}) {
   const lines = frame.split("\n");
@@ -57,6 +66,10 @@ export function parseSseFrame(frame, callbacks = {}) {
   if (eventType === "delta") {
     callbacks.onToken?.(data);
     return "delta";
+  }
+  if (eventType === "guardrail_replacement") {
+    callbacks.onGuardrailReplacement?.(JSON.parse(data));
+    return "guardrail_replacement";
   }
   if (eventType === "sources") {
     callbacks.onSources?.(JSON.parse(data));
@@ -87,6 +100,8 @@ export function parseSseFrame(frame, callbacks = {}) {
  * @param {function} [opts.onToken] - Called with each token string (delta events).
  * @param {function} [opts.onSources] - Called with { citations: [...] } (sources event).
  * @param {function} [opts.onMetadata] - Called with { session_id, confidence, trace_id } (metadata event).
+ * @param {function} [opts.onGuardrailReplacement] - Called with { answer } when the
+ *   output guardrail blocks the streamed answer (guardrail_replacement event).
  * @param {function} [opts.onDone] - Called when the done event is received.
  * @returns {Promise<void>} Resolves when the stream completes.
  * @throws {Error} On non-2xx response or network failure.
@@ -97,6 +112,7 @@ export async function streamChat({
   onToken,
   onSources,
   onMetadata,
+  onGuardrailReplacement,
   onDone,
 }) {
   const response = await fetch(`${API_BASE}/chat`, {
@@ -129,6 +145,7 @@ export async function streamChat({
         onToken,
         onSources,
         onMetadata,
+        onGuardrailReplacement,
         onDone,
       });
       if (kind === "done") done = true;
@@ -137,7 +154,13 @@ export async function streamChat({
 
   // Flush any trailing frame (shouldn't happen with [DONE], but be safe).
   if (!done && buffer.trim()) {
-    parseSseFrame(buffer, { onToken, onSources, onMetadata, onDone });
+    parseSseFrame(buffer, {
+      onToken,
+      onSources,
+      onMetadata,
+      onGuardrailReplacement,
+      onDone,
+    });
   }
 }
 

@@ -62,6 +62,13 @@ class PostProcessResult:
     """Langfuse trace id (Step 7). Set by the orchestrator when tracing is
     enabled so the chat route can surface it in the ``ChatResponse`` and the
     frontend can pass it back with feedback for score correlation."""
+    guardrail_replacement: str | None = None
+    """Set by the orchestrator when the **output guardrail** blocks the
+    streamed answer. Carries the refusal text that replaces the already-
+    streamed tokens. The SSE layer emits an ``event: guardrail_replacement``
+    frame from this so the frontend can swap the visible message (SSE is
+    one-way — the original tokens cannot be un-sent). ``None`` means no
+    output block occurred (or no guardrail suite is configured)."""
 
 
 class PostProcessor:

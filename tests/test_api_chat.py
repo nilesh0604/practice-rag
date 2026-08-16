@@ -21,11 +21,12 @@ from api.routes.chat import build_event_stream, build_replay_stream
 from rag.post_processor import PostProcessResult
 
 
-def _result(answer="Hello world", confidence=0.9, citations=None):
+def _result(answer="Hello world", confidence=0.9, citations=None, guardrail_replacement=None):
     return PostProcessResult(
         answer=answer,
         citations=citations or [],
         confidence=confidence,
+        guardrail_replacement=guardrail_replacement,
     )
 
 
@@ -134,6 +135,47 @@ class TestBuildEventStream:
         # delivered it). Verify persistence instead of the wire payload.
         msgs = store.get_messages(sid)
         assert msgs[-1]["content"] == "ab"
+        store.close()
+
+    def test_output_blocked_emits_guardrail_replacement_event(self):
+        """When the result carries ``guardrail_replacement``, the SSE stream
+        emits an ``event: guardrail_replacement`` frame (with the refusal as
+        JSON ``{"answer": ...}``) between the last delta and ``sources``."""
+        refusal = "I can't provide that answer. Please ask a question about FastAPI."
+        orch = MagicMock()
+        orch.stream_answer.return_value = iter([
+            "harmful streamed text",
+            _result(answer=refusal, guardrail_replacement=refusal),
+        ])
+        store = ConversationStore(":memory:")
+        cache = LRUCache(max_size=4)
+        sid = store.create_session()
+
+        events = list(build_event_stream(orch, "q", "", sid, store, cache))
+        # Order: delta, guardrail_replacement, sources, metadata, done.
+        assert events[0] == "event: delta\ndata: harmful streamed text\n\n"
+        assert events[1].startswith("event: guardrail_replacement\ndata: ")
+        payload = json.loads(events[1].split("data: ", 1)[1])
+        assert payload["answer"] == refusal
+        assert events[2].startswith("event: sources")
+        assert events[3].startswith("event: metadata")
+        assert events[4] == "event: done\ndata: [DONE]\n\n"
+        # The persisted assistant message is the refusal, not the streamed text.
+        msgs = store.get_messages(sid)
+        assert msgs[-1]["content"] == refusal
+        store.close()
+
+    def test_no_guardrail_replacement_omits_event(self):
+        """A normal (non-blocked) result must NOT emit a
+        ``guardrail_replacement`` frame."""
+        orch = MagicMock()
+        orch.stream_answer.return_value = iter(["tok", _result(answer="tok")])
+        store = ConversationStore(":memory:")
+        cache = LRUCache(max_size=4)
+        sid = store.create_session()
+
+        events = list(build_event_stream(orch, "q", "", sid, store, cache))
+        assert not any(e.startswith("event: guardrail_replacement") for e in events)
         store.close()
 
 

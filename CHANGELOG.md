@@ -5,6 +5,54 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added — `guardrail_replacement` SSE event for output-guardrail blocks
+
+The stream-then-verify guardrail pattern previously had a UX gap: when the
+output guardrail blocked the already-streamed answer, the **persisted**
+answer was replaced with a refusal, but the **already-streamed tokens stayed
+visible** in the UI because SSE is one-way and no swap event was emitted.
+The history endpoint reflected the refusal while the live chat bubble showed
+the harmful text — an inconsistent and unsafe state.
+
+This adds an optional `event: guardrail_replacement` SSE frame, emitted
+**only** when the output guardrail blocks, between the last `delta` and
+`sources`:
+
+    event: guardrail_replacement\ndata: {"answer": "<refusal>"}\n\n
+
+The frontend swaps the visible message content for the refusal on receipt,
+so the live UI and the persisted history agree.
+
+- `rag/post_processor.py` — `PostProcessResult.guardrail_replacement`
+  field (default `None`).
+- `rag/orchestrator.py` — `OUTPUT_REFUSAL` constant; `stream_answer` and
+  `answer` set `result.guardrail_replacement = OUTPUT_REFUSAL` on output
+  block; class docstring updated.
+- `api/routes/chat.py` — `build_event_stream` emits
+  `event: guardrail_replacement` when `result.guardrail_replacement` is
+  set (JSON-encoded `{"answer": ...}`); module docstring updated with the
+  new event in the wire-format taxonomy.
+- `frontend/src/api.js` — `parseSseFrame` dispatches
+  `guardrail_replacement` → `onGuardrailReplacement`; `streamChat`
+  accepts and forwards `onGuardrailReplacement`; module docstring updated.
+- `frontend/src/ChatWidget.jsx` — `handleSend` wires
+  `onGuardrailReplacement` to replace the assistant message `content`
+  with the refusal (swap, not append).
+- `tests/test_rag_orchestrator.py` — new tests asserting
+  `guardrail_replacement` is set on output block (stream + `answer`) and
+  `None` when allowed.
+- `tests/test_api_chat.py` — new tests asserting the
+  `guardrail_replacement` frame is emitted (with correct order + JSON
+  payload + persisted refusal) and omitted on non-blocked results.
+- `frontend/__tests__/api.test.js` — `parseSseFrame` +
+  `streamChat` tests for the `guardrail_replacement` event.
+- `frontend/__tests__/ChatWidget.test.jsx` — test that streamed tokens
+  are swapped for the refusal on `guardrail_replacement`.
+- `docs/CHAT_ASSISTANT_FEATURES.md` — Streaming UX
+  "Stream-then-verify pattern" line upgraded from 🟡 to ✅.
+- `README.md` — SSE wire-format section updated with the
+  `guardrail_replacement` event.
+
 ### Changed — SSE wire format switched to named events (delta/sources/metadata/done)
 
 The `POST /api/v1/chat` SSE stream now emits named events instead of the

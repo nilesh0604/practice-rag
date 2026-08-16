@@ -70,6 +70,17 @@ describe("parseSseFrame", () => {
     expect(cb.onDone).toHaveBeenCalled();
   });
 
+  it("dispatches guardrail_replacement via onGuardrailReplacement", () => {
+    const payload = { answer: "I can't provide that answer." };
+    const cb = { onGuardrailReplacement: jest.fn() };
+    const kind = parseSseFrame(
+      `event: guardrail_replacement\ndata: ${JSON.stringify(payload)}`,
+      cb,
+    );
+    expect(kind).toBe("guardrail_replacement");
+    expect(cb.onGuardrailReplacement).toHaveBeenCalledWith(payload);
+  });
+
   it("returns null for empty frames", () => {
     expect(parseSseFrame("", {})).toBeNull();
     expect(parseSseFrame("data: ", {})).toBeNull();
@@ -153,6 +164,35 @@ describe("streamChat", () => {
       trace_id: null,
     });
     expect(doneCalled).toBe(true);
+  });
+
+  it("forwards guardrail_replacement events via onGuardrailReplacement", async () => {
+    const refusal = "I can't provide that answer.";
+    const sse = [
+      "event: delta\ndata: harmful\n\n",
+      `event: guardrail_replacement\ndata: ${JSON.stringify({ answer: refusal })}\n\n`,
+      `event: sources\ndata: ${JSON.stringify({ citations: [] })}\n\n`,
+      `event: metadata\ndata: ${JSON.stringify({
+        session_id: "sess_abc",
+        confidence: 0.0,
+        trace_id: null,
+      })}\n\n`,
+      "event: done\ndata: [DONE]\n\n",
+    ];
+    global.fetch.mockReturnValue(mockFetchResponse(sse));
+
+    const tokens = [];
+    let replacement = null;
+    await streamChat({
+      message: "harmful q",
+      onToken: (t) => tokens.push(t),
+      onGuardrailReplacement: (r) => {
+        replacement = r;
+      },
+    });
+
+    expect(tokens).toEqual(["harmful"]);
+    expect(replacement).toEqual({ answer: refusal });
   });
 
   it("handles tokens split across chunk boundaries", async () => {

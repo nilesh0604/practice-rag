@@ -46,6 +46,15 @@ logger = logging.getLogger(__name__)
 # Type alias for the mixed stream: tokens are str, the final item is a result.
 StreamItem = Union[str, PostProcessResult]
 
+OUTPUT_REFUSAL: str = (
+    "I can't provide that answer. Please ask a question about "
+    "FastAPI, Pydantic v2, or SQLModel."
+)
+"""Canned refusal substituted for a streamed answer when the output guardrail
+blocks it. Also surfaced via ``PostProcessResult.guardrail_replacement`` so the
+SSE layer can emit a ``guardrail_replacement`` event and the frontend can swap
+the already-streamed (one-way) tokens."""
+
 
 class RAGOrchestrator:
     """Coordinates the full RAG flow: rewrite → retrieve → assemble → generate → post-process.
@@ -66,7 +75,11 @@ class RAGOrchestrator:
     3. **Output guardrail** — after generation, the answer is PII-scrubbed
        and (optionally) judged for harmful content. A harmful answer is
        replaced with a refusal. The scrubbed text is what gets post-
-       processed and persisted.
+       processed and persisted. Because the tokens were already streamed
+       (SSE is one-way), the refusal is also surfaced via
+       ``PostProcessResult.guardrail_replacement`` so the SSE layer can
+       emit a ``guardrail_replacement`` event and the frontend can swap
+       the visible message.
     """
 
     def __init__(
@@ -177,6 +190,7 @@ class RAGOrchestrator:
                 )
 
             # ── Step 6: output guardrail (PII scrub + harmful-content judge) ──
+            output_blocked = False
             if self.guardrail_suite is not None:
                 out_span = (
                     self.tracer.start_span(trace, "guardrail_output")
@@ -189,10 +203,11 @@ class RAGOrchestrator:
                     # streamed tokens are not un-sent (SSE is one-way), but the
                     # persisted + post-processed answer is the refusal so the
                     # session store and history endpoint reflect the block.
-                    answer = (
-                        "I can't provide that answer. Please ask a question about "
-                        "FastAPI, Pydantic v2, or SQLModel."
-                    )
+                    # ``guardrail_replacement`` is set on the result so the SSE
+                    # layer can emit a swap event and the frontend can replace
+                    # the visible (already-streamed) message with the refusal.
+                    answer = OUTPUT_REFUSAL
+                    output_blocked = True
                 else:
                     answer = out_decision.scrubbed or answer
                 if out_span is not None:
@@ -202,6 +217,8 @@ class RAGOrchestrator:
                     )
 
             result = self.post_processor.post_process(answer, docs)
+            if output_blocked:
+                result.guardrail_replacement = OUTPUT_REFUSAL
             if trace is not None:
                 result.trace_id = trace.id
             yield result
@@ -294,6 +311,7 @@ class RAGOrchestrator:
                 self.tracer.end_span(gen_span, metadata={"answer_len": len(answer)})
 
             # ── Step 6: output guardrail (PII scrub + harmful-content judge) ──
+            output_blocked = False
             if self.guardrail_suite is not None:
                 out_span = (
                     self.tracer.start_span(trace, "guardrail_output")
@@ -301,10 +319,8 @@ class RAGOrchestrator:
                 )
                 out_decision = self.guardrail_suite.check_output(answer)
                 if out_decision.blocked:
-                    answer = (
-                        "I can't provide that answer. Please ask a question about "
-                        "FastAPI, Pydantic v2, or SQLModel."
-                    )
+                    answer = OUTPUT_REFUSAL
+                    output_blocked = True
                 else:
                     answer = out_decision.scrubbed or answer
                 if out_span is not None:
@@ -313,6 +329,8 @@ class RAGOrchestrator:
                     )
 
             result = self.post_processor.post_process(answer, docs)
+            if output_blocked:
+                result.guardrail_replacement = OUTPUT_REFUSAL
             if trace is not None:
                 result.trace_id = trace.id
             return answer, result, docs

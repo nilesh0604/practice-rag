@@ -6,6 +6,8 @@ format uses named events:
 
     event: delta\\n                 # one per generated token
     data: <token>\\n\\n
+    event: guardrail_replacement\\n # only when the output guardrail blocks
+    data: {"answer": "<refusal>"}\\n\\n
     event: sources\\n               # exactly once, after the last token
     data: {"citations": [...]}\\n\\n
     event: metadata\\n              # exactly once, after sources
@@ -22,6 +24,12 @@ full ``ChatResponse`` (including the concatenated ``answer``) is still
 persisted to the session store and the LRU cache — only the wire format
 drops the redundant ``answer`` (the frontend reconstructs it from deltas).
 
+The optional ``event: guardrail_replacement`` frame is emitted **only** when
+the output guardrail blocks the already-streamed answer. Because SSE is
+one-way the original tokens cannot be un-sent, so this frame carries the
+refusal text and the frontend swaps the visible message content for it. It
+arrives after the last ``delta`` and before ``sources``.
+
 Cache (Tier 1): before invoking the orchestrator the normalized query is
 looked up in the LRU cache. On a hit the cached answer is replayed as a
 single ``event: delta`` frame followed by the ``sources``, ``metadata``,
@@ -36,6 +44,7 @@ spinning up the HTTP layer.
 
 from __future__ import annotations
 
+import json
 import logging
 import time
 from typing import Iterator
@@ -130,6 +139,14 @@ def build_event_stream(
         confidence=result.confidence,
     )
     cache.put(query, response)
+    # If the output guardrail blocked the streamed answer, tell the frontend
+    # to swap the already-streamed tokens for the refusal (SSE is one-way,
+    # so the deltas cannot be un-sent). Emitted before `sources` so the UI
+    # replacement lands before citations/metadata are applied.
+    replacement = getattr(result, "guardrail_replacement", None)
+    if replacement:
+        replacement_json = json.dumps({"answer": response.answer})
+        yield f"event: guardrail_replacement\ndata: {replacement_json}\n\n"
     # Split the post-processed result into two named events so the frontend
     # can render citation chips (sources) and request-level metadata
     # (session id / confidence / trace id) independently.
