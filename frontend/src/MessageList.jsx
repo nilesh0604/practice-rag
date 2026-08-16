@@ -5,7 +5,7 @@ import CitationChip from "./CitationChip.jsx";
  * MessageList — renders the chronological list of chat messages.
  *
  * Each assistant message can show:
- *  - citation chips (from the `event: result` frame)
+ *  - citation chips (from the `event: sources` frame)
  *  - a low-confidence warning when confidence < 0.65
  *  - thumbs up/down feedback buttons (enabled after streaming completes)
  *

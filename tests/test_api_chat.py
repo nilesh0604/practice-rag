@@ -1,9 +1,10 @@
 """Tests for ``POST /api/v1/chat`` SSE endpoint (api/routes/chat.py).
 
-Covers: SSE wire format (token frames, ``event: result``, ``[DONE]``),
-session creation/resolution, 404 on unknown session, cache hit replay,
-cache miss streaming, message persistence, and the factored
-``build_event_stream`` / ``build_replay_stream`` generators.
+Covers: SSE wire format (named events ``delta`` / ``sources`` /
+``metadata`` / ``done``), session creation/resolution, 404 on unknown
+session, cache hit replay, cache miss streaming, message persistence,
+and the factored ``build_event_stream`` / ``build_replay_stream``
+generators.
 """
 
 from __future__ import annotations
@@ -32,7 +33,7 @@ def _result(answer="Hello world", confidence=0.9, citations=None):
 
 
 class TestBuildEventStream:
-    def test_yields_token_frames_then_result_then_done(self):
+    def test_yields_delta_then_sources_then_metadata_then_done(self):
         orch = MagicMock()
         orch.stream_answer.return_value = iter(["A", "B", _result()])
         store = ConversationStore(":memory:")
@@ -41,13 +42,14 @@ class TestBuildEventStream:
 
         events = list(build_event_stream(orch, "q", "", sid, store, cache))
 
-        assert events[0] == "data: A\n\n"
-        assert events[1] == "data: B\n\n"
-        assert events[2].startswith("event: result\ndata: ")
-        assert events[3] == "data: [DONE]\n\n"
+        assert events[0] == "event: delta\ndata: A\n\n"
+        assert events[1] == "event: delta\ndata: B\n\n"
+        assert events[2].startswith("event: sources\ndata: ")
+        assert events[3].startswith("event: metadata\ndata: ")
+        assert events[4] == "event: done\ndata: [DONE]\n\n"
         store.close()
 
-    def test_result_frame_is_valid_chat_response_json(self):
+    def test_sources_frame_carries_citations(self):
         citations = [Citation(title="FastAPI Docs", source_url="https://example.com/x")]
         orch = MagicMock()
         orch.stream_answer.return_value = iter(["tok", _result(answer="tok", citations=citations)])
@@ -56,11 +58,26 @@ class TestBuildEventStream:
         sid = store.create_session()
 
         events = list(build_event_stream(orch, "q", "", sid, store, cache))
-        payload = json.loads(events[1].split("data: ", 1)[1])
-        assert payload["session_id"] == sid
-        assert payload["answer"] == "tok"
-        assert payload["confidence"] == 0.9
+        sources_frame = next(e for e in events if e.startswith("event: sources"))
+        payload = json.loads(sources_frame.split("data: ", 1)[1])
         assert len(payload["citations"]) == 1
+        assert payload["citations"][0]["title"] == "FastAPI Docs"
+        store.close()
+
+    def test_metadata_frame_carries_session_confidence_trace(self):
+        orch = MagicMock()
+        orch.stream_answer.return_value = iter(["tok", _result(answer="tok", confidence=0.9)])
+        store = ConversationStore(":memory:")
+        cache = LRUCache(max_size=4)
+        sid = store.create_session()
+
+        events = list(build_event_stream(orch, "q", "", sid, store, cache))
+        meta_frame = next(e for e in events if e.startswith("event: metadata"))
+        payload = json.loads(meta_frame.split("data: ", 1)[1])
+        assert payload["session_id"] == sid
+        assert payload["confidence"] == 0.9
+        # trace_id is None when Langfuse is disabled.
+        assert payload["trace_id"] is None
         store.close()
 
     def test_user_and_assistant_messages_persisted(self):
@@ -88,7 +105,7 @@ class TestBuildEventStream:
         assert cache.get("how do i") is not None
         store.close()
 
-    def test_empty_token_stream_still_emits_result_and_done(self):
+    def test_empty_token_stream_still_emits_sources_metadata_done(self):
         orch = MagicMock()
         orch.stream_answer.return_value = iter([_result(answer="")])
         store = ConversationStore(":memory:")
@@ -96,9 +113,10 @@ class TestBuildEventStream:
         sid = store.create_session()
 
         events = list(build_event_stream(orch, "q", "", sid, store, cache))
-        # No token frames, just result + done
-        assert events[0].startswith("event: result")
-        assert events[1] == "data: [DONE]\n\n"
+        # No delta frames, just sources + metadata + done
+        assert events[0].startswith("event: sources")
+        assert events[1].startswith("event: metadata")
+        assert events[2] == "event: done\ndata: [DONE]\n\n"
         store.close()
 
     def test_no_result_yielded_synthesizes_empty(self):
@@ -111,8 +129,11 @@ class TestBuildEventStream:
         sid = store.create_session()
 
         events = list(build_event_stream(orch, "q", "", sid, store, cache))
-        payload = json.loads(events[-2].split("data: ", 1)[1])
-        assert payload["answer"] == "ab"
+        # The synthesized result's answer is the concatenated tokens; it is
+        # persisted + cached but NOT carried on the wire (deltas already
+        # delivered it). Verify persistence instead of the wire payload.
+        msgs = store.get_messages(sid)
+        assert msgs[-1]["content"] == "ab"
         store.close()
 
 
@@ -120,7 +141,7 @@ class TestBuildEventStream:
 
 
 class TestBuildReplayStream:
-    def test_replays_answer_as_single_frame(self):
+    def test_replays_answer_as_single_delta_then_sources_metadata_done(self):
         cached = ChatResponse(
             session_id="sess_old",
             answer="cached answer",
@@ -128,9 +149,10 @@ class TestBuildReplayStream:
             confidence=0.5,
         )
         events = list(build_replay_stream(cached, "sess_new"))
-        assert events[0] == "data: cached answer\n\n"
-        assert events[1].startswith("event: result")
-        assert events[2] == "data: [DONE]\n\n"
+        assert events[0] == "event: delta\ndata: cached answer\n\n"
+        assert events[1].startswith("event: sources")
+        assert events[2].startswith("event: metadata")
+        assert events[3] == "event: done\ndata: [DONE]\n\n"
 
     def test_replay_uses_current_session_id(self):
         cached = ChatResponse(
@@ -140,7 +162,8 @@ class TestBuildReplayStream:
             confidence=0.5,
         )
         events = list(build_replay_stream(cached, "sess_new"))
-        payload = json.loads(events[1].split("data: ", 1)[1])
+        meta_frame = next(e for e in events if e.startswith("event: metadata"))
+        payload = json.loads(meta_frame.split("data: ", 1)[1])
         assert payload["session_id"] == "sess_new"
 
 
@@ -148,34 +171,39 @@ class TestBuildReplayStream:
 
 
 class TestChatEndpoint:
-    def test_streams_sse_tokens(self, client):
+    def test_streams_sse_delta_events(self, client):
         with client.stream("POST", "/api/v1/chat", json={"message": "hi"}) as resp:
             assert resp.status_code == 200
             assert "text/event-stream" in resp.headers.get("content-type", "")
             body = "".join(resp.iter_text())
-        assert "data: Hello\n\n" in body
-        assert "data:  world\n\n" in body
-        assert "data: [DONE]\n\n" in body
+        assert "event: delta\ndata: Hello\n\n" in body
+        assert "event: delta\ndata:  world\n\n" in body
+        assert "event: done\ndata: [DONE]\n\n" in body
 
-    def test_result_event_present(self, client):
+    def test_sources_and_metadata_events_present(self, client):
         with client.stream("POST", "/api/v1/chat", json={"message": "hi"}) as resp:
             body = "".join(resp.iter_text())
-        assert "event: result" in body
-        # Extract the result JSON
-        result_line = [l for l in body.splitlines() if l.startswith("event: result")]
-        assert result_line
+        assert "event: sources" in body
+        assert "event: metadata" in body
+        # Both events carry a JSON data line.
+        assert any(
+            l.startswith("event: sources") for l in body.splitlines()
+        )
+        assert any(
+            l.startswith("event: metadata") for l in body.splitlines()
+        )
 
     def test_creates_session_when_omitted(self, client, mem_store):
         with client.stream("POST", "/api/v1/chat", json={"message": "hi"}) as resp:
             body = "".join(resp.iter_text())
-        # The result frame carries the new session id.
-        for line in body.splitlines():
-            if line.startswith("data: ") and line.removeprefix("data: ").startswith("{"):
-                payload = json.loads(line.removeprefix("data: "))
-                sid = payload["session_id"]
-                assert sid.startswith("sess_")
-                assert mem_store.session_exists(sid)
-                break
+        # The metadata frame carries the new session id.
+        lines = body.splitlines()
+        meta_idx = next(i for i, l in enumerate(lines) if l.startswith("event: metadata"))
+        data_line = lines[meta_idx + 1]
+        payload = json.loads(data_line.removeprefix("data: "))
+        sid = payload["session_id"]
+        assert sid.startswith("sess_")
+        assert mem_store.session_exists(sid)
 
     def test_uses_provided_session_id(self, client, mem_store):
         sid = mem_store.create_session()
@@ -216,7 +244,7 @@ class TestChatEndpoint:
         ) as resp:
             assert resp.headers.get("x-cache") == "HIT"
             body = "".join(resp.iter_text())
-        assert "data: cached!\n\n" in body
+        assert "event: delta\ndata: cached!\n\n" in body
         # Orchestrator must NOT have been called on a cache hit.
         mock_orchestrator.stream_answer.assert_not_called()
 

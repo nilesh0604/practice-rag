@@ -4,7 +4,7 @@ import React from "react";
  * CitationChip — renders `[Source: title]` as a clickable external link with
  * an optional snippet, relevance score, and last-modified date.
  *
- * Matches the SSE `event: result` frame's `citations` array shape:
+ * Matches the SSE `event: sources` frame's `citations` array shape:
  *   { title, source_url, snippet?, relevanceScore?, lastModified? }
  * Older citations without the optional fields still render correctly.
  */

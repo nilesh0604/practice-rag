@@ -1,8 +1,8 @@
-import React, { useState, useRef, useCallback } from 'react';
-import MessageList from './MessageList.jsx';
-import InputBox from './InputBox.jsx';
-import ErrorBoundary from './ErrorBoundary.jsx';
-import { streamChat, sendFeedback } from './api.js';
+import React, { useState, useRef, useCallback } from "react";
+import MessageList from "./MessageList.jsx";
+import InputBox from "./InputBox.jsx";
+import ErrorBoundary from "./ErrorBoundary.jsx";
+import { streamChat, sendFeedback } from "./api.js";
 
 /**
  * ChatWidget — the main chat orchestrator.
@@ -14,9 +14,9 @@ import { streamChat, sendFeedback } from './api.js';
  *  - isStreaming: true while tokens are arriving
  *  - feedbackState: { [messageIndex]: 'up' | 'down' }
  *
- * The SSE consumer (api.js streamChat) calls onToken for each token,
- * onResult with the parsed ChatResponse (citations + confidence +
- * session_id), and onDone when [DONE] is received.
+ * The SSE consumer (api.js streamChat) calls onToken for each delta,
+ * onSources with the parsed citations, onMetadata with the session id +
+ * confidence + trace id, and onDone when the terminal event is received.
  *
  * Per the architecture doc:
  *   App → ChatWidget → MessageList + InputBox + ErrorBoundary
@@ -36,11 +36,11 @@ export default function ChatWidget() {
 
   const handleSend = useCallback(
     async (text) => {
-      const userMsg = { id: nextId(), role: 'user', content: text };
+      const userMsg = { id: nextId(), role: "user", content: text };
       const assistantMsg = {
         id: nextId(),
-        role: 'assistant',
-        content: '',
+        role: "assistant",
+        content: "",
         citations: [],
         confidence: null,
         streaming: true,
@@ -63,16 +63,21 @@ export default function ChatWidget() {
               ),
             );
           },
-          onResult: (result) => {
-            if (result.session_id) setSessionId(result.session_id);
+          onSources: ({ citations }) => {
             setMessages((prev) =>
               prev.map((m) =>
                 m.id === assistantMsg.id
-                  ? {
-                      ...m,
-                      citations: result.citations || [],
-                      confidence: result.confidence ?? null,
-                    }
+                  ? { ...m, citations: citations || [] }
+                  : m,
+              ),
+            );
+          },
+          onMetadata: (meta) => {
+            if (meta.session_id) setSessionId(meta.session_id);
+            setMessages((prev) =>
+              prev.map((m) =>
+                m.id === assistantMsg.id
+                  ? { ...m, confidence: meta.confidence ?? null }
                   : m,
               ),
             );
@@ -92,7 +97,7 @@ export default function ChatWidget() {
               ? {
                   ...m,
                   streaming: false,
-                  error: err.message || 'Failed to get a response.',
+                  error: err.message || "Failed to get a response.",
                 }
               : m,
           ),
@@ -122,7 +127,7 @@ export default function ChatWidget() {
           return next;
         });
         // eslint-disable-next-line no-console
-        console.error('Feedback failed:', err);
+        console.error("Feedback failed:", err);
       }
     },
     [sessionId],

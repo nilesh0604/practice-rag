@@ -5,6 +5,58 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed — SSE wire format switched to named events (delta/sources/metadata/done)
+
+The `POST /api/v1/chat` SSE stream now emits named events instead of the
+previous bare `data:` / `event: result` / `data: [DONE]` frames. The new
+wire format matches the architecture doc's listed event taxonomy:
+
+    event: delta\ndata: <token>\n\n             # one per generated token
+    event: sources\ndata: {"citations":[...]}\n\n  # once, after the last token
+    event: metadata\ndata: {json}\n\n           # once, after sources
+    event: done\ndata: [DONE]\n\n               # terminal sentinel
+
+The `event: sources` frame carries the post-processed citations (was
+previously embedded in the `event: result` frame's full `ChatResponse`).
+The `event: metadata` frame carries the session id, groundedness/
+confidence score, and Langfuse trace id. The full `ChatResponse`
+(including the concatenated `answer`) is still persisted to the session
+store and the LRU cache — only the wire format drops the redundant
+`answer` field (the frontend reconstructs it from the `delta` events).
+
+This is a **breaking wire-format change**: any client consuming the old
+`data: <token>` / `event: result` / `data: [DONE]` frames must be
+updated to the named-event format.
+
+- `api/routes/chat.py` — `build_event_stream` + `build_replay_stream`
+  now emit `event: delta` / `event: sources` / `event: metadata` /
+  `event: done`; module + function docstrings updated.
+- `frontend/src/api.js` — `parseSseFrame` dispatches on the `event:`
+  field (`delta` → `onToken`, `sources` → `onSources`, `metadata` →
+  `onMetadata`, `done` → `onDone`); `streamChat` callback signatures
+  updated (`onResult` → `onSources` + `onMetadata`); module docstring
+  updated.
+- `frontend/src/ChatWidget.jsx` — `handleSend` wires `onSources`
+  (citations) and `onMetadata` (session id + confidence) separately
+  instead of a single `onResult`.
+- `frontend/src/CitationChip.jsx`, `frontend/src/MessageList.jsx` —
+  doc comments updated to reference `event: sources` instead of
+  `event: result`.
+- `schemas/chat.py`, `rag/orchestrator.py` — module/class docstrings
+  updated to the named-event format.
+- `tests/test_api_chat.py` — all SSE frame assertions updated for the
+  new named events (`delta` / `sources` / `metadata` / `done`); the
+  `test_no_result_yielded_synthesizes_empty` test now verifies
+  persistence instead of the wire payload (the synthesized answer is
+  no longer carried on the wire).
+- `frontend/__tests__/api.test.js` — `parseSseFrame` + `streamChat`
+  tests updated for named events.
+- `frontend/__tests__/ChatWidget.test.jsx` — `mockStreamChatTokens`
+  helper now calls `onSources` + `onMetadata` instead of `onResult`.
+- `docs/CHAT_ASSISTANT_FEATURES.md` — Streaming UX SSE frame line
+  upgraded from 🟡 to ✅; Core Chat summary updated (✅4→5, 🟡2→1).
+- `README.md` — SSE wire format + frontend parser descriptions updated.
+
 ### Added — Query rewriter latency-skip heuristic
 
 `LLMQueryRewriter` now short-circuits the ~1-3s Ollama round-trip for

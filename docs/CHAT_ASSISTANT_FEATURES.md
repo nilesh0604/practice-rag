@@ -46,8 +46,8 @@
 
 ### Streaming UX — 🟡 Partial
 
-- ✅ SSE streaming via `text/event-stream`. See <ref_file file="/Users/Nilesh_Shinde/iSpace/practice-rag/api/routes/chat.py" /> (`build_event_stream`).
-- 🟡 SSE frame format differs from the listed `delta`/`sources`/`metadata`/`done` events. Actual frames: `data: <token>`, `event: result` + `data: {ChatResponse json}`, `data: [DONE]`.
+- ✅ SSE streaming via `text/event-stream` with named events. See <ref_file file="/Users/Nilesh_Shinde/iSpace/practice-rag/api/routes/chat.py" /> (`build_event_stream`).
+- ✅ SSE frame format uses the listed named events: `event: delta` (one per token), `event: sources` (citations JSON, once after the last token), `event: metadata` (session id + confidence + trace id, once), `event: done` (terminal `[DONE]` sentinel). The full `ChatResponse` (including the concatenated `answer`) is still persisted to the session store + LRU cache; only the wire format drops the redundant `answer` (the frontend reconstructs it from deltas).
 - ✅ Typing/streaming indicator — the frontend renders a streaming state via the `streaming` flag on the assistant message bubble (blinking cursor), not a dedicated `TypingIndicator` component. See <ref_file file="/Users/Nilesh_Shinde/iSpace/practice-rag/frontend/src/ChatWidget.jsx" />.
 - 🟡 Stream-then-verify pattern: input guardrails run pre-stream; output guardrails run on the full buffer post-stream. On output block, the **persisted** answer is replaced with a refusal, but **no `guardrail_replacement` SSE event** is emitted to swap the already-streamed UI message — already-sent tokens remain visible (SSE is one-way). See <ref_file file="/Users/Nilesh_Shinde/iSpace/practice-rag/rag/orchestrator.py" /> (output guardrail block).
 - ❌ **TTFT < 800ms target** — not measured/asserted as an SLO; TTFT is collected by `MetricsCollector` but there is no threshold gate.
@@ -150,7 +150,7 @@ Additional endpoints not in the listed spec but present: `POST /api/v1/ingest`, 
 
 | Category             | ✅ Implemented | 🟡 Partial | ❌ Not implemented |
 | -------------------- | -------------- | ---------- | ------------------ |
-| Core Chat            | 4              | 2          | 3                  |
+| Core Chat            | 5              | 1          | 3                  |
 | React Chat Widget UI | 1              | 8          | 2                  |
 | Retrieval            | 2              | 1          | 3                  |
 | APIs                 | 0              | 4          | 0 (within scope)   |

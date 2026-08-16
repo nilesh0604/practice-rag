@@ -17,20 +17,27 @@ jest.mock("../src/api.js", () => ({
 const { streamChat, sendFeedback } = require("../src/api.js");
 
 /**
- * Helper: simulate streamChat calling onToken/onResult/onDone.
+ * Helper: simulate streamChat calling onToken/onSources/onMetadata/onDone.
  * Callbacks are invoked synchronously (no act() wrapping) — React 18
  * automatic batching + RTL waitFor handle the re-renders.
  */
 function mockStreamChatTokens({ tokens, result, sessionId = "sess_test" }) {
-  streamChat.mockImplementation(async ({ onToken, onResult, onDone }) => {
-    for (const token of tokens) {
-      onToken?.(token);
-    }
-    if (result !== undefined) {
-      onResult?.({ ...result, session_id: result?.session_id ?? sessionId });
-    }
-    onDone?.();
-  });
+  streamChat.mockImplementation(
+    async ({ onToken, onSources, onMetadata, onDone }) => {
+      for (const token of tokens) {
+        onToken?.(token);
+      }
+      if (result !== undefined) {
+        onSources?.({ citations: result?.citations ?? [] });
+        onMetadata?.({
+          session_id: result?.session_id ?? sessionId,
+          confidence: result?.confidence ?? null,
+          trace_id: result?.trace_id ?? null,
+        });
+      }
+      onDone?.();
+    },
+  );
 }
 
 describe("ChatWidget", () => {

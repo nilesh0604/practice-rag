@@ -1,9 +1,11 @@
 """Chat request/response contracts for the FastAPI serving layer.
 
-The SSE stream emits raw tokens (`data: <token>\\n\\n`) followed by
-`data: [DONE]`; `ChatResponse` is the non-streaming, post-processed
-representation that gets persisted to the session store and returned by
-`GET /api/v1/history/{session_id}`.
+The SSE stream emits named events: ``event: delta`` (one per token),
+``event: sources`` (citations JSON), ``event: metadata`` (session id +
+confidence + trace id), and ``event: done`` (``[DONE]`` sentinel);
+``ChatResponse`` is the non-streaming, post-processed representation that
+gets persisted to the session store, stored in the LRU cache, and
+returned by ``GET /api/v1/history/{session_id}``.
 """
 
 from __future__ import annotations

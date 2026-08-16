@@ -14,9 +14,9 @@ generator, and post-processor into a single ``stream_answer`` generator that:
 
     for item in orchestrator.stream_answer(query, history):
         if isinstance(item, str):
-            # SSE: data: {item}
+            # SSE: event: delta\ndata: {item}
         else:
-            # PostProcessResult — persist, emit [DONE]
+            # PostProcessResult — persist, emit sources + metadata + done
 
 This keeps the orchestrator stateless and unit-testable without FastAPI.
 """

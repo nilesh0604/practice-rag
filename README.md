@@ -331,11 +331,12 @@ curl -N -X POST http://localhost:8000/api/v1/chat \
   -d '{"message":"How do I declare optional query parameters in FastAPI?"}'
 ```
 
-The SSE response emits `data: <token>` frames as tokens stream, then an
-`event: result` frame with the full `ChatResponse` JSON (citations +
-confidence + session id), and finally `data: [DONE]`. Repeated identical
-queries hit the in-memory LRU cache (`X-Cache: HIT` header) and replay the
-cached answer without invoking the orchestrator.
+The SSE response emits `event: delta` frames (one per token) as tokens
+stream, then an `event: sources` frame with the citations JSON, an
+`event: metadata` frame with the session id + confidence + trace id, and
+finally an `event: done` frame with the `[DONE]` sentinel. Repeated
+identical queries hit the in-memory LRU cache (`X-Cache: HIT` header) and
+replay the cached answer without invoking the orchestrator.
 
 Other endpoints:
 
@@ -383,13 +384,16 @@ App → ChatWidget → ErrorBoundary
 ```
 
 **SSE consumption:** `src/api.js` uses `fetch` + `ReadableStream` reader
-(per the doc's snippet) to parse the SSE stream. The parser handles three
-frame kinds:
+(per the doc's snippet) to parse the SSE stream. The parser handles four
+named-event frame kinds:
 
-- `data: <token>` — appended to the streaming assistant bubble
-- `event: result` — parsed as `ChatResponse` JSON; sets citations,
-  confidence, and session id
-- `data: [DONE]` — marks streaming complete, enables feedback buttons
+- `event: delta` — token appended to the streaming assistant bubble
+- `event: sources` — parsed as `{ citations: [...] }` JSON; renders
+  citation chips
+- `event: metadata` — parsed as `{ session_id, confidence, trace_id }`
+  JSON; sets the session id, renders the low-confidence warning, and
+  stores the trace id for feedback
+- `event: done` — marks streaming complete, enables feedback buttons
 
 **Features:**
 

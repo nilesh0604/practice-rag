@@ -2,23 +2,32 @@
 
 Wraps the Step 3 ``RAGOrchestrator.stream_answer`` generator in a
 ``StreamingResponse`` with ``text/event-stream`` media type. The SSE wire
-format matches the architecture doc:
+format uses named events:
 
-    data: <token>\\n\\n            # one per generated token
-    event: result\\n               # exactly once, after the last token
-    data: {ChatResponse json}\\n\\n
-    data: [DONE]\\n\\n              # terminal sentinel
+    event: delta\\n                 # one per generated token
+    data: <token>\\n\\n
+    event: sources\\n               # exactly once, after the last token
+    data: {"citations": [...]}\\n\\n
+    event: metadata\\n              # exactly once, after sources
+    data: {"session_id": ..., "confidence": ..., "trace_id": ...}\\n\\n
+    event: done\\n                  # terminal sentinel
+    data: [DONE]\\n\\n
 
-The ``event: result`` frame carries the post-processed ``ChatResponse``
-(citations + confidence + session id) so the frontend can render citation
-chips and the low-confidence warning without parsing the streamed text.
+The ``event: sources`` frame carries the post-processed citations so the
+frontend can render citation chips without parsing the streamed text. The
+``event: metadata`` frame carries the session id, groundedness/confidence
+score, and Langfuse trace id so the frontend can set the session, render
+the low-confidence warning, and pass the trace id back with feedback. The
+full ``ChatResponse`` (including the concatenated ``answer``) is still
+persisted to the session store and the LRU cache — only the wire format
+drops the redundant ``answer`` (the frontend reconstructs it from deltas).
 
 Cache (Tier 1): before invoking the orchestrator the normalized query is
 looked up in the LRU cache. On a hit the cached answer is replayed as a
-single ``data:`` frame followed by the ``result`` and ``[DONE]`` frames,
-skipping retrieval + generation entirely. The replayed ``result`` frame is
-rebuilt with the *current* session id so session ids never leak across
-sessions.
+single ``event: delta`` frame followed by the ``sources``, ``metadata``,
+and ``done`` frames, skipping retrieval + generation entirely. The
+replayed ``metadata`` frame is rebuilt with the *current* session id so
+session ids never leak across sessions.
 
 The event-stream generator is factored into ``build_event_stream`` so it
 can be unit-tested directly (collecting the yielded SSE strings) without
@@ -89,7 +98,7 @@ def build_event_stream(
                     if metrics is not None:
                         metrics.record_ttft(first_token_time - start)
                 answer_text += item
-                yield f"data: {item}\n\n"
+                yield f"event: delta\ndata: {item}\n\n"
             else:
                 result = item
     except Exception:
@@ -121,8 +130,20 @@ def build_event_stream(
         confidence=result.confidence,
     )
     cache.put(query, response)
-    yield f"event: result\ndata: {response.model_dump_json()}\n\n"
-    yield "data: [DONE]\n\n"
+    # Split the post-processed result into two named events so the frontend
+    # can render citation chips (sources) and request-level metadata
+    # (session id / confidence / trace id) independently.
+    citations_json = (
+        response.model_dump_json(include={"citations"})
+        if response.citations
+        else '{"citations":[]}'
+    )
+    yield f"event: sources\ndata: {citations_json}\n\n"
+    metadata_json = response.model_dump_json(
+        include={"session_id", "confidence", "trace_id"}
+    )
+    yield f"event: metadata\ndata: {metadata_json}\n\n"
+    yield "event: done\ndata: [DONE]\n\n"
 
 
 def build_replay_stream(
@@ -132,7 +153,9 @@ def build_replay_stream(
     """Replay a cached answer as SSE without invoking the orchestrator.
 
     The cached ``ChatResponse`` is rebuilt with the current ``session_id``
-    so the frontend never sees another session's id.
+    so the frontend never sees another session's id. Emits the same named
+    events as ``build_event_stream``: one ``delta`` with the full cached
+    answer, then ``sources`` + ``metadata`` + ``done``.
     """
     replayed = ChatResponse(
         session_id=session_id,
@@ -140,9 +163,18 @@ def build_replay_stream(
         citations=cached.citations,
         confidence=cached.confidence,
     )
-    yield f"data: {cached.answer}\n\n"
-    yield f"event: result\ndata: {replayed.model_dump_json()}\n\n"
-    yield "data: [DONE]\n\n"
+    yield f"event: delta\ndata: {cached.answer}\n\n"
+    citations_json = (
+        replayed.model_dump_json(include={"citations"})
+        if replayed.citations
+        else '{"citations":[]}'
+    )
+    yield f"event: sources\ndata: {citations_json}\n\n"
+    metadata_json = replayed.model_dump_json(
+        include={"session_id", "confidence", "trace_id"}
+    )
+    yield f"event: metadata\ndata: {metadata_json}\n\n"
+    yield "event: done\ndata: [DONE]\n\n"
 
 
 @router.post("/chat")
