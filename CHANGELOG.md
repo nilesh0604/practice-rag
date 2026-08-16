@@ -5,6 +5,25 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added — Department/role content filtering
+
+`ChatRequest` now accepts optional `department` and `role` fields. When set,
+the hybrid retriever applies a Qdrant payload filter so only documents tagged
+with the matching `department` and/or `roles` are returned.
+
+- `schemas/chat.py`: `ChatRequest` gains `department` and `role` fields.
+- `schemas/documents.py`: `DocumentChunk` and `RetrievedDoc` gain `department`
+  and `roles` payload fields.
+- `rag/retriever.py`: `HybridRetriever.retrieve()` accepts `department` and
+  `role` and passes a `query_filter` to both dense and sparse Qdrant queries.
+- `rag/orchestrator.py`: `stream_answer()` and `answer()` forward the filters
+  to retrieval.
+- `api/routes/chat.py`: the `/api/v1/chat` endpoint reads `department`/`role`
+  from the request, builds a filter-aware cache key, and streams the filtered
+  answer.
+- `tests/test_schemas.py` and `tests/test_rag_retriever.py`: new tests for
+  `ChatRequest` filtering fields and Qdrant payload filter construction.
+
 ### Added — Model drift detection (Responsible AI)
 
 A model drift monitor now records an answer feature vector for every completed

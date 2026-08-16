@@ -582,3 +582,36 @@ F500 model monitoring uses a **statistical drift test** against a version-pinned
 2. Replace the relative-mean heuristic with a **statistical drift test** (KS / PSI / Wasserstein) and compute p-values.
 3. Add **per-feature SLO thresholds** and wire drift breaches into CI as a **blocking promotion gate**.
 4. Persist every answer's feature vector to an **append-only trace store** (not just in-process metrics) for forensics and offline re-analysis.
+
+---
+
+## 17. Department/role content filtering without auth/identity layer
+
+**Files:** `schemas/chat.py`, `schemas/documents.py`, `rag/retriever.py`, `rag/orchestrator.py`, `api/routes/chat.py`
+
+### Enterprise-standard practice
+
+F500 deployments enforce content access through an authenticated identity layer:
+
+- **Identity provider (IdP)** — OAuth2 / OIDC (Keycloak, Auth0, Okta) issuing signed JWTs with `department`, `role`, and scope claims.
+- **Server-side claim verification** — the API validates the JWT signature and derives `department`/`role` from the token, never trusting client-provided values in the request body.
+- **RBAC policy engine** — per-corpus and per-content ACLs bound to groups/roles, with audit logging of every access-control decision.
+- **Immutable audit log** — record `{query, actor, department, role, allowed_docs}` for forensics.
+
+### Workaround shipped
+
+`ChatRequest` accepts optional, unvalidated `department` and `role` strings. The retriever passes them directly into a Qdrant payload `query_filter` on `department` and `roles`. There is no IdP, no JWT validation, no server-side identity resolution, and no audit log. Any client can claim any department/role and see any content tagged accordingly.
+
+### Reasoning for the workaround
+
+- This is a local, $0-cost, single-user practice project with open localhost endpoints and no multi-tenant threat model.
+- Adding an IdP would require container + config burden that does not change the RAG filtering mechanics.
+- The request-body fields demonstrate the end-to-end filtering shape so a real identity layer can be layered in later by deriving the same values from validated JWT claims.
+
+### Future action item
+
+1. Replace request-body `department`/`role` with **JWT claim extraction** (`Authorization: Bearer <jwt>`) in `api/routes/chat.py`.
+2. Add **per-endpoint RBAC decorators** and a claims-verification dependency in `api/deps.py`.
+3. Maintain a **content ACL model** (`ContentAccessPolicy`) with allowed departments/roles, and enforce it in `HybridRetriever` instead of direct payload matching.
+4. Add an **audit log** for every filtered query: `{session_id, actor, department, role, query, allowed_doc_ids}`.
+5. Re-index the corpus with authoritative `department`/`roles` metadata from the source-of-record (HR / entitlement system) rather than ingestion-time optional fields.

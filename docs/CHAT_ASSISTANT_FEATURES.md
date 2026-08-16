@@ -84,7 +84,7 @@ Implemented components (see <ref_file file="/Users/Nilesh_Shinde/iSpace/practice
 - 🟡 Embeddings are `nomic-embed-text` (768d), **not `text-embedding-ada-002` (1536d)**.
 - ✅ Relevance scores normalized to 0–1 (RRF score divided by theoretical max `2/(k+1)`). See <ref_file file="/Users/Nilesh_Shinde/iSpace/practice-rag/rag/retriever.py" /> (`_rrf_fuse`).
 - ❌ **Configurable `maxSources` per request** — `top_k` is a retriever constructor constant (`DEFAULT_TOP_K=5`), not a per-request option on `ChatRequest`.
-- ❌ **Department-scoped retrieval via `department` option** — not implemented. `ChatRequest` has no `department` field; retriever has no filter.
+- 🟡 **Department-scoped retrieval via `department` option** — `ChatRequest` now has optional `department`/`role` fields and the retriever applies a Qdrant payload filter. **No auth/identity layer** verifies the caller's department/role.
 
 ---
 
@@ -144,7 +144,7 @@ Additional endpoints not in the listed spec but present: `POST /api/v1/ingest`, 
 
 ## RBAC — ❌ Not implemented
 
-- ❌ **Content filtering by department/role** (e.g. `department: "engineering"`) — not implemented. `ChatRequest` has no department/role field; the retriever applies no payload filter; there is no auth/identity layer.
+- 🟡 **Content filtering by department/role** (e.g. `department: "engineering"`) — `ChatRequest` now accepts `department`/`role`, the retriever applies a Qdrant payload filter, and `DocumentChunk`/`RetrievedDoc` carry `department`/`roles`. **No auth/identity layer** verifies the caller's department/role.
 
 ---
 

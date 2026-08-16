@@ -60,6 +60,14 @@ class DocumentChunk(BaseModel):
         description="Logical document id, e.g. 'fastapi-query-params'. "
         "Used to filter/delete all chunks of a stale document.",
     )
+    department: str | None = Field(
+        default=None,
+        description="Department this chunk is intended for, e.g. 'engineering'.",
+    )
+    roles: list[str] | None = Field(
+        default=None,
+        description="Allowed roles for this chunk, e.g. ['manager', 'lead'].",
+    )
     embedding: list[float] | None = Field(
         default=None,
         description="768-d dense embedding from nomic-embed-text. "
@@ -119,4 +127,12 @@ class RetrievedDoc(BaseModel):
         description="Last-modified timestamp of the source document (UTC), "
         "if present in the Qdrant payload. Used to populate citation "
         "``lastModified`` so the UI can show source freshness.",
+    )
+    department: str | None = Field(
+        default=None,
+        description="Department this chunk is intended for, if present.",
+    )
+    roles: list[str] | None = Field(
+        default=None,
+        description="Allowed roles for this chunk, if present.",
     )

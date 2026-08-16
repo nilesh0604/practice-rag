@@ -68,6 +68,12 @@ SSE_MEDIA_TYPE: str = "text/event-stream"
 """Media type for Server-Sent Events responses."""
 
 
+def _cache_key(query: str, department: str | None, role: str | None) -> str:
+    """Build a cache key that includes department/role when present."""
+    parts = [p for p in (department, role, query) if p]
+    return " | ".join(parts) if len(parts) > 1 else query
+
+
 def build_event_stream(
     orchestrator: RAGOrchestrator,
     query: str,
@@ -76,6 +82,9 @@ def build_event_stream(
     store: ConversationStore,
     cache: LRUCache,
     metrics: MetricsCollector | None = None,
+    department: str | None = None,
+    role: str | None = None,
+    cache_key: str | None = None,
 ) -> Iterator[str]:
     """Build the SSE generator for a chat request.
 
@@ -100,7 +109,7 @@ def build_event_stream(
     result: PostProcessResult | None = None
     first_token_time: float | None = None
     try:
-        for item in orchestrator.stream_answer(query, history):
+        for item in orchestrator.stream_answer(query, history, department, role):
             if isinstance(item, str):
                 if first_token_time is None:
                     first_token_time = time.time()
@@ -138,7 +147,7 @@ def build_event_stream(
         citations=result.citations,
         confidence=result.confidence,
     )
-    cache.put(query, response)
+    cache.put(cache_key or query, response)
     # Responsible AI: record the bias & fairness check result (when a bias
     # monitor ran) so the ``GET /api/v1/metrics`` snapshot surfaces bias
     # monitoring metrics (checks, biased answers, blocks, per-category
@@ -225,6 +234,9 @@ def chat(
 ) -> StreamingResponse:
     """Stream a RAG answer for the user's message as Server-Sent Events."""
     query = request.message
+    department = request.department
+    role = request.role
+    cache_key = _cache_key(query, department, role)
 
     # Resolve / create the session.
     session_id = request.session_id or store.create_session()
@@ -233,8 +245,8 @@ def chat(
         # creating a phantom session that the client thinks exists.
         raise HTTPException(status_code=404, detail=f"Session {request.session_id!r} not found")
 
-    # Tier 1 cache: exact normalized query match.
-    cached = cache.get(query)
+    # Tier 1 cache: exact normalized query match (scoped by department/role).
+    cached = cache.get(cache_key)
     if cached is not None:
         logger.info("Cache hit — replaying cached answer for session %s", session_id)
         metrics.record_cache_hit()
@@ -248,7 +260,18 @@ def chat(
     metrics.record_cache_miss()
     history = store.format_history(session_id)
     return StreamingResponse(
-        build_event_stream(orchestrator, query, history, session_id, store, cache, metrics),
+        build_event_stream(
+            orchestrator,
+            query,
+            history,
+            session_id,
+            store,
+            cache,
+            metrics,
+            department,
+            role,
+            cache_key=cache_key,
+        ),
         media_type=SSE_MEDIA_TYPE,
         headers={"X-Cache": "MISS"},
     )

@@ -12,6 +12,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from ingestion.embedder import EMBEDDING_DIM
+from qdrant_client.models import FieldCondition, Filter, MatchAny, MatchValue
 from rag.retriever import (
     DEFAULT_RRF_K,
     DEFAULT_TOP_K,
@@ -253,3 +254,61 @@ class TestRetrieverDefaults:
 
     def test_max_rrf_score_positive(self):
         assert MAX_RRF_SCORE > 0
+
+
+class TestRetrieverFiltering:
+    def test_department_filter_passed_to_qdrant(self):
+        client = MagicMock()
+        client.query_points.side_effect = [
+            _make_query_response([]),
+            _make_query_response([]),
+        ]
+        retriever = HybridRetriever(client, _make_embedder(), top_k=5)
+        retriever.retrieve("query", department="engineering")
+        for call in client.query_points.call_args_list:
+            flt = call.kwargs.get("query_filter")
+            assert isinstance(flt, Filter)
+            assert flt.must[0].key == "department"
+            assert isinstance(flt.must[0].match, MatchValue)
+            assert flt.must[0].match.value == "engineering"
+
+    def test_role_filter_passed_to_qdrant(self):
+        client = MagicMock()
+        client.query_points.side_effect = [
+            _make_query_response([]),
+            _make_query_response([]),
+        ]
+        retriever = HybridRetriever(client, _make_embedder(), top_k=5)
+        retriever.retrieve("query", role="manager")
+        for call in client.query_points.call_args_list:
+            flt = call.kwargs.get("query_filter")
+            assert isinstance(flt, Filter)
+            assert flt.must[0].key == "roles"
+            assert isinstance(flt.must[0].match, MatchAny)
+            assert flt.must[0].match.any == ["manager"]
+
+    def test_department_and_role_filters_combined(self):
+        client = MagicMock()
+        client.query_points.side_effect = [
+            _make_query_response([]),
+            _make_query_response([]),
+        ]
+        retriever = HybridRetriever(client, _make_embedder(), top_k=5)
+        retriever.retrieve("query", department="engineering", role="manager")
+        for call in client.query_points.call_args_list:
+            flt = call.kwargs.get("query_filter")
+            assert isinstance(flt, Filter)
+            assert len(flt.must) == 2
+            keys = {c.key for c in flt.must}
+            assert keys == {"department", "roles"}
+
+    def test_no_filter_when_not_provided(self):
+        client = MagicMock()
+        client.query_points.side_effect = [
+            _make_query_response([]),
+            _make_query_response([]),
+        ]
+        retriever = HybridRetriever(client, _make_embedder(), top_k=5)
+        retriever.retrieve("query")
+        for call in client.query_points.call_args_list:
+            assert call.kwargs.get("query_filter") is None

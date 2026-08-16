@@ -147,6 +147,19 @@ class TestChatRequest:
         with pytest.raises(ValidationError):
             ChatRequest(message="x" * 4001)
 
+    def test_department_and_role_optional(self):
+        req = ChatRequest(
+            message="hi",
+            department="engineering",
+            role="manager",
+        )
+        assert req.department == "engineering"
+        assert req.role == "manager"
+
+    def test_unknown_field_rejected(self):
+        with pytest.raises(ValidationError):
+            ChatRequest(message="hi", unknown="nope")
+
 
 # ── ChatResponse / Citation ─────────────────────────────────────────────────
 

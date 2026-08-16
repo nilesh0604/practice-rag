@@ -30,6 +30,7 @@ import logging
 from typing import TYPE_CHECKING
 
 from qdrant_client import QdrantClient
+from qdrant_client.models import FieldCondition, Filter, MatchAny, MatchValue
 
 from ingestion.embedder import Embedder, sparse_embed_text
 from rag.qdrant_collection import (
@@ -93,17 +94,23 @@ class HybridRetriever:
 
     # ── public API ─────────────────────────────────────────────────────
 
-    def retrieve(self, query: str) -> list[RetrievedDoc]:
+    def retrieve(
+        self,
+        query: str,
+        department: str | None = None,
+        role: str | None = None,
+    ) -> list[RetrievedDoc]:
         """Run hybrid retrieval for a query string → fused top-K RetrievedDocs.
 
         Embeds the query (dense + sparse), queries both Qdrant indexes, fuses
         with RRF, and returns the top-K results sorted by fused score.
         """
+        query_filter = self._build_filter(department, role)
         dense_vec = self.embedder.embed_text(query)
         sparse_vec = sparse_embed_text(query)
 
-        dense_hits = self._search_dense(dense_vec)
-        sparse_hits = self._search_sparse(sparse_vec)
+        dense_hits = self._search_dense(dense_vec, query_filter)
+        sparse_hits = self._search_sparse(sparse_vec, query_filter)
 
         fused = self._rrf_fuse(dense_hits, sparse_hits)
         logger.info(
@@ -118,7 +125,34 @@ class HybridRetriever:
 
     # ── Qdrant queries ─────────────────────────────────────────────────
 
-    def _search_dense(self, dense_vec: list[float]) -> list["ScoredPoint"]:
+    def _build_filter(
+        self,
+        department: str | None,
+        role: str | None,
+    ) -> Filter | None:
+        """Build a Qdrant payload filter from optional department/role."""
+        conditions: list[FieldCondition] = []
+        if department:
+            conditions.append(
+                FieldCondition(
+                    key="department",
+                    match=MatchValue(value=department),
+                )
+            )
+        if role:
+            conditions.append(
+                FieldCondition(
+                    key="roles",
+                    match=MatchAny(any=[role]),
+                )
+            )
+        return Filter(must=conditions) if conditions else None
+
+    def _search_dense(
+        self,
+        dense_vec: list[float],
+        query_filter: Filter | None = None,
+    ) -> list["ScoredPoint"]:
         """Dense vector search via Qdrant ``query_points``."""
         from qdrant_client.http.models import SearchParams
 
@@ -127,19 +161,25 @@ class HybridRetriever:
             query=dense_vec,
             using=self.vector_name,
             limit=self.prefetch_limit,
+            query_filter=query_filter,
             with_payload=True,
             with_vectors=False,
             search_params=SearchParams(hnsw_ef=self.hnsw_ef),
         )
         return list(response.points)
 
-    def _search_sparse(self, sparse_vec) -> list["ScoredPoint"]:
+    def _search_sparse(
+        self,
+        sparse_vec,
+        query_filter: Filter | None = None,
+    ) -> list["ScoredPoint"]:
         """Sparse vector search via Qdrant ``query_points``."""
         response = self.client.query_points(
             collection_name=self.collection_name,
             query=sparse_vec,
             using=self.sparse_vector_name,
             limit=self.prefetch_limit,
+            query_filter=query_filter,
             with_payload=True,
             with_vectors=False,
         )
@@ -197,4 +237,6 @@ class HybridRetriever:
             chunk_index=payload.get("chunk_index"),
             parent_doc_id=payload.get("parent_doc_id"),
             last_modified=payload.get("last_modified"),
+            department=payload.get("department"),
+            roles=payload.get("roles"),
         )

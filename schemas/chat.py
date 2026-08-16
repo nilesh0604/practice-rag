@@ -30,6 +30,14 @@ class ChatRequest(BaseModel):
         default=None,
         description="Existing session id. If omitted, the server creates a new one.",
     )
+    department: str | None = Field(
+        default=None,
+        description="Optional department filter for retrieval (e.g. 'engineering').",
+    )
+    role: str | None = Field(
+        default=None,
+        description="Optional role filter for content access (e.g. 'manager').",
+    )
 
 
 class Citation(BaseModel):

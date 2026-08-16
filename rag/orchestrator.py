@@ -204,6 +204,8 @@ class RAGOrchestrator:
         self,
         query: str,
         history: str = "",
+        department: str | None = None,
+        role: str | None = None,
     ) -> Iterator[StreamItem]:
         """Run the full RAG flow, yielding tokens then a final PostProcessResult.
 
@@ -276,7 +278,7 @@ class RAGOrchestrator:
                 self.tracer.start_span(trace, "retrieval", metadata={"rewritten": rewritten})
                 if trace is not None else None
             )
-            docs = self._retrieve(rewritten, classify_label)
+            docs = self._retrieve(rewritten, classify_label, department, role)
             if ret_span is not None:
                 self.tracer.end_span(ret_span, metadata={"num_docs": len(docs)})
 
@@ -481,7 +483,13 @@ class RAGOrchestrator:
 
     # ── retrieval (single + multi-query) ─────────────────────────────────
 
-    def _retrieve(self, rewritten: str, classify_label: str) -> list[RetrievedDoc]:
+    def _retrieve(
+        self,
+        rewritten: str,
+        classify_label: str,
+        department: str | None = None,
+        role: str | None = None,
+    ) -> list[RetrievedDoc]:
         """Run retrieval, decomposing into sub-queries for ``compare`` queries.
 
         When a query decomposer is configured AND the classifier labeled the
@@ -493,16 +501,26 @@ class RAGOrchestrator:
         retrieval pass runs — identical to the non-decomposed path.
         """
         if classify_label != CLASS_COMPARE:
+            if department or role:
+                return self.retriever.retrieve(rewritten, department, role)
             return self.retriever.retrieve(rewritten)
         sub_queries = self.query_decomposer.decompose(rewritten)
         if len(sub_queries) <= 1:
+            if department or role:
+                return self.retriever.retrieve(rewritten, department, role)
             return self.retriever.retrieve(rewritten)
         logger.info(
             "Orchestrator: compare query decomposed into %d sub-queries", len(sub_queries),
         )
         merged: list[RetrievedDoc] = []
         for sq in sub_queries:
-            merged = self._merge_docs(merged, self.retriever.retrieve(sq))
+            if department or role:
+                merged = self._merge_docs(
+                    merged,
+                    self.retriever.retrieve(sq, department, role),
+                )
+            else:
+                merged = self._merge_docs(merged, self.retriever.retrieve(sq))
         return merged
 
     @staticmethod
@@ -529,6 +547,8 @@ class RAGOrchestrator:
         self,
         query: str,
         history: str = "",
+        department: str | None = None,
+        role: str | None = None,
     ) -> tuple[str, PostProcessResult, list[RetrievedDoc]]:
         """Non-streaming convenience method — collects all tokens and returns the result.
 
@@ -586,7 +606,7 @@ class RAGOrchestrator:
                 self.tracer.start_span(trace, "retrieval", metadata={"rewritten": rewritten})
                 if trace is not None else None
             )
-            docs = self._retrieve(rewritten, classify_label)
+            docs = self._retrieve(rewritten, classify_label, department, role)
             if ret_span is not None:
                 self.tracer.end_span(ret_span, metadata={"num_docs": len(docs)})
 
