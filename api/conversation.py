@@ -228,6 +228,28 @@ class ConversationStore:
             ).fetchall()
         return [dict(r) for r in rows]
 
+    def erase_session(self, session_id: str) -> dict[str, int]:
+        """Permanently erase all conversation data for a session.
+
+        Deletes every message and feedback row for ``session_id`` and returns
+        the number of rows removed from each table. This is the SQLite-backed
+        implementation of the GDPR Art. 17 right-to-erasure endpoint.
+        """
+        with self._lock:
+            cur_messages = self._conn.execute(
+                "DELETE FROM messages WHERE session_id = ?",
+                (session_id,),
+            )
+            cur_feedback = self._conn.execute(
+                "DELETE FROM feedback WHERE session_id = ?",
+                (session_id,),
+            )
+            self._conn.commit()
+        return {
+            "messages_deleted": cur_messages.rowcount,
+            "feedback_deleted": cur_feedback.rowcount,
+        }
+
     # ── lifecycle ──────────────────────────────────────────────────────
 
     def close(self) -> None:

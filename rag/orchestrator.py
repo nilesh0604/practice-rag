@@ -26,6 +26,7 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Iterator, Union
 
+from rag.bias_monitor import BiasAssessment, BiasMonitor, PassthroughBiasMonitor
 from rag.context_assembler import ContextAssembler
 from rag.generator import Generator
 from rag.post_processor import PostProcessor, PostProcessResult
@@ -60,6 +61,30 @@ OUTPUT_REFUSAL: str = (
 blocks it. Also surfaced via ``PostProcessResult.guardrail_replacement`` so the
 SSE layer can emit a ``guardrail_replacement`` event and the frontend can swap
 the already-streamed (one-way) tokens."""
+
+LOW_CONFIDENCE_REFUSAL: str = (
+    "I'm not confident this answer is grounded in the retrieved sources. "
+    "Please rephrase the question or consult the documentation directly."
+)
+"""Canned refusal substituted for an answer whose post-processor groundedness
+score falls below ``CONFIDENCE_THRESHOLD`` when the orchestrator is built with
+``block_low_confidence=True``. Surfaced via
+``PostProcessResult.guardrail_replacement`` (same swap mechanism as the output
+guardrail) so the SSE layer can replace the already-streamed tokens. The real
+(low) confidence score is preserved on the result so metadata + metrics still
+capture the grounding failure."""
+
+BIAS_REFUSAL: str = (
+    "I can't provide that answer because it may contain biased or "
+    "non-inclusive language. Please rephrase the question."
+)
+"""Canned refusal substituted for an answer the bias & fairness monitor
+flags as biased when the orchestrator is built with ``block_biased=True``
+(Responsible AI). Surfaced via ``PostProcessResult.guardrail_replacement``
+(same swap mechanism as the output guardrail + hallucination block) so the
+SSE layer can replace the already-streamed tokens. The real
+``BiasAssessment`` (categories, evidence, score) is preserved on the result
+so metadata + metrics capture the bias detection."""
 
 
 class RAGOrchestrator:
@@ -133,6 +158,9 @@ class RAGOrchestrator:
         reranker: "NIMReranker | None" = None,
         query_decomposer: QueryDecomposer | None = None,
         query_clarifier: QueryClarifier | None = None,
+        block_low_confidence: bool = False,
+        bias_monitor: BiasMonitor | None = None,
+        block_biased: bool = False,
     ) -> None:
         self.retriever = retriever
         self.context_assembler = context_assembler
@@ -144,6 +172,25 @@ class RAGOrchestrator:
         self.reranker = reranker
         self.query_decomposer = query_decomposer or PassthroughQueryDecomposer()
         self.query_clarifier = query_clarifier or PassthroughQueryClarifier()
+        self.block_low_confidence = block_low_confidence
+        """When True, an answer whose post-processor groundedness score is
+        below ``CONFIDENCE_THRESHOLD`` is replaced with ``LOW_CONFIDENCE_REFUSAL``
+        (a hallucination block). The refusal is persisted + post-processed
+        exactly like an output-guardrail block: ``guardrail_replacement`` is
+        set on the streaming path so the SSE layer swaps the already-streamed
+        tokens. The real (low) confidence is preserved on the result for
+        metadata/metrics. Default ``False`` preserves the warn-only behavior."""
+        self.bias_monitor = bias_monitor or PassthroughBiasMonitor()
+        """Bias & fairness monitor (Responsible AI). Runs after the output
+        guardrail + hallucination block. When ``block_biased`` is True and
+        the monitor flags the answer as biased, the answer is replaced with
+        ``BIAS_REFUSAL`` (same swap mechanism). The real ``BiasAssessment``
+        is preserved on the result so metadata + metrics capture the
+        detection. Default is the passthrough (no-op) monitor."""
+        self.block_biased = block_biased
+        """When True, a biased answer is replaced with ``BIAS_REFUSAL``.
+        Default ``False`` preserves the monitor-only behavior (the
+        assessment is still recorded on the result for metrics)."""
 
     def stream_answer(
         self,
@@ -317,12 +364,70 @@ class RAGOrchestrator:
                         )
 
             result = self.post_processor.post_process(answer, docs)
+            # ── Hallucination block: when enabled, an answer whose
+            # groundedness score is below CONFIDENCE_THRESHOLD is replaced
+            # with a low-confidence refusal. Mirrors the output-guardrail
+            # block: the refusal is persisted + post-processed, and
+            # ``guardrail_replacement`` is set on the streaming path so the
+            # SSE layer swaps the already-streamed tokens. The real (low)
+            # confidence is preserved on the result so metadata + metrics
+            # capture the grounding failure. Skipped when the output
+            # guardrail already blocked (output block takes precedence).
+            low_conf_blocked = False
+            if (
+                self.block_low_confidence
+                and not output_blocked
+                and result.low_confidence
+            ):
+                logger.info(
+                    "Orchestrator: low-confidence block — confidence=%.3f",
+                    result.confidence,
+                )
+                low_conf_blocked = True
+                result.answer = LOW_CONFIDENCE_REFUSAL
+                result.citations = []
+            # ── Bias & fairness monitor (Responsible AI): runs after the
+            # output guardrail + hallucination block on the final answer.
+            # When ``block_biased`` is True and the monitor flags the
+            # answer as biased, the answer is replaced with ``BIAS_REFUSAL``
+            # (same swap mechanism). The real ``BiasAssessment`` is
+            # preserved on the result so metadata + metrics capture the
+            # detection. Skipped when the output guardrail or hallucination
+            # block already replaced the answer (those take precedence — a
+            # canned refusal is not biased content worth blocking).
+            bias_blocked = False
+            if not output_blocked and not low_conf_blocked:
+                bias_span = (
+                    self.tracer.start_span(trace, "bias_monitor")
+                    if trace is not None else None
+                )
+                bias_assessment = self.bias_monitor.assess(result.answer)
+                result.bias = bias_assessment
+                if bias_span is not None:
+                    self.tracer.end_span(
+                        bias_span,
+                        metadata={
+                            "biased": bias_assessment.biased,
+                            "categories": bias_assessment.categories,
+                            "score": bias_assessment.score,
+                        },
+                    )
+                if self.block_biased and bias_assessment.biased:
+                    logger.info(
+                        "Orchestrator: bias block — categories=%s score=%.2f",
+                        bias_assessment.categories,
+                        bias_assessment.score,
+                    )
+                    bias_blocked = True
+                    result.answer = BIAS_REFUSAL
+                    result.citations = []
+                    result.bias_blocked = True
             # Only the streaming path sets ``guardrail_replacement`` — the
             # sensitive buffered path never streamed the harmful tokens, so
             # there is nothing for the frontend to swap (the single delta IS
             # the final, guardrailed answer).
-            if output_blocked and not sensitive_buffered:
-                result.guardrail_replacement = OUTPUT_REFUSAL
+            if (output_blocked or low_conf_blocked or bias_blocked) and not sensitive_buffered:
+                result.guardrail_replacement = result.answer
             if trace is not None:
                 result.trace_id = trace.id
             yield result
@@ -491,8 +596,58 @@ class RAGOrchestrator:
                     )
 
             result = self.post_processor.post_process(answer, docs)
-            if output_blocked:
-                result.guardrail_replacement = OUTPUT_REFUSAL
+            # ── Hallucination block (non-streaming path) — see stream_answer
+            # for the full rationale. The returned ``answer`` is the refusal
+            # so callers (eval, history) see the blocked text; the real low
+            # confidence is preserved on the result.
+            low_conf_blocked = False
+            if (
+                self.block_low_confidence
+                and not output_blocked
+                and result.low_confidence
+            ):
+                logger.info(
+                    "Orchestrator: low-confidence block (answer) — confidence=%.3f",
+                    result.confidence,
+                )
+                low_conf_blocked = True
+                result.answer = LOW_CONFIDENCE_REFUSAL
+                result.citations = []
+                answer = LOW_CONFIDENCE_REFUSAL
+            # ── Bias & fairness monitor (non-streaming path) — see
+            # stream_answer for the full rationale. The returned ``answer``
+            # is the refusal so callers (eval, history) see the blocked
+            # text; the real ``BiasAssessment`` is preserved on the result.
+            bias_blocked = False
+            if not output_blocked and not low_conf_blocked:
+                bias_span = (
+                    self.tracer.start_span(trace, "bias_monitor")
+                    if trace is not None else None
+                )
+                bias_assessment = self.bias_monitor.assess(result.answer)
+                result.bias = bias_assessment
+                if bias_span is not None:
+                    self.tracer.end_span(
+                        bias_span,
+                        metadata={
+                            "biased": bias_assessment.biased,
+                            "categories": bias_assessment.categories,
+                            "score": bias_assessment.score,
+                        },
+                    )
+                if self.block_biased and bias_assessment.biased:
+                    logger.info(
+                        "Orchestrator: bias block (answer) — categories=%s score=%.2f",
+                        bias_assessment.categories,
+                        bias_assessment.score,
+                    )
+                    bias_blocked = True
+                    result.answer = BIAS_REFUSAL
+                    result.citations = []
+                    result.bias_blocked = True
+                    answer = BIAS_REFUSAL
+            if output_blocked or low_conf_blocked or bias_blocked:
+                result.guardrail_replacement = result.answer
             if trace is not None:
                 result.trace_id = trace.id
             return answer, result, docs

@@ -25,6 +25,7 @@ from api.conversation import DEFAULT_DB_PATH, ConversationStore
 from api.guardrails import GuardrailSuite
 from api.nim_guardrails import build_guardrail_suite
 from api.observability import CircuitBreaker, LangfuseTracer, MetricsCollector
+from rag.bias_monitor import BiasMonitor
 from rag.context_assembler import ContextAssembler
 from rag.nim_generator import build_generator
 from rag.nim_reranker import build_reranker, get_rerank_candidate_k
@@ -40,6 +41,23 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_CORPUS_DIR: str = os.getenv("CORPUS_DIR", "data/corpus")
 """Default corpus directory for the ``/api/v1/ingest`` endpoint."""
+
+BLOCK_LOW_CONFIDENCE: bool = os.getenv("BLOCK_LOW_CONFIDENCE", "").lower() in {
+    "1", "true", "yes", "on",
+}
+"""When true, the orchestrator replaces answers whose post-processor
+groundedness score falls below ``CONFIDENCE_THRESHOLD`` with a
+``LOW_CONFIDENCE_REFUSAL`` (hallucination block), mirroring the output
+guardrail block. Default false — preserves the warn-only UI behavior."""
+
+BLOCK_BIASED: bool = os.getenv("BLOCK_BIASED", "").lower() in {
+    "1", "true", "yes", "on",
+}
+"""When true, the orchestrator replaces answers the bias & fairness monitor
+flags as biased with a ``BIAS_REFUSAL`` (Responsible AI block), mirroring
+the output guardrail + hallucination block. Default false — preserves the
+monitor-only behavior (the ``BiasAssessment`` is still recorded on the
+result for metrics)."""
 
 
 @lru_cache
@@ -114,6 +132,9 @@ def get_orchestrator() -> RAGOrchestrator:
         reranker=get_reranker(),
         query_decomposer=LLMQueryDecomposer(),
         query_clarifier=LLMQueryClarifier(),
+        block_low_confidence=BLOCK_LOW_CONFIDENCE,
+        bias_monitor=BiasMonitor(),
+        block_biased=BLOCK_BIASED,
     )
 
 

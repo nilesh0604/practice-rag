@@ -188,6 +188,10 @@ class _MetricsState:
     cache_hits: int = 0
     cache_misses: int = 0
     ttft_samples: deque = field(default_factory=lambda: deque(maxlen=MAX_TTFT_SAMPLES))
+    bias_checks: int = 0
+    biased_answers: int = 0
+    bias_blocks: int = 0
+    bias_category_counts: dict[str, int] = field(default_factory=dict)
 
 
 class MetricsCollector:
@@ -226,6 +230,30 @@ class MetricsCollector:
         with self._lock:
             self._state.ttft_samples.append(seconds)
 
+    def record_bias_check(
+        self,
+        biased: bool,
+        categories: list[str] | None = None,
+        blocked: bool = False,
+    ) -> None:
+        """Record a bias & fairness check result (Responsible AI).
+
+        Increments the bias-check counter, the biased-answer counter when
+        ``biased`` is True, the bias-block counter when ``blocked`` is True,
+        and the per-category counts for each category in ``categories``.
+        Surfaces the bias monitoring metrics in ``GET /api/v1/metrics``.
+        """
+        with self._lock:
+            self._state.bias_checks += 1
+            if biased:
+                self._state.biased_answers += 1
+            if blocked:
+                self._state.bias_blocks += 1
+            for cat in categories or []:
+                self._state.bias_category_counts[cat] = (
+                    self._state.bias_category_counts.get(cat, 0) + 1
+                )
+
     def evaluate_ttft_slo(
         self,
         target_s: float = TTFT_SLO_TARGET_S,
@@ -260,6 +288,8 @@ class MetricsCollector:
             hits = self._state.cache_hits
             misses = self._state.cache_misses
             total_cache = hits + misses
+            bias_checks = self._state.bias_checks
+            biased = self._state.biased_answers
             return {
                 "requests": self._state.requests,
                 "errors": self._state.errors,
@@ -277,6 +307,13 @@ class MetricsCollector:
                     "max_s": max(samples) if samples else 0.0,
                 },
                 "slo": _ttft_slo(samples, TTFT_SLO_TARGET_S, TTFT_SLO_PERCENTILE),
+                "bias": {
+                    "checks": bias_checks,
+                    "biased_answers": biased,
+                    "blocks": self._state.bias_blocks,
+                    "bias_rate": (biased / bias_checks) if bias_checks else 0.0,
+                    "categories": dict(self._state.bias_category_counts),
+                },
             }
 
     def reset(self) -> None:

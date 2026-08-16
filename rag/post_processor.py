@@ -27,6 +27,7 @@ import re
 from dataclasses import dataclass, field
 
 from ingestion.embedder import Embedder
+from rag.bias_monitor import BiasAssessment
 from schemas.chat import Citation
 from schemas.documents import RetrievedDoc
 
@@ -69,6 +70,20 @@ class PostProcessResult:
     frame from this so the frontend can swap the visible message (SSE is
     one-way — the original tokens cannot be un-sent). ``None`` means no
     output block occurred (or no guardrail suite is configured)."""
+    bias: BiasAssessment | None = None
+    """Set by the orchestrator after the bias & fairness monitor runs on
+    the final answer (Responsible AI). Carries the ``BiasAssessment``
+    (biased flag, categories, evidence, score) so the chat route can
+    record bias metrics via ``MetricsCollector.record_bias_check``.
+    ``None`` means no bias monitor is configured or the check was skipped
+    (e.g. the output guardrail / hallucination block already replaced the
+    answer with a canned refusal)."""
+    bias_blocked: bool = False
+    """Set by the orchestrator to True when the bias block fired
+    (``block_biased=True`` and the monitor flagged the answer as biased).
+    Distinct from ``bias.biased`` (which is the monitor's verdict) so the
+    chat route can record the block count even when the answer was
+    replaced with ``BIAS_REFUSAL``."""
 
 
 class PostProcessor:

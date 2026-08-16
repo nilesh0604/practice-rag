@@ -5,6 +5,134 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added — GDPR Art. 17 right-to-erasure endpoint
+
+A new `DELETE /api/v1/history/{session_id}` endpoint allows users to erase all
+persisted conversation data (messages and feedback) for a session, implementing
+the GDPR Art. 17 right to erasure.
+
+- `api/conversation.py`:
+  - `ConversationStore.erase_session(session_id)` deletes every message and
+    feedback row for a session and returns the number of rows removed from
+    each table.
+- `api/routes/history.py`:
+  - New `DELETE /api/v1/history/{session_id}` route. Returns 404 for an unknown
+    session or an `ErasureResponse` with `session_id`, `messages_deleted`,
+    `feedback_deleted`, and `erased_at` on success.
+- `tests/test_api_history.py`:
+  - `TestErasureEndpoint` covers successful erasure and 404 for unknown
+    sessions.
+
+### Added — Bias & fairness monitoring (Responsible AI)
+
+A bias & fairness monitor now runs after the output guardrail + hallucination
+block to detect potentially biased or non-inclusive language in the assistant's
+answer. Monitor-only by default; an opt-in block replaces a biased answer with
+a refusal (same SSE swap mechanism as the output guardrail + hallucination
+block).
+
+- `rag/bias_monitor.py` (new):
+  - `BiasMonitor` — two-tier check: (1) heuristic regex (always, deterministic)
+    flags gendered pronouns in generic context (`he`/`she`/`his`/`her`/
+    `himself`/`herself`, word-boundary matched so `the`/`this`/`shepherd` are
+    not false positives), gendered address terms (`guys`/`gals`/`ladies`/
+    `gentlemen`/`fellas`/`boys`/`girls`), and stereotypical ability claims
+    (`men are`/`women can't`/`boys should` with a verb lookahead so neutral
+    enumerations like `men and women` are not flagged); (2) optional local LLM
+    judge (`biased`/`neutral`, degrades to heuristic-only on error). When the
+    LLM judge flags bias but the heuristic found nothing, the `llm_flagged`
+    category is added so the category breakdown distinguishes regex hits from
+    LLM-only flags.
+  - `BiasAssessment` dataclass — biased flag, deduplicated categories, evidence
+    snippets (truncated to 80 chars), severity score (heuristic-derived when
+    only the regex tier fired, 1.0 when the LLM judge confirms bias, 0.0 when
+    not biased).
+  - `PassthroughBiasMonitor` — no-op default so the orchestrator code path
+    stays uniform.
+- `rag/post_processor.py`:
+  - `PostProcessResult` gains `bias: BiasAssessment | None` and
+    `bias_blocked: bool` fields. The orchestrator sets `bias` after the monitor
+    runs and `bias_blocked` when the block fires.
+- `rag/orchestrator.py`:
+  - New `BIAS_REFUSAL` constant.
+  - New `bias_monitor: BiasMonitor | None` and `block_biased: bool = False`
+    constructor params.
+  - `stream_answer` / `answer`: after the output guardrail + hallucination
+    block (skipped when either already blocked — a canned refusal is not
+    biased content worth blocking), runs the bias monitor on the final answer,
+    attaches the `BiasAssessment` to the result, and (when `block_biased` is
+    on and the monitor flags bias) replaces the answer with `BIAS_REFUSAL`,
+    clears citations, sets `bias_blocked`, and sets `guardrail_replacement`
+    on the streaming path (same swap mechanism). A `bias_monitor` Langfuse
+    span captures the verdict, categories, and score. The sensitive buffered
+    path replaces the persisted answer but emits no swap event (single-delta
+    invariant).
+- `api/deps.py`:
+  - New `BLOCK_BIASED` env flag (parsed from `BLOCK_BIASED`, default `""` →
+    monitor-only), wired into `get_orchestrator()` with a `BiasMonitor()`.
+- `api/observability.py`:
+  - `MetricsCollector` gains `record_bias_check(biased, categories, blocked)`
+    and a `bias` block in `snapshot()` — checks, biased answers, blocks, bias
+    rate, per-category counts. Surfaces bias monitoring metrics in
+    `GET /api/v1/metrics`.
+- `api/routes/chat.py`:
+  - `build_event_stream` records the bias check result via
+    `metrics.record_bias_check(...)` from `result.bias` + `result.bias_blocked`.
+- `tests/test_bias_monitor.py` (new): heuristic tier (pronouns, address,
+  stereotypes, false-positive avoidance, evidence truncation), LLM judge
+  (confirmation, LLM-only flag, neutral override, error degradation, prompt
+  format, model/token config), passthrough monitor, `BiasAssessment` defaults.
+- `tests/test_rag_orchestrator.py`: new `TestBiasMonitorStream` /
+  `TestBiasMonitorAnswer` / `TestBiasMonitorSensitive` classes covering block
+  replacement, `guardrail_replacement` wiring, citation clearing, monitor-only
+  mode, assessment recording, output-block + low-confidence-block precedence
+  (bias monitor skipped), and the sensitive-path no-swap invariant.
+- `tests/test_observability.py`: new `TestBiasMetrics` class covering
+  `record_bias_check` + snapshot `bias` block (clean, biased, blocked, mixed
+  rate, category accumulation, reset).
+- `docs/CHAT_ASSISTANT_FEATURES.md`: Bias & fairness monitoring row updated
+  from ❌ to 🟡 (monitor-only by default + opt-in block); summary table +
+  bottom line updated.
+- `docs/F500_ENTERPRISE_ACTION_ITEMS.md`: new item 14 tracking the
+  heuristic + 3B LLM judge workaround (no eval gate / no per-demographic-group
+  parity metrics / no red-team corpus / no audit log / no human review loop).
+
+### Added — Hallucination output block (low-confidence grounding refusal)
+
+The hallucination check (post-processor groundedness score) can now **block**
+a low-groundedness answer instead of only warning the user. Gated by the
+`BLOCK_LOW_CONFIDENCE` env flag (default `""` → warn-only behavior preserved).
+
+- `rag/orchestrator.py`:
+  - New `LOW_CONFIDENCE_REFUSAL` constant.
+  - New `block_low_confidence: bool = False` constructor param.
+  - `stream_answer` / `answer`: after post-processing, when
+    `block_low_confidence` is on, the output guardrail did not already block,
+    and `result.low_confidence` is True, the answer is replaced with
+    `LOW_CONFIDENCE_REFUSAL` and citations are cleared. On the streaming path
+    `guardrail_replacement` is set (same SSE swap mechanism as the output
+    guardrail) so the frontend replaces the already-streamed tokens. The real
+    (low) confidence is preserved on the result so metadata + metrics capture
+    the grounding failure. The sensitive buffered path replaces the persisted
+    answer but emits no swap event (single-delta invariant). The non-streaming
+    `answer` method applies the same block and sets `guardrail_replacement`.
+- `api/deps.py`:
+  - New `BLOCK_LOW_CONFIDENCE` env flag (parsed from `BLOCK_LOW_CONFIDENCE`),
+    wired into `get_orchestrator()`.
+- `tests/test_rag_orchestrator.py`:
+  - `_build_orchestrator` now sets `low_confidence` from the confidence score
+    and accepts `block_low_confidence`.
+  - New `TestLowConfidenceBlockStream` / `TestLowConfidenceBlockAnswer` /
+    `TestLowConfidenceBlockSensitive` classes covering block replacement,
+    `guardrail_replacement` wiring, citation clearing, high-confidence
+    passthrough, default warn-only, output-block precedence, and the
+    sensitive-path no-swap invariant.
+- `docs/CHAT_ASSISTANT_FEATURES.md`: hallucination-check line updated to
+  describe both modes (warn-only default + opt-in output block).
+- `docs/F500_ENTERPRISE_ACTION_ITEMS.md`: new item 9 tracking the global
+  cosine-threshold workaround (no per-domain calibration, no eval gate/FPR
+  SLO on the block decision, 3B local embedder decides grounding).
+
 ### Added — PII detection on input + content-safety LLM judge on input
 
 The input guardrail (`InputGuardrail`) now has a four-tier check instead

@@ -27,7 +27,9 @@ def _make_doc(title="Doc", content="content", score=0.9):
     )
 
 
-def _build_orchestrator(tokens=None, docs=None, confidence=0.9):
+def _build_orchestrator(
+    tokens=None, docs=None, confidence=0.9, block_low_confidence=False,
+):
     """Build an orchestrator with all mocked collaborators."""
     if tokens is None:
         tokens = ["Hello", " world"]
@@ -48,12 +50,16 @@ def _build_orchestrator(tokens=None, docs=None, confidence=0.9):
         answer="".join(tokens),
         citations=[],
         confidence=confidence,
+        low_confidence=confidence < 0.65,
     )
 
     rewriter = MagicMock()
     rewriter.rewrite.return_value = "rewritten query"
 
-    return RAGOrchestrator(retriever, assembler, generator, pp, rewriter), {
+    return RAGOrchestrator(
+        retriever, assembler, generator, pp, rewriter,
+        block_low_confidence=block_low_confidence,
+    ), {
         "retriever": retriever,
         "assembler": assembler,
         "generator": generator,
@@ -1104,4 +1110,356 @@ class TestMergeDocs:
             [_make_doc_id("a")], [_make_doc_id("b")],
         )
         assert {d.id for d in merged} == {"a", "b"}
+
+
+# ── Hallucination block (low-confidence grounding) ────────────────────
+
+
+class TestLowConfidenceBlockStream:
+    """When ``block_low_confidence=True`` and the post-processor reports a
+    low groundedness score, the streaming path replaces the answer with the
+    low-confidence refusal and sets ``guardrail_replacement`` (same swap
+    mechanism as the output guardrail)."""
+
+    def test_low_confidence_blocked_replaces_answer(self):
+        orch, _ = _build_orchestrator(
+            tokens=["a", "b"], confidence=0.2, block_low_confidence=True,
+        )
+        items = list(orch.stream_answer("q"))
+        result = [i for i in items if isinstance(i, PostProcessResult)][0]
+        assert "not confident" in result.answer
+        # The real (low) confidence is preserved for metadata/metrics.
+        assert result.confidence == 0.2
+        assert result.low_confidence is True
+
+    def test_low_confidence_blocked_sets_guardrail_replacement(self):
+        orch, _ = _build_orchestrator(
+            tokens=["a", "b"], confidence=0.2, block_low_confidence=True,
+        )
+        items = list(orch.stream_answer("q"))
+        result = [i for i in items if isinstance(i, PostProcessResult)][0]
+        assert result.guardrail_replacement is not None
+        assert "not confident" in result.guardrail_replacement
+
+    def test_low_confidence_blocked_clears_citations(self):
+        """A refused answer must not link to sources that 'support' it."""
+        orch, _ = _build_orchestrator(
+            tokens=["a", "b"], confidence=0.2, block_low_confidence=True,
+        )
+        items = list(orch.stream_answer("q"))
+        result = [i for i in items if isinstance(i, PostProcessResult)][0]
+        assert result.citations == []
+
+    def test_high_confidence_not_blocked(self):
+        """Above the threshold the answer passes through unchanged."""
+        orch, _ = _build_orchestrator(
+            tokens=["a", "b"], confidence=0.9, block_low_confidence=True,
+        )
+        items = list(orch.stream_answer("q"))
+        result = [i for i in items if isinstance(i, PostProcessResult)][0]
+        assert result.answer == "ab"
+        assert result.guardrail_replacement is None
+
+    def test_disabled_by_default_warn_only(self):
+        """Without ``block_low_confidence`` the low-score answer is delivered
+        as-is (the frontend renders the warn-only UI banner)."""
+        orch, _ = _build_orchestrator(tokens=["a", "b"], confidence=0.2)
+        items = list(orch.stream_answer("q"))
+        result = [i for i in items if isinstance(i, PostProcessResult)][0]
+        assert result.answer == "ab"
+        assert result.guardrail_replacement is None
+
+    def test_output_block_takes_precedence_over_low_confidence(self):
+        """When the output guardrail blocks, the low-confidence check is
+        skipped (the refusal is already the output refusal)."""
+        suite = _mock_guardrail_suite(output_blocked=True)
+        orch, mocks = _build_with_guardrails_low_conf(
+            suite, tokens=["harmful", " text"], confidence=0.1,
+        )
+        items = list(orch.stream_answer("q"))
+        result = [i for i in items if isinstance(i, PostProcessResult)][0]
+        # Output refusal wins over the low-confidence refusal.
+        assert "can't provide" in result.answer
+        assert "not confident" not in result.answer
+
+
+class TestLowConfidenceBlockAnswer:
+    """Non-streaming ``answer`` method applies the same block."""
+
+    def test_low_confidence_blocked_replaces_returned_answer(self):
+        orch, _ = _build_orchestrator(
+            tokens=["a", "b"], confidence=0.1, block_low_confidence=True,
+        )
+        answer, result, _docs = orch.answer("q")
+        assert "not confident" in answer
+        assert "not confident" in result.answer
+        assert result.guardrail_replacement is not None
+
+    def test_high_confidence_not_blocked_answer(self):
+        orch, _ = _build_orchestrator(
+            tokens=["a", "b"], confidence=0.9, block_low_confidence=True,
+        )
+        answer, result, _docs = orch.answer("q")
+        assert answer == "ab"
+        assert result.guardrail_replacement is None
+
+
+class TestLowConfidenceBlockSensitive:
+    """Sensitive buffered path: the low-confidence block replaces the
+    persisted answer but does NOT set ``guardrail_replacement`` (the single
+    delta was already the final delivered token — nothing to swap), matching
+    the output-guardrail sensitive-path invariant."""
+
+    def test_sensitive_low_confidence_no_guardrail_replacement(self):
+        suite = _mock_guardrail_suite(classification_label="sensitive")
+        orch, _ = _build_with_guardrails_low_conf(
+            suite, tokens=["some", " answer"], confidence=0.1,
+        )
+        items = list(orch.stream_answer("how to hack"))
+        result = [i for i in items if isinstance(i, PostProcessResult)][0]
+        # Persisted answer is the refusal...
+        assert "not confident" in result.answer
+        # ...but no swap event (sensitive single-delta invariant).
+        assert result.guardrail_replacement is None
+
+
+# Helper reused by the low-confidence + guardrail tests above: builds an
+# orchestrator with both a guardrail suite and block_low_confidence=True,
+# echoing the input answer in the post-processor so the refusal text the
+# orchestrator substitutes is visible in the returned PostProcessResult.
+def _build_with_guardrails_low_conf(suite, tokens=None, confidence=0.9):
+    if tokens is None:
+        tokens = ["Hello", " world"]
+    docs = [_make_doc(title="D", content="c")]
+    retriever = MagicMock()
+    retriever.retrieve.return_value = docs
+    assembler = MagicMock()
+    assembler.assemble.return_value = "ctx"
+    generator = MagicMock()
+    generator.stream.return_value = iter(tokens)
+    pp = MagicMock()
+    pp.post_process.side_effect = lambda answer, retrieved_docs: PostProcessResult(
+        answer=answer, confidence=confidence,
+        low_confidence=confidence < 0.65,
+    )
+    orch = RAGOrchestrator(
+        retriever, assembler, generator, pp, guardrail_suite=suite,
+        block_low_confidence=True,
+    )
+    return orch, {"retriever": retriever, "pp": pp}
+
+
+# ── Bias & fairness monitor integration ───────────────────────────────
+
+
+def _build_with_bias_monitor(
+    tokens=None,
+    confidence=0.9,
+    block_biased=False,
+    bias_assessment=None,
+):
+    """Build an orchestrator with a mocked bias monitor.
+
+    The post-processor echoes the input answer so the bias block refusal
+    text is visible in the returned PostProcessResult. The bias monitor is
+    a MagicMock returning the supplied ``bias_assessment`` (default: a
+    clean assessment).
+    """
+    from rag.bias_monitor import BiasAssessment
+
+    if tokens is None:
+        tokens = ["Hello", " world"]
+    docs = [_make_doc(title="D", content="c")]
+    retriever = MagicMock()
+    retriever.retrieve.return_value = docs
+    assembler = MagicMock()
+    assembler.assemble.return_value = "ctx"
+    generator = MagicMock()
+    generator.stream.return_value = iter(tokens)
+    pp = MagicMock()
+    pp.post_process.side_effect = lambda answer, retrieved_docs: PostProcessResult(
+        answer=answer, confidence=confidence,
+        low_confidence=confidence < 0.65,
+    )
+    bias_monitor = MagicMock()
+    bias_monitor.assess.return_value = bias_assessment or BiasAssessment()
+    orch = RAGOrchestrator(
+        retriever, assembler, generator, pp,
+        block_biased=block_biased, bias_monitor=bias_monitor,
+    )
+    return orch, {"retriever": retriever, "pp": pp, "bias_monitor": bias_monitor}
+
+
+class TestBiasMonitorStream:
+    """Streaming path: the bias monitor runs after the output guardrail +
+    hallucination block. When ``block_biased=True`` and the monitor flags
+    the answer, the answer is replaced with ``BIAS_REFUSAL`` and
+    ``guardrail_replacement`` is set (same swap mechanism)."""
+
+    def test_clean_answer_not_blocked(self):
+        from rag.bias_monitor import BiasAssessment
+
+        orch, mocks = _build_with_bias_monitor(
+            tokens=["a", "b"], block_biased=True,
+            bias_assessment=BiasAssessment(biased=False),
+        )
+        items = list(orch.stream_answer("q"))
+        result = [i for i in items if isinstance(i, PostProcessResult)][0]
+        assert result.answer == "ab"
+        assert result.guardrail_replacement is None
+        assert result.bias_blocked is False
+
+    def test_biased_answer_blocked_replaces_answer(self):
+        from rag.bias_monitor import BiasAssessment
+
+        orch, mocks = _build_with_bias_monitor(
+            tokens=["He", " deploys"], block_biased=True,
+            bias_assessment=BiasAssessment(biased=True, categories=["gendered_pronoun"], score=1.0),
+        )
+        items = list(orch.stream_answer("q"))
+        result = [i for i in items if isinstance(i, PostProcessResult)][0]
+        assert "non-inclusive" in result.answer
+        assert result.bias_blocked is True
+
+    def test_biased_answer_blocked_sets_guardrail_replacement(self):
+        from rag.bias_monitor import BiasAssessment
+
+        orch, _ = _build_with_bias_monitor(
+            tokens=["He", " deploys"], block_biased=True,
+            bias_assessment=BiasAssessment(biased=True, score=1.0),
+        )
+        items = list(orch.stream_answer("q"))
+        result = [i for i in items if isinstance(i, PostProcessResult)][0]
+        assert result.guardrail_replacement is not None
+        assert "non-inclusive" in result.guardrail_replacement
+
+    def test_biased_answer_blocked_clears_citations(self):
+        from rag.bias_monitor import BiasAssessment
+
+        orch, _ = _build_with_bias_monitor(
+            tokens=["He", " deploys"], block_biased=True,
+            bias_assessment=BiasAssessment(biased=True, score=1.0),
+        )
+        items = list(orch.stream_answer("q"))
+        result = [i for i in items if isinstance(i, PostProcessResult)][0]
+        assert result.citations == []
+
+    def test_biased_answer_monitor_only_when_block_disabled(self):
+        """Without ``block_biased`` the biased answer is delivered as-is
+        but the assessment is still recorded on the result."""
+        from rag.bias_monitor import BiasAssessment
+
+        orch, _ = _build_with_bias_monitor(
+            tokens=["He", " deploys"], block_biased=False,
+            bias_assessment=BiasAssessment(biased=True, categories=["gendered_pronoun"], score=0.25),
+        )
+        items = list(orch.stream_answer("q"))
+        result = [i for i in items if isinstance(i, PostProcessResult)][0]
+        assert result.answer == "He deploys"
+        assert result.guardrail_replacement is None
+        assert result.bias_blocked is False
+        assert result.bias is not None
+        assert result.bias.biased is True
+
+    def test_bias_assessment_recorded_on_result(self):
+        from rag.bias_monitor import BiasAssessment
+
+        orch, _ = _build_with_bias_monitor(
+            tokens=["a", "b"], block_biased=False,
+            bias_assessment=BiasAssessment(biased=False, categories=[], score=0.0),
+        )
+        items = list(orch.stream_answer("q"))
+        result = [i for i in items if isinstance(i, PostProcessResult)][0]
+        assert result.bias is not None
+        assert result.bias.biased is False
+
+    def test_output_block_skips_bias_monitor(self):
+        """When the output guardrail blocks, the bias monitor is skipped
+        (a canned refusal is not biased content worth blocking)."""
+        suite = _mock_guardrail_suite(output_blocked=True)
+        from rag.bias_monitor import BiasAssessment
+
+        orch, mocks = _build_with_bias_monitor(
+            tokens=["harmful", " text"], block_biased=True,
+            bias_assessment=BiasAssessment(biased=True, score=1.0),
+        )
+        orch.guardrail_suite = suite
+        items = list(orch.stream_answer("q"))
+        result = [i for i in items if isinstance(i, PostProcessResult)][0]
+        # Output refusal wins over the bias refusal.
+        assert "can't provide" in result.answer
+        assert "non-inclusive" not in result.answer
+        # Bias monitor was not called.
+        mocks["bias_monitor"].assess.assert_not_called()
+        assert result.bias is None
+
+    def test_low_confidence_block_skips_bias_monitor(self):
+        """When the hallucination block fires, the bias monitor is skipped."""
+        from rag.bias_monitor import BiasAssessment
+
+        orch, mocks = _build_with_bias_monitor(
+            tokens=["a", "b"], confidence=0.1, block_biased=True,
+            bias_assessment=BiasAssessment(biased=True, score=1.0),
+        )
+        orch.block_low_confidence = True
+        items = list(orch.stream_answer("q"))
+        result = [i for i in items if isinstance(i, PostProcessResult)][0]
+        assert "not confident" in result.answer
+        assert "non-inclusive" not in result.answer
+        mocks["bias_monitor"].assess.assert_not_called()
+        assert result.bias is None
+
+
+class TestBiasMonitorAnswer:
+    """Non-streaming ``answer`` method applies the same bias block."""
+
+    def test_biased_answer_blocked_replaces_returned_answer(self):
+        from rag.bias_monitor import BiasAssessment
+
+        orch, _ = _build_with_bias_monitor(
+            tokens=["He", " deploys"], block_biased=True,
+            bias_assessment=BiasAssessment(biased=True, score=1.0),
+        )
+        answer, result, _docs = orch.answer("q")
+        assert "non-inclusive" in answer
+        assert "non-inclusive" in result.answer
+        assert result.guardrail_replacement is not None
+        assert result.bias_blocked is True
+
+    def test_clean_answer_not_blocked_answer(self):
+        from rag.bias_monitor import BiasAssessment
+
+        orch, _ = _build_with_bias_monitor(
+            tokens=["a", "b"], block_biased=True,
+            bias_assessment=BiasAssessment(biased=False),
+        )
+        answer, result, _docs = orch.answer("q")
+        assert answer == "ab"
+        assert result.guardrail_replacement is None
+        assert result.bias_blocked is False
+
+
+class TestBiasMonitorSensitive:
+    """Sensitive buffered path: the bias block replaces the persisted
+    answer but does NOT set ``guardrail_replacement`` (the single delta
+    was already the final delivered token — nothing to swap), matching
+    the output-guardrail + hallucination-block sensitive-path invariant."""
+
+    def test_sensitive_bias_block_no_guardrail_replacement(self):
+        from rag.bias_monitor import BiasAssessment
+
+        suite = _mock_guardrail_suite(classification_label="sensitive")
+        orch, _ = _build_with_bias_monitor(
+            tokens=["He", " deploys"], block_biased=True,
+            bias_assessment=BiasAssessment(biased=True, score=1.0),
+        )
+        orch.guardrail_suite = suite
+        items = list(orch.stream_answer("how to hack"))
+        result = [i for i in items if isinstance(i, PostProcessResult)][0]
+        # Persisted answer is the refusal...
+        assert "non-inclusive" in result.answer
+        # ...but no swap event (sensitive single-delta invariant).
+        assert result.guardrail_replacement is None
+        assert result.bias_blocked is True
+
 

@@ -139,6 +139,19 @@ def build_event_stream(
         confidence=result.confidence,
     )
     cache.put(query, response)
+    # Responsible AI: record the bias & fairness check result (when a bias
+    # monitor ran) so the ``GET /api/v1/metrics`` snapshot surfaces bias
+    # monitoring metrics (checks, biased answers, blocks, per-category
+    # counts). ``result.bias`` is None when no monitor is configured or the
+    # check was skipped (output guardrail / hallucination block already
+    # replaced the answer with a canned refusal).
+    bias_assessment = getattr(result, "bias", None)
+    if bias_assessment is not None and metrics is not None:
+        metrics.record_bias_check(
+            biased=bias_assessment.biased,
+            categories=bias_assessment.categories,
+            blocked=getattr(result, "bias_blocked", False),
+        )
     # If the output guardrail blocked the streamed answer, tell the frontend
     # to swap the already-streamed tokens for the refusal (SSE is one-way,
     # so the deltas cannot be un-sent). Emitted before `sources` so the UI

@@ -410,6 +410,72 @@ class TestMetricsCollectorTtftSlo:
 
 
 # ════════════════════════════════════════════════════════════════════════
+# Bias & fairness metrics (Responsible AI)
+# ════════════════════════════════════════════════════════════════════════
+
+
+class TestBiasMetrics:
+    def test_initial_snapshot_bias_zeroed(self):
+        mc = MetricsCollector()
+        snap = mc.snapshot()["bias"]
+        assert snap["checks"] == 0
+        assert snap["biased_answers"] == 0
+        assert snap["blocks"] == 0
+        assert snap["bias_rate"] == 0.0
+        assert snap["categories"] == {}
+
+    def test_record_bias_check_clean(self):
+        mc = MetricsCollector()
+        mc.record_bias_check(biased=False)
+        snap = mc.snapshot()["bias"]
+        assert snap["checks"] == 1
+        assert snap["biased_answers"] == 0
+        assert snap["bias_rate"] == 0.0
+
+    def test_record_bias_check_biased(self):
+        mc = MetricsCollector()
+        mc.record_bias_check(biased=True, categories=["gendered_pronoun"])
+        snap = mc.snapshot()["bias"]
+        assert snap["checks"] == 1
+        assert snap["biased_answers"] == 1
+        assert snap["bias_rate"] == 1.0
+        assert snap["categories"] == {"gendered_pronoun": 1}
+
+    def test_record_bias_check_blocked(self):
+        mc = MetricsCollector()
+        mc.record_bias_check(biased=True, categories=["gendered_pronoun"], blocked=True)
+        snap = mc.snapshot()["bias"]
+        assert snap["blocks"] == 1
+
+    def test_bias_rate_mixed(self):
+        mc = MetricsCollector()
+        mc.record_bias_check(biased=False)
+        mc.record_bias_check(biased=True, categories=["gendered_pronoun"])
+        mc.record_bias_check(biased=False)
+        snap = mc.snapshot()["bias"]
+        assert snap["checks"] == 3
+        assert snap["biased_answers"] == 1
+        assert snap["bias_rate"] == pytest.approx(1 / 3)
+
+    def test_category_counts_accumulate(self):
+        mc = MetricsCollector()
+        mc.record_bias_check(biased=True, categories=["gendered_pronoun", "stereotype"])
+        mc.record_bias_check(biased=True, categories=["gendered_pronoun"])
+        snap = mc.snapshot()["bias"]
+        assert snap["categories"] == {"gendered_pronoun": 2, "stereotype": 1}
+
+    def test_reset_clears_bias_metrics(self):
+        mc = MetricsCollector()
+        mc.record_bias_check(biased=True, categories=["gendered_pronoun"], blocked=True)
+        mc.reset()
+        snap = mc.snapshot()["bias"]
+        assert snap["checks"] == 0
+        assert snap["biased_answers"] == 0
+        assert snap["blocks"] == 0
+        assert snap["categories"] == {}
+
+
+# ════════════════════════════════════════════════════════════════════════
 # LangfuseTracer
 # ════════════════════════════════════════════════════════════════════════
 

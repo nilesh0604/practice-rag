@@ -37,3 +37,27 @@ class TestHistoryEndpoint:
         resp = client.get(f"/api/v1/history/{sid}")
         assert resp.status_code == 200
         assert resp.json()["messages"] == [{"role": "user", "content": "q", "citations": None, "confidence": None, "created_at": resp.json()["messages"][0]["created_at"]}]
+
+
+class TestErasureEndpoint:
+    def test_erases_messages_and_feedback(self, client, mem_store):
+        sid = mem_store.create_session()
+        mem_store.add_message(sid, "user", "hello")
+        mem_store.add_message(sid, "assistant", "hi there")
+        mem_store.add_feedback(sid, 0, "up", "great")
+
+        resp = client.delete(f"/api/v1/history/{sid}")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["session_id"] == sid
+        assert body["messages_deleted"] == 2
+        assert body["feedback_deleted"] == 1
+        assert "erased_at" in body
+
+        assert not mem_store.session_exists(sid)
+        assert mem_store.get_messages(sid) == []
+        assert mem_store.get_feedback(sid) == []
+
+    def test_404_for_unknown_session(self, client):
+        resp = client.delete("/api/v1/history/sess_unknown")
+        assert resp.status_code == 404

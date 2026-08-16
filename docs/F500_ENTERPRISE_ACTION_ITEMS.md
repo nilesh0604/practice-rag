@@ -428,21 +428,124 @@ A new `CLASS_SENSITIVE` label is detected by (1) an LLM classifier prompt additi
 
 ---
 
+## 12. Hallucination block — global cosine threshold (no eval gate / no per-domain calibration)
+
+**Files:** `rag/post_processor.py` (`compute_groundedness`, `CONFIDENCE_THRESHOLD`), `rag/orchestrator.py` (`LOW_CONFIDENCE_REFUSAL`, `block_low_confidence`), `api/deps.py` (`BLOCK_LOW_CONFIDENCE`)
+
+### Enterprise-standard practice
+
+A hallucination / groundedness gate that **blocks** an answer (not just warns) is a safety-critical decision. An enterprise would:
+
+- **Calibrate the threshold per domain / query type** — a single global cosine cutoff (0.65) over-fits one corpus; technical docs, policy docs, and conversational follow-ups have different grounding distributions.
+- **Eval-gate the block decision** with a labeled dataset (grounded vs. hallucinated answers) and gate promotion on **FPR ≤ 2%** (over-blocking frustrates users with valid answers) and **FNR ≤ 5%** (under-blocking lets hallucinations through — the very thing the gate exists to prevent).
+- **Use a production-grade embedding model** (`text-embedding-ada-002` / equivalent) for the grounding score — not a 768d local model whose cosine distribution is uncharacterized.
+- **Track block metrics** — `low_confidence_block_rate`, `groundedness_score_distribution` — as quality observability (same gap as item 6).
+- **Audit-log** `{query, answer, groundedness_score, blocked}` for incident forensics and threshold-drift triage.
+- **Prefer a faithfulness LLM judge** (Ragas faithfulness / NLI-based entailment) over a single max-cosine heuristic — cosine similarity is a weak proxy for entailment (a high-cosine answer can still contradict the source).
+
+### Workaround shipped
+
+When `BLOCK_LOW_CONFIDENCE=true`, the orchestrator replaces any answer whose `compute_groundedness` max-cosine score is below `CONFIDENCE_THRESHOLD` (0.65) with `LOW_CONFIDENCE_REFUSAL`, clears citations, and (streaming path) sets `guardrail_replacement` so the SSE layer swaps the already-streamed tokens. Default off (warn-only UI banner). The threshold is a single global constant; the embedder is the local `nomic-embed-text` (768d); there is no eval gate, no FPR/FNR SLO, no per-domain calibration, no block metrics, no audit log, and the decision is a max-cosine heuristic (not an entailment/faithfulness judge).
+
+### Reasoning for the workaround
+
+- This is a **local, $0-cost, single-user practice project** (per README + architecture doc deviations D1/D2).
+- The block is **opt-in** (default off) so the warn-only behavior is preserved — the block is a capability demonstration, not a forced gate on every request.
+- The max-cosine heuristic is the architecture doc's own `groundedness()` pseudocode — faithful to the spec for the practice stage.
+- The real (low) confidence is preserved on the result so the grounding failure is still observable in metadata/metrics even when the block fires.
+
+### Future action item
+
+1. **Calibrate the threshold per domain** — compute the groundedness-score distribution on a labeled grounded-vs-hallucinated eval set and set a per-corpus (or per-query-type) threshold instead of a single global 0.65.
+2. **Build a labeled eval set** (grounded answers + known hallucinations) and gate the block on **FPR ≤ 2%**, **FNR ≤ 5%** — extend `eval/golden-dataset.json` with groundedness labels.
+3. **Swap the grounding model** to `text-embedding-ada-002` (or equivalent) — or replace the cosine heuristic with a **faithfulness/entailment LLM judge** (Ragas faithfulness, NLI-based) that captures contradiction, not just similarity.
+4. **Add block metrics** to `MetricsCollector` (`low_confidence_block_rate`, `groundedness_score_distribution`) and expose in `GET /api/v1/metrics` — same as item 6.
+5. **Audit-log** `{query, answer_hash, groundedness_score, blocked}` to the trace/metrics for forensics and threshold-drift triage.
+6. **Wire the block eval into CI** as a blocking gate on any threshold / embedder / grounding-model change.
+
+## 14. Bias & fairness monitor — heuristic + 3B LLM judge (no eval gate / no parity metrics)
+
+**Files:** `rag/bias_monitor.py` (`BiasMonitor`, `detect_bias_heuristic`, `BIAS_JUDGE_PROMPT`), `rag/orchestrator.py` (`stream_answer` / `answer` bias check, `BIAS_REFUSAL`), `api/deps.py` (`BLOCK_BIASED`), `api/observability.py` (`MetricsCollector.record_bias_check`)
+
+### Enterprise-standard practice
+
+Bias & fairness monitoring for an F500 AI assistant is a **compliance-relevant** capability. An enterprise would:
+
+- **Use a purpose-trained fairness model** (or a dedicated fairness-as-a-service offering) — not a 3B general-purpose chat model + a regex list — for bias classification.
+- **Eval-gate the monitor** with a labeled dataset (biased + neutral-technical + edge-case examples) and gate promotion on **FPR ≤ 2%** (over-flagging neutral technical answers kills UX) and **FNR ≤ 5%** (under-detecting lets biased content through).
+- **Track per-demographic-group fairness parity metrics** — demographic parity, equalized odds, disparate impact — across user cohorts, not just a single aggregate bias rate. The current monitor flags biased _language_ in an answer; it does not measure whether the system's _outcomes_ differ across demographic groups.
+- **Red-team the monitor** — adversarial paraphrases, coded/implicit bias, multi-turn escalation that avoids the regex markers (same gap as item 7).
+- **Audit-log** `{query, answer_hash, biased, categories, score, blocked}` for incident forensics and bias-drift triage.
+- **Calibrate the block threshold per domain** — a single global `block_biased` boolean (on/off) is the coarsest possible gate; an enterprise would calibrate per query type / corpus.
+- **Human review loop** — flagged-but-not-blocked answers should feed a review queue for fairness analysts, not just a metric counter.
+
+### Workaround shipped
+
+`BiasMonitor` runs a two-tier check after the output guardrail + hallucination block: (1) a heuristic regex tier (gendered pronouns in generic context, gendered address terms, stereotypical ability claims with a verb lookahead) and (2) an optional local LLM judge (`biased`/`neutral`, degrades to heuristic-only on error). The `BiasAssessment` (biased flag, categories, evidence snippets, severity score) is attached to `PostProcessResult.bias` and surfaced in `GET /api/v1/metrics` under the `bias` key. When `BLOCK_BIASED=true` the orchestrator replaces a biased answer with `BIAS_REFUSAL` (same SSE swap mechanism as the output guardrail + hallucination block). No eval gate, no FPR/FNR SLO, no per-demographic-group parity metrics, no red-team corpus, no audit log, no human review loop, and the LLM judge is a 3B general-purpose chat model. The heuristic is over-inclusive by design (a monitoring/warn tool, not a hard classifier) — it flags any standalone gendered pronoun even when the referent is a specific named person.
+
+### Reasoning for the workaround
+
+- This is a **local, $0-cost, single-user practice project** (per README + architecture doc deviations D1/D2).
+- The two-tier shape (heuristic + LLM judge + graceful degradation) is the correct architectural pattern — the gap is in the _classifier quality_ and the _parity metrics_, not the _delivery mechanism_. Closing the classifier-quality gap (purpose-trained model + eval gate) is the same work as items 1 & 2.
+- The heuristic regex tier ensures the monitor works without Ollama (defense-in-depth with the LLM judge).
+- The block is **opt-in** (default off) so the monitor-only behavior is preserved — the block is a capability demonstration, not a forced gate on every request.
+- The corpus is public technical docs (FastAPI/Pydantic/SQLModel) with minimal demographic content, so the bias blast radius is low for the practice stage.
+
+### Future action item
+
+1. **Swap the bias judge** to a purpose-trained fairness model (or fairness-as-a-service) behind a config flag — same as item 1.
+2. **Build a labeled eval set** (biased + neutral-technical + edge-case examples) and gate promotion on **FPR ≤ 2%**, **FNR ≤ 5%** — extend `eval/guardrail-dataset.json` with `biased`-labeled examples.
+3. **Add per-demographic-group fairness parity metrics** — demographic parity, equalized odds, disparate impact — across user cohorts. This requires user-cohort labeling (not present in the single-user practice app) and is a fundamentally different measurement from in-answer language bias detection.
+4. **Red-team the monitor** — adversarial paraphrases, coded/implicit bias, multi-turn escalation — same corpus as item 7.
+5. **Audit-log** `{query, answer_hash, biased, categories, score, blocked}` to the trace/metrics for forensics and bias-drift triage.
+6. **Calibrate the block threshold per domain** — replace the global `block_biased` boolean with a per-query-type / per-corpus threshold.
+7. **Human review loop** — feed flagged-but-not-blocked answers to a review queue for fairness analysts.
+8. **Wire the bias eval into CI** as a blocking gate on any bias-prompt / model / threshold change.
+
+---
+
 ## Summary table
 
-| #   | Gap                                     | Workaround                                                     | Severity | Blocks production?                                                 |
-| --- | --------------------------------------- | -------------------------------------------------------------- | -------- | ------------------------------------------------------------------ |
-| 1   | 3B judge model                          | `llama3.2:3b` dev substitute                                   | High     | Yes (for F500)                                                     |
-| 2   | No eval gate / SLO                      | Mocked unit tests only                                         | High     | Yes (for F500)                                                     |
-| 3   | History synthesis hallucination risk    | Soft "don't invent" instruction                                | Medium   | Yes (for F500)                                                     |
-| 4   | Rewriter as injection surface           | No sanitization/audit/eval                                     | Medium   | Yes (for F500)                                                     |
-| 5   | PII/injection in judge history          | Raw history to local judge                                     | Medium   | Yes if hosted model                                                |
-| 6   | No guardrail metrics                    | Log + Langfuse span only                                       | Low      | No (observability gap)                                             |
-| 7   | No red-team suite                       | Functional tests only                                          | High     | Yes (for F500)                                                     |
-| 8   | NVIDIA NIM as optional cloud provider   | Comparison-test-only, behind config flag                       | High     | Yes (for F500) — 10 gaps to close before production promotion      |
-| 9   | Decomposer as injection/quality surface | `compare`-label-only decomposition, no eval/audit/SLO          | Medium   | Yes (for F500)                                                     |
-| 10  | Clarifier as injection/quality surface  | `ambiguous`-label short-circuit, no eval/audit/SLO/multi-turn  | Medium   | Yes (for F500)                                                     |
-| 11  | NIM default model catalog drift         | Hard-coded swap to `meta/llama-3.1-8b-instruct` after live 404 | Medium   | No (fallback masked it) — but blocks reliable NIM use until probed |
-| 12  | Sensitive-topic detector heuristic      | Keyword list + 3B LLM classifier, no eval gate/FPR-FNR SLO     | High     | Yes (for F500) — safety-critical classifier                        |
+| #   | Gap                                     | Workaround                                                       | Severity | Blocks production?                                                                         |
+| --- | --------------------------------------- | ---------------------------------------------------------------- | -------- | ------------------------------------------------------------------------------------------ |
+| 1   | 3B judge model                          | `llama3.2:3b` dev substitute                                     | High     | Yes (for F500)                                                                             |
+| 2   | No eval gate / SLO                      | Mocked unit tests only                                           | High     | Yes (for F500)                                                                             |
+| 3   | History synthesis hallucination risk    | Soft "don't invent" instruction                                  | Medium   | Yes (for F500)                                                                             |
+| 4   | Rewriter as injection surface           | No sanitization/audit/eval                                       | Medium   | Yes (for F500)                                                                             |
+| 5   | PII/injection in judge history          | Raw history to local judge                                       | Medium   | Yes if hosted model                                                                        |
+| 6   | No guardrail metrics                    | Log + Langfuse span only                                         | Low      | No (observability gap)                                                                     |
+| 7   | No red-team suite                       | Functional tests only                                            | High     | Yes (for F500)                                                                             |
+| 8   | NVIDIA NIM as optional cloud provider   | Comparison-test-only, behind config flag                         | High     | Yes (for F500) — 10 gaps to close before production promotion                              |
+| 9   | Decomposer as injection/quality surface | `compare`-label-only decomposition, no eval/audit/SLO            | Medium   | Yes (for F500)                                                                             |
+| 10  | Clarifier as injection/quality surface  | `ambiguous`-label short-circuit, no eval/audit/SLO/multi-turn    | Medium   | Yes (for F500)                                                                             |
+| 11  | NIM default model catalog drift         | Hard-coded swap to `meta/llama-3.1-8b-instruct` after live 404   | Medium   | No (fallback masked it) — but blocks reliable NIM use until probed                         |
+| 12  | Sensitive-topic detector heuristic      | Keyword list + 3B LLM classifier, no eval gate/FPR-FNR SLO       | High     | Yes (for F500) — safety-critical classifier                                                |
+| 13  | Hallucination block global threshold    | Opt-in `BLOCK_LOW_CONFIDENCE` max-cosine cutoff, no eval gate    | Medium   | No (opt-in, default warn-only) — but blocks reliable gating until calibrated               |
+| 14  | Bias & fairness monitor heuristic       | Heuristic regex + 3B LLM judge, no eval gate / no parity metrics | Medium   | No (opt-in block, default monitor-only) — but blocks reliable bias gating until calibrated |
 
 **Current stage justification:** This is a local, $0-cost, single-user practice project (per README + architecture doc deviations D1/D2). The workarounds are acceptable for the practice/learning stage. Items 1, 2, 5, 7, and 8 become **blockers** the moment the app is deployed to a hosted/multi-user environment or the judge/generator moves to a hosted model.
+
+---
+
+## 15. No GDPR Art. 17 right-to-erasure endpoint — [CLOSED]
+
+**Files:** `api/routes/history.py`, `api/conversation.py`, `tests/test_api_history.py`
+
+### Enterprise-standard practice
+
+F500 deployments expose a user-facing right-to-erasure mechanism with:
+
+- **Identity-bound access control** — the caller must prove ownership of the session (RBAC / authn).
+- **Immutable audit log** — record `{session_id, erased_at, messages_deleted, feedback_deleted, actor}` to an append-only, tamper-evident store before/after deletion.
+- **Data-retention policy automation** — scheduled purges per legal hold / retention schedule, with opt-out for active investigations.
+- **Pre-erasure export** — support GDPR Art. 20 data portability (e.g., `GET /api/v1/history/{session_id}/export`) before irreversible deletion.
+
+### Implementation that closed the gap
+
+`DELETE /api/v1/history/{session_id}` was implemented on 2026-08-15. `ConversationStore.erase_session(session_id)` deletes all message and feedback rows for a session and returns the number of rows removed from each table. Covered by `TestErasureEndpoint` in `tests/test_api_history.py`.
+
+### Remaining enterprise gaps (not workarounds)
+
+1. **No auth/RBAC layer** — the endpoint is session-scoped and trusts the caller; acceptable for a single-user local app. Becomes a blocker in any multi-user / hosted deployment (see `docs/CHAT_ASSISTANT_FEATURES.md` RBAC gap).
+2. **No immutable erasure audit log** — deletion counts are returned in the API response but not persisted to an append-only log.
+3. **No data-portability export before erasure** — `GET /api/v1/history/{session_id}` exists, but there is no explicit “download my data” endpoint.
