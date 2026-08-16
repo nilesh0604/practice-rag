@@ -152,6 +152,14 @@ def build_event_stream(
             categories=bias_assessment.categories,
             blocked=getattr(result, "bias_blocked", False),
         )
+    # Responsible AI: record the model drift report (when a drift monitor
+    # ran) so the ``GET /api/v1/metrics`` snapshot surfaces drift alerts.
+    drift_report = getattr(result, "drift", None)
+    if drift_report is not None and metrics is not None:
+        metrics.record_drift_check(
+            report=drift_report,
+            alert=getattr(result, "drift_alert", False),
+        )
     # If the output guardrail blocked the streamed answer, tell the frontend
     # to swap the already-streamed tokens for the refusal (SSE is one-way,
     # so the deltas cannot be un-sent). Emitted before `sources` so the UI

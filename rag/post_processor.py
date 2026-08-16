@@ -28,6 +28,7 @@ from dataclasses import dataclass, field
 
 from ingestion.embedder import Embedder
 from rag.bias_monitor import BiasAssessment
+from rag.drift_monitor import DriftReport
 from schemas.chat import Citation
 from schemas.documents import RetrievedDoc
 
@@ -84,6 +85,17 @@ class PostProcessResult:
     Distinct from ``bias.biased`` (which is the monitor's verdict) so the
     chat route can record the block count even when the answer was
     replaced with ``BIAS_REFUSAL``."""
+    drift: DriftReport | None = None
+    """Set by the orchestrator after the model drift monitor records the
+    completed answer (Responsible AI). Carries the latest ``DriftReport``
+    (drift_detected, per-feature comparison) so the chat route can record
+    drift metrics via ``MetricsCollector.record_drift_check``.
+    ``None`` means no drift monitor is configured."""
+    drift_alert: bool = False
+    """Set by the orchestrator to True when the latest drift report has
+    ``drift_detected=True``. Distinct from ``drift.drift_detected`` so the
+    chat route can record the alert count even when the report is
+    preserved on the result."""
 
 
 class PostProcessor:

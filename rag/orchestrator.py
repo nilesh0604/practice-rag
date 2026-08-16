@@ -28,6 +28,7 @@ from typing import TYPE_CHECKING, Iterator, Union
 
 from rag.bias_monitor import BiasAssessment, BiasMonitor, PassthroughBiasMonitor
 from rag.context_assembler import ContextAssembler
+from rag.drift_monitor import DriftMonitor, PassthroughDriftMonitor
 from rag.generator import Generator
 from rag.post_processor import PostProcessor, PostProcessResult
 from rag.query_clarifier import GENERIC_CLARIFICATION, PassthroughQueryClarifier, QueryClarifier
@@ -161,6 +162,7 @@ class RAGOrchestrator:
         block_low_confidence: bool = False,
         bias_monitor: BiasMonitor | None = None,
         block_biased: bool = False,
+        drift_monitor: DriftMonitor | None = None,
     ) -> None:
         self.retriever = retriever
         self.context_assembler = context_assembler
@@ -187,6 +189,12 @@ class RAGOrchestrator:
         ``BIAS_REFUSAL`` (same swap mechanism). The real ``BiasAssessment``
         is preserved on the result so metadata + metrics capture the
         detection. Default is the passthrough (no-op) monitor."""
+        self.drift_monitor = drift_monitor or PassthroughDriftMonitor()
+        """Model drift monitor (Responsible AI). Records the final answer's
+        features in a rolling window and compares the most recent window to
+        the preceding one. A ``DriftReport`` is attached to the result so
+        metrics capture drift alerts. Default is the passthrough (no-op)
+        monitor."""
         self.block_biased = block_biased
         """When True, a biased answer is replaced with ``BIAS_REFUSAL``.
         Default ``False`` preserves the monitor-only behavior (the
@@ -422,6 +430,31 @@ class RAGOrchestrator:
                     result.answer = BIAS_REFUSAL
                     result.citations = []
                     result.bias_blocked = True
+            # ── Model drift monitor (Responsible AI): record the final
+            # answer and compare the current rolling window to the baseline.
+            # The report is attached to the result so the chat route can
+            # record drift metrics and the snapshot can surface alerts.
+            drift_span = (
+                self.tracer.start_span(trace, "drift_monitor")
+                if trace is not None else None
+            )
+            drift_report = self.drift_monitor.assess(
+                result,
+                blocked=output_blocked or low_conf_blocked or bias_blocked,
+            )
+            result.drift = drift_report
+            result.drift_alert = drift_report.drift_detected
+            if drift_span is not None:
+                self.tracer.end_span(
+                    drift_span,
+                    metadata={
+                        "drift_detected": drift_report.drift_detected,
+                        "total_samples": drift_report.total_samples,
+                        "drifted_features": [
+                            name for name, r in drift_report.features.items() if r.drifted
+                        ],
+                    },
+                )
             # Only the streaming path sets ``guardrail_replacement`` — the
             # sensitive buffered path never streamed the harmful tokens, so
             # there is nothing for the frontend to swap (the single delta IS
@@ -646,6 +679,14 @@ class RAGOrchestrator:
                     result.citations = []
                     result.bias_blocked = True
                     answer = BIAS_REFUSAL
+            # ── Model drift monitor (non-streaming path) — see stream_answer
+            # for the full rationale. The report is attached to the result.
+            drift_report = self.drift_monitor.assess(
+                result,
+                blocked=output_blocked or low_conf_blocked or bias_blocked,
+            )
+            result.drift = drift_report
+            result.drift_alert = drift_report.drift_detected
             if output_blocked or low_conf_blocked or bias_blocked:
                 result.guardrail_replacement = result.answer
             if trace is not None:

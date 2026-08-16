@@ -45,6 +45,8 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, ContextManager, Iterator, Protocol
 
+from rag.drift_monitor import DriftReport
+
 logger = logging.getLogger(__name__)
 
 # ── Langfuse constants ─────────────────────────────────────────────────
@@ -192,6 +194,9 @@ class _MetricsState:
     biased_answers: int = 0
     bias_blocks: int = 0
     bias_category_counts: dict[str, int] = field(default_factory=dict)
+    drift_checks: int = 0
+    drift_alerts: int = 0
+    drift_feature_counts: dict[str, int] = field(default_factory=dict)
 
 
 class MetricsCollector:
@@ -254,6 +259,30 @@ class MetricsCollector:
                     self._state.bias_category_counts.get(cat, 0) + 1
                 )
 
+    def record_drift_check(
+        self,
+        report: DriftReport | None = None,
+        alert: bool = False,
+    ) -> None:
+        """Record a model drift detection result (Responsible AI).
+
+        Increments the drift-check counter, the drift-alert counter when
+        the report indicates ``drift_detected`` or ``alert`` is True, and
+        the per-feature counts for each feature that triggered a drift.
+        Surfaces the drift monitoring metrics in ``GET /api/v1/metrics``.
+        """
+        is_alert = alert or (report is not None and report.drift_detected)
+        with self._lock:
+            self._state.drift_checks += 1
+            if is_alert:
+                self._state.drift_alerts += 1
+            if report is not None:
+                for name, feature in report.features.items():
+                    if feature.drifted:
+                        self._state.drift_feature_counts[name] = (
+                            self._state.drift_feature_counts.get(name, 0) + 1
+                        )
+
     def evaluate_ttft_slo(
         self,
         target_s: float = TTFT_SLO_TARGET_S,
@@ -290,6 +319,8 @@ class MetricsCollector:
             total_cache = hits + misses
             bias_checks = self._state.bias_checks
             biased = self._state.biased_answers
+            drift_checks = self._state.drift_checks
+            drift_alerts = self._state.drift_alerts
             return {
                 "requests": self._state.requests,
                 "errors": self._state.errors,
@@ -313,6 +344,12 @@ class MetricsCollector:
                     "blocks": self._state.bias_blocks,
                     "bias_rate": (biased / bias_checks) if bias_checks else 0.0,
                     "categories": dict(self._state.bias_category_counts),
+                },
+                "drift": {
+                    "checks": drift_checks,
+                    "alerts": drift_alerts,
+                    "alert_rate": (drift_alerts / drift_checks) if drift_checks else 0.0,
+                    "features": dict(self._state.drift_feature_counts),
                 },
             }
 

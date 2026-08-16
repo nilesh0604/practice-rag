@@ -805,3 +805,58 @@ class TestWarmUpOllama:
         mock_resp.__exit__ = MagicMock(return_value=False)
         with patch("urllib.request.urlopen", return_value=mock_resp):
             assert warm_up_ollama("http://fake:11434") is False
+
+
+# ════════════════════════════════════════════════════════════════════════
+# Model drift metrics (Responsible AI)
+# ════════════════════════════════════════════════════════════════════════
+
+
+class TestDriftMetrics:
+    def test_initial_snapshot_drift_zeroed(self):
+        mc = MetricsCollector()
+        snap = mc.snapshot()["drift"]
+        assert snap["checks"] == 0
+        assert snap["alerts"] == 0
+        assert snap["alert_rate"] == 0.0
+        assert snap["features"] == {}
+
+    def test_record_drift_check_clean(self):
+        from rag.drift_monitor import DriftReport
+
+        mc = MetricsCollector()
+        mc.record_drift_check(DriftReport())
+        snap = mc.snapshot()["drift"]
+        assert snap["checks"] == 1
+        assert snap["alerts"] == 0
+        assert snap["alert_rate"] == 0.0
+
+    def test_record_drift_check_alert(self):
+        from rag.drift_monitor import DriftFeatureReport, DriftReport
+
+        mc = MetricsCollector()
+        report = DriftReport(
+            drift_detected=True,
+            features={
+                "confidence": DriftFeatureReport(
+                    current_mean=0.4,
+                    baseline_mean=0.8,
+                    relative_change=0.5,
+                    drifted=True,
+                )
+            },
+        )
+        mc.record_drift_check(report)
+        snap = mc.snapshot()["drift"]
+        assert snap["checks"] == 1
+        assert snap["alerts"] == 1
+        assert snap["alert_rate"] == 1.0
+        assert snap["features"] == {"confidence": 1}
+
+    def test_record_drift_check_alert_flag(self):
+        from rag.drift_monitor import DriftReport
+
+        mc = MetricsCollector()
+        mc.record_drift_check(DriftReport(), alert=True)
+        snap = mc.snapshot()["drift"]
+        assert snap["alerts"] == 1

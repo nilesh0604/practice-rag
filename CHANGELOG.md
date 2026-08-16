@@ -5,6 +5,43 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added — Model drift detection (Responsible AI)
+
+A model drift monitor now records an answer feature vector for every completed
+RAG response and compares the most recent rolling window to the preceding one.
+It raises a `DriftReport` when any tracked feature's mean changes by more than
+the configured threshold (default 20%). Monitor-only and opt-in via the
+`DRIFT_MONITOR` environment variable.
+
+- `rag/drift_monitor.py` (new):
+  - `DriftMonitor` tracks groundedness confidence, citation count, answer
+    length, bias score, and guardrail/bias block flag. It compares the current
+    window's mean to the baseline window's mean and reports per-feature drift.
+  - `DriftReport` / `DriftFeatureReport` carry the comparison results and are
+    attached to `PostProcessResult.drift`.
+  - `PassthroughDriftMonitor` keeps the orchestrator uniform when the feature
+    is disabled.
+- `rag/orchestrator.py`:
+  - Runs the drift monitor after the output guardrail + hallucination + bias
+    blocks in both `stream_answer` and `answer` paths, recording a
+    `drift_monitor` Langfuse span.
+- `rag/post_processor.py`:
+  - `PostProcessResult` gains `drift` and `drift_alert` fields.
+- `api/observability.py`:
+  - `MetricsCollector.record_drift_check()` aggregates drift checks, alerts,
+    and per-feature counts; the `drift` block appears in `GET /api/v1/metrics`.
+- `api/routes/chat.py`:
+  - Records the `DriftReport` from each chat completion into `MetricsCollector`.
+- `api/deps.py`:
+  - Wires `DriftMonitor` when `DRIFT_MONITOR=true`, otherwise
+    `PassthroughDriftMonitor`.
+- `docs/CHAT_ASSISTANT_FEATURES.md` and `docs/F500_ENTERPRISE_ACTION_ITEMS.md`:
+  - Mark model drift detection as partially implemented and document the
+    enterprise-grade gap (statistical test, reference dataset, SLO/promotion
+    gate).
+- `tests/test_drift_monitor.py` and `tests/test_observability.py`:
+  - Unit tests for the drift monitor and the new metrics counters.
+
 ### Added — GDPR Art. 17 right-to-erasure endpoint
 
 A new `DELETE /api/v1/history/{session_id}` endpoint allows users to erase all

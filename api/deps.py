@@ -27,6 +27,7 @@ from api.nim_guardrails import build_guardrail_suite
 from api.observability import CircuitBreaker, LangfuseTracer, MetricsCollector
 from rag.bias_monitor import BiasMonitor
 from rag.context_assembler import ContextAssembler
+from rag.drift_monitor import DriftMonitor, PassthroughDriftMonitor
 from rag.nim_generator import build_generator
 from rag.nim_reranker import build_reranker, get_rerank_candidate_k
 from rag.orchestrator import RAGOrchestrator
@@ -58,6 +59,14 @@ flags as biased with a ``BIAS_REFUSAL`` (Responsible AI block), mirroring
 the output guardrail + hallucination block. Default false — preserves the
 monitor-only behavior (the ``BiasAssessment`` is still recorded on the
 result for metrics)."""
+
+DRIFT_MONITOR: bool = os.getenv("DRIFT_MONITOR", "").lower() in {
+    "1", "true", "yes", "on",
+}
+"""When true, the orchestrator records every completed answer in a rolling
+window and compares the most recent window to the baseline to detect output-
+distribution drift. Default false — the drift monitor is off until the
+operator opts in."""
 
 
 @lru_cache
@@ -135,6 +144,7 @@ def get_orchestrator() -> RAGOrchestrator:
         block_low_confidence=BLOCK_LOW_CONFIDENCE,
         bias_monitor=BiasMonitor(),
         block_biased=BLOCK_BIASED,
+        drift_monitor=DriftMonitor() if DRIFT_MONITOR else PassthroughDriftMonitor(),
     )
 
 

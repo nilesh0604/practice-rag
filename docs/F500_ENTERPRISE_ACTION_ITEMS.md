@@ -506,22 +506,23 @@ Bias & fairness monitoring for an F500 AI assistant is a **compliance-relevant**
 
 ## Summary table
 
-| #   | Gap                                     | Workaround                                                       | Severity | Blocks production?                                                                         |
-| --- | --------------------------------------- | ---------------------------------------------------------------- | -------- | ------------------------------------------------------------------------------------------ |
-| 1   | 3B judge model                          | `llama3.2:3b` dev substitute                                     | High     | Yes (for F500)                                                                             |
-| 2   | No eval gate / SLO                      | Mocked unit tests only                                           | High     | Yes (for F500)                                                                             |
-| 3   | History synthesis hallucination risk    | Soft "don't invent" instruction                                  | Medium   | Yes (for F500)                                                                             |
-| 4   | Rewriter as injection surface           | No sanitization/audit/eval                                       | Medium   | Yes (for F500)                                                                             |
-| 5   | PII/injection in judge history          | Raw history to local judge                                       | Medium   | Yes if hosted model                                                                        |
-| 6   | No guardrail metrics                    | Log + Langfuse span only                                         | Low      | No (observability gap)                                                                     |
-| 7   | No red-team suite                       | Functional tests only                                            | High     | Yes (for F500)                                                                             |
-| 8   | NVIDIA NIM as optional cloud provider   | Comparison-test-only, behind config flag                         | High     | Yes (for F500) — 10 gaps to close before production promotion                              |
-| 9   | Decomposer as injection/quality surface | `compare`-label-only decomposition, no eval/audit/SLO            | Medium   | Yes (for F500)                                                                             |
-| 10  | Clarifier as injection/quality surface  | `ambiguous`-label short-circuit, no eval/audit/SLO/multi-turn    | Medium   | Yes (for F500)                                                                             |
-| 11  | NIM default model catalog drift         | Hard-coded swap to `meta/llama-3.1-8b-instruct` after live 404   | Medium   | No (fallback masked it) — but blocks reliable NIM use until probed                         |
-| 12  | Sensitive-topic detector heuristic      | Keyword list + 3B LLM classifier, no eval gate/FPR-FNR SLO       | High     | Yes (for F500) — safety-critical classifier                                                |
-| 13  | Hallucination block global threshold    | Opt-in `BLOCK_LOW_CONFIDENCE` max-cosine cutoff, no eval gate    | Medium   | No (opt-in, default warn-only) — but blocks reliable gating until calibrated               |
-| 14  | Bias & fairness monitor heuristic       | Heuristic regex + 3B LLM judge, no eval gate / no parity metrics | Medium   | No (opt-in block, default monitor-only) — but blocks reliable bias gating until calibrated |
+| #   | Gap                                     | Workaround                                                                                                         | Severity | Blocks production?                                                                                             |
+| --- | --------------------------------------- | ------------------------------------------------------------------------------------------------------------------ | -------- | -------------------------------------------------------------------------------------------------------------- |
+| 1   | 3B judge model                          | `llama3.2:3b` dev substitute                                                                                       | High     | Yes (for F500)                                                                                                 |
+| 2   | No eval gate / SLO                      | Mocked unit tests only                                                                                             | High     | Yes (for F500)                                                                                                 |
+| 3   | History synthesis hallucination risk    | Soft "don't invent" instruction                                                                                    | Medium   | Yes (for F500)                                                                                                 |
+| 4   | Rewriter as injection surface           | No sanitization/audit/eval                                                                                         | Medium   | Yes (for F500)                                                                                                 |
+| 5   | PII/injection in judge history          | Raw history to local judge                                                                                         | Medium   | Yes if hosted model                                                                                            |
+| 6   | No guardrail metrics                    | Log + Langfuse span only                                                                                           | Low      | No (observability gap)                                                                                         |
+| 7   | No red-team suite                       | Functional tests only                                                                                              | High     | Yes (for F500)                                                                                                 |
+| 8   | NVIDIA NIM as optional cloud provider   | Comparison-test-only, behind config flag                                                                           | High     | Yes (for F500) — 10 gaps to close before production promotion                                                  |
+| 9   | Decomposer as injection/quality surface | `compare`-label-only decomposition, no eval/audit/SLO                                                              | Medium   | Yes (for F500)                                                                                                 |
+| 10  | Clarifier as injection/quality surface  | `ambiguous`-label short-circuit, no eval/audit/SLO/multi-turn                                                      | Medium   | Yes (for F500)                                                                                                 |
+| 11  | NIM default model catalog drift         | Hard-coded swap to `meta/llama-3.1-8b-instruct` after live 404                                                     | Medium   | No (fallback masked it) — but blocks reliable NIM use until probed                                             |
+| 12  | Sensitive-topic detector heuristic      | Keyword list + 3B LLM classifier, no eval gate/FPR-FNR SLO                                                         | High     | Yes (for F500) — safety-critical classifier                                                                    |
+| 13  | Hallucination block global threshold    | Opt-in `BLOCK_LOW_CONFIDENCE` max-cosine cutoff, no eval gate                                                      | Medium   | No (opt-in, default warn-only) — but blocks reliable gating until calibrated                                   |
+| 14  | Bias & fairness monitor heuristic       | Heuristic regex + 3B LLM judge, no eval gate / no parity metrics                                                   | Medium   | No (opt-in block, default monitor-only) — but blocks reliable bias gating until calibrated                     |
+| 16  | Model drift detection                   | In-process rolling-window relative-mean comparison, no reference dataset / no statistical test / no promotion gate | Medium   | No (opt-in, default off) — but blocks reliable drift gating until a proper test and alert pipeline is in place |
 
 **Current stage justification:** This is a local, $0-cost, single-user practice project (per README + architecture doc deviations D1/D2). The workarounds are acceptable for the practice/learning stage. Items 1, 2, 5, 7, and 8 become **blockers** the moment the app is deployed to a hosted/multi-user environment or the judge/generator moves to a hosted model.
 
@@ -549,3 +550,35 @@ F500 deployments expose a user-facing right-to-erasure mechanism with:
 1. **No auth/RBAC layer** — the endpoint is session-scoped and trusts the caller; acceptable for a single-user local app. Becomes a blocker in any multi-user / hosted deployment (see `docs/CHAT_ASSISTANT_FEATURES.md` RBAC gap).
 2. **No immutable erasure audit log** — deletion counts are returned in the API response but not persisted to an append-only log.
 3. **No data-portability export before erasure** — `GET /api/v1/history/{session_id}` exists, but there is no explicit “download my data” endpoint.
+
+---
+
+## 16. Model drift detection
+
+**Files:** `rag/drift_monitor.py`, `rag/orchestrator.py`, `api/observability.py`
+
+### Enterprise-standard practice
+
+F500 model monitoring uses a **statistical drift test** against a version-pinned, held-out reference dataset and a production window, with an alert + promotion gate:
+
+- **Reference distribution** — a frozen golden/eval set representing the expected answer distribution (confidence, citations, latency, safety, faithfulness, etc.).
+- **Statistical tests** — Kolmogorov-Smirnov, Population Stability Index (PSI), Wasserstein distance, or Maximum Mean Discrepancy, with p-values / thresholds.
+- **Per-feature SLOs** — drift alerts tied to SLO burn, paging on-call, and automatic rollback / promotion block.
+- **Immutable trace** — every answer's feature vector logged for forensics and offline re-analysis.
+
+### Workaround shipped
+
+`DriftMonitor` (`rag/drift_monitor.py`) tracks five answer features (groundedness confidence, citation count, answer length, bias score, guardrail/bias block flag) in an in-process rolling window. It compares the mean of the last `window_size` samples against the `window_size` before them and raises `DriftReport.drift_detected` when any feature's relative change exceeds `threshold` (20%). The report is attached to `PostProcessResult.drift`, surfaced in `GET /api/v1/metrics`, and recorded by `MetricsCollector.record_drift_check`. The feature is off by default (`DRIFT_MONITOR` env flag).
+
+### Reasoning for the workaround
+
+- A proper statistical drift pipeline requires a reference dataset, alerting, and a CI/eval gate — out of scope for the practice stage.
+- The rolling-window comparison is stateless in-process, zero cost, and good enough to surface _early warning_ of an output-distribution shift (e.g., after a model or prompt change).
+- The monitor is opt-in so it does not affect the default latency or behavior.
+
+### Future action item
+
+1. Build a **reference dataset** of expected answer feature distributions for the production corpus.
+2. Replace the relative-mean heuristic with a **statistical drift test** (KS / PSI / Wasserstein) and compute p-values.
+3. Add **per-feature SLO thresholds** and wire drift breaches into CI as a **blocking promotion gate**.
+4. Persist every answer's feature vector to an **append-only trace store** (not just in-process metrics) for forensics and offline re-analysis.
