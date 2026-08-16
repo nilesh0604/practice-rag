@@ -161,6 +161,20 @@ Enterprises scrub PII and scan history for injection **before** it's included in
 
 Fix 1 passes raw `history` into `INJECTION_JUDGE_PROMPT` and `CLASSIFIER_PROMPT` with no scrubbing or injection scan.
 
+**Partial progress (2026-08-15):** PII scrubbing on **input** is now
+implemented. `InputGuardrail.check()` runs `scrub_pii` on the user's
+message (tier 2, always, regex-based) and returns the scrubbed text via
+`GuardrailDecision.scrubbed`. The orchestrator substitutes the scrubbed
+query for the original in all downstream steps (classify → rewrite →
+retrieve → generate), so no raw PII from the **current user message**
+reaches any LLM prompt or the retriever. A dedicated content-safety LLM
+judge (`INPUT_CONTENT_SAFETY_PROMPT`) also runs on the scrubbed input.
+What remains: (a) **history** is still passed raw into the judge /
+classifier / rewriter prompts — history PII scrubbing and history
+injection scanning are not yet implemented; (b) the regex `scrub_pii`
+only covers emails and phone numbers (no SSN, credit-card, or NER-based
+PII detection); (c) no content-safety eval gate on the input judge.
+
 ### Reasoning for the workaround
 
 - The judge is a **local Ollama model** (no data leaves the machine), so the PII-leak risk is theoretical for this project.
@@ -169,10 +183,13 @@ Fix 1 passes raw `history` into `INJECTION_JUDGE_PROMPT` and `CLASSIFIER_PROMPT`
 
 ### Future action item
 
-1. **PII-scrub history** (`scrub_pii`) before it enters `INJECTION_JUDGE_PROMPT` / `CLASSIFIER_PROMPT` / `REWRITE_PROMPT_TEMPLATE`.
-2. **Regex-scan history** for injection patterns (`detect_prompt_injection`) and either strip flagged turns or append a system note that history may contain injection.
-3. If moving to a **hosted guardrail model** (Bedrock/Azure), history scrubbing becomes **mandatory** — promote this item to a blocker at that point.
-4. Consider sending only a **summary/hash** of history to the judge rather than full text, reducing the attack surface.
+1. ~~**PII-scrub the user's input message** (`scrub_pii`) before it enters `INJECTION_JUDGE_PROMPT` / `INPUT_CONTENT_SAFETY_PROMPT` / `CLASSIFIER_PROMPT` / `REWRITE_PROMPT_TEMPLATE`.~~ ✅ Done (2026-08-15) — `InputGuardrail.check()` now scrubs PII on input (tier 2) and the orchestrator uses the scrubbed query downstream. **History** PII scrubbing is still not done (see below).
+2. **PII-scrub history** (`scrub_pii`) before it enters `INJECTION_JUDGE_PROMPT` / `CLASSIFIER_PROMPT` / `REWRITE_PROMPT_TEMPLATE`. The current user message is scrubbed, but conversation history is still passed raw.
+3. **Regex-scan history** for injection patterns (`detect_prompt_injection`) and either strip flagged turns or append a system note that history may contain injection.
+4. If moving to a **hosted guardrail model** (Bedrock/Azure), history scrubbing becomes **mandatory** — promote this item to a blocker at that point.
+5. Consider sending only a **summary/hash** of history to the judge rather than full text, reducing the attack surface.
+6. **Extend `scrub_pii`** beyond email/phone to cover SSN, credit-card numbers, and NER-based PII (e.g. Presidio / GLiNER). The current regex tier is intentionally minimal for the practice corpus (public docs, no real PII).
+7. **Add a content-safety eval gate** on the input judge (`INPUT_CONTENT_SAFETY_PROMPT`) — FPR/FNR SLO on a labeled harmful-vs-benign dataset, wired into CI as a blocking gate.
 
 ---
 

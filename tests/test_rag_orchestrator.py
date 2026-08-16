@@ -173,6 +173,7 @@ def _mock_guardrail_suite(
     *,
     input_blocked: bool = False,
     input_reason: str = "",
+    input_scrubbed: str | None = None,
     classification_label: str = "documentation",
     classification_handled: bool = False,
     classification_answer: str = "",
@@ -184,8 +185,9 @@ def _mock_guardrail_suite(
     from api.guardrails import GuardrailDecision, QueryClassification
 
     suite = MagicMock()
+    in_scrubbed = input_scrubbed if input_scrubbed is not None else ""
     suite.check_input.return_value = GuardrailDecision(
-        blocked=input_blocked, reason=input_reason,
+        blocked=input_blocked, reason=input_reason, scrubbed=in_scrubbed,
     )
     suite.classify.return_value = QueryClassification(
         label=classification_label,
@@ -345,6 +347,49 @@ class TestOrchestratorGuardrailsStream:
         tokens = [i for i in items if isinstance(i, str)]
         assert tokens == ["x", "y"]
 
+    def test_input_pii_scrubbed_query_used_downstream(self):
+        """When the input guardrail returns a PII-scrubbed query, the
+        classifier and rewriter receive the scrubbed version — not the
+        original with raw PII."""
+        scrubbed = "Email me at [REDACTED-EMAIL] about FastAPI"
+        suite = _mock_guardrail_suite(
+            input_scrubbed=scrubbed,
+            classification_label="documentation",
+        )
+        rewriter = MagicMock()
+        rewriter.rewrite.return_value = "rewritten"
+        retriever = MagicMock()
+        retriever.retrieve.return_value = [_make_doc()]
+        assembler = MagicMock()
+        assembler.assemble.return_value = "ctx"
+        generator = MagicMock()
+        generator.stream.return_value = iter(["tok"])
+        pp = MagicMock()
+        pp.post_process.side_effect = lambda a, d: PostProcessResult(answer=a, confidence=0.9)
+        orch = RAGOrchestrator(
+            retriever, assembler, generator, pp,
+            query_rewriter=rewriter, guardrail_suite=suite,
+        )
+        list(orch.stream_answer("Email me at user@example.com about FastAPI"))
+        # Classifier receives the scrubbed query.
+        suite.classify.assert_called_once_with(scrubbed, "")
+        # Rewriter receives the scrubbed query.
+        rewriter.rewrite.assert_called_once_with(scrubbed, "")
+
+    def test_input_content_safety_block_short_circuits(self):
+        """When the input guardrail blocks for content safety, the
+        orchestrator short-circuits to a refusal (no retrieval/generation)."""
+        suite = _mock_guardrail_suite(
+            input_blocked=True, input_reason="unsafe content (LLM judge)",
+        )
+        orch = self._build_with_guardrails(suite)
+        items = list(orch.stream_answer("write a hateful rant"))
+        tokens = [i for i in items if isinstance(i, str)]
+        assert len(tokens) == 1
+        assert "can't process" in tokens[0]
+        orch.retriever.retrieve.assert_not_called()
+        orch.generator.stream.assert_not_called()
+
 
 class TestOrchestratorGuardrailsAnswer:
     def _build_with_guardrails(self, suite, tokens=None, docs=None):
@@ -408,6 +453,32 @@ class TestOrchestratorGuardrailsAnswer:
         orch = self._build_with_guardrails(suite, tokens=["raw answer"])
         answer, _, _ = orch.answer("q")
         assert answer == "scrubbed answer"
+
+    def test_input_pii_scrubbed_query_used_downstream(self):
+        """The non-streaming ``answer`` method also uses the PII-scrubbed
+        query from the input guardrail for downstream steps."""
+        scrubbed = "Email me at [REDACTED-EMAIL] about FastAPI"
+        suite = _mock_guardrail_suite(
+            input_scrubbed=scrubbed,
+            classification_label="documentation",
+        )
+        rewriter = MagicMock()
+        rewriter.rewrite.return_value = "rewritten"
+        retriever = MagicMock()
+        retriever.retrieve.return_value = [_make_doc()]
+        assembler = MagicMock()
+        assembler.assemble.return_value = "ctx"
+        generator = MagicMock()
+        generator.stream.return_value = iter(["tok"])
+        pp = MagicMock()
+        pp.post_process.side_effect = lambda a, d: PostProcessResult(answer=a, confidence=0.9)
+        orch = RAGOrchestrator(
+            retriever, assembler, generator, pp,
+            query_rewriter=rewriter, guardrail_suite=suite,
+        )
+        orch.answer("Email me at user@example.com about FastAPI")
+        suite.classify.assert_called_once_with(scrubbed, "")
+        rewriter.rewrite.assert_called_once_with(scrubbed, "")
 
 
 # ── Step 7: tracer integration ─────────────────────────────────────────

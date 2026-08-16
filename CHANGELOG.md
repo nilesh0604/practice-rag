@@ -5,6 +5,69 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added — PII detection on input + content-safety LLM judge on input
+
+The input guardrail (`InputGuardrail`) now has a four-tier check instead
+of the previous two-tier (regex + injection LLM judge):
+
+1. **Regex injection scan** (unchanged) — fast, deterministic, always runs.
+2. **PII scrub on input** (new) — `scrub_pii` now runs on the user's input
+   message (not just the assistant's output). Emails and phone numbers are
+   redacted to `[REDACTED-EMAIL]` / `[REDACTED-PHONE]` before the query
+   reaches any downstream component. The scrubbed query is returned via
+   `GuardrailDecision.scrubbed` and the orchestrator substitutes it for
+   the original query in all downstream steps (classify → rewrite →
+   retrieve → generate). No raw PII from the current user message reaches
+   the classifier, rewriter, retriever, generator, or any LLM judge prompt.
+3. **LLM injection judge** (unchanged) — now runs on the PII-scrubbed
+   message instead of the raw message.
+4. **LLM content-safety judge** (new) — a dedicated judge
+   (`INPUT_CONTENT_SAFETY_PROMPT`) classifies general harmful content
+   (hate speech, violence, self-harm, sexual content, illegal activity)
+   in the user's message itself — distinct from the injection judge which
+   only detects hijack attempts. Defensive/educational security questions
+   ("how to prevent CSRF in FastAPI") are classified as safe. Runs on the
+   PII-scrubbed message. On LLM error, degrades gracefully (never blocks
+   on LLM failure).
+
+- `api/guardrails.py`:
+  - New `INPUT_CONTENT_SAFETY_PROMPT` constant.
+  - `InputGuardrail.check()` — four-tier check (regex → PII scrub →
+    injection judge → content-safety judge). `GuardrailDecision.scrubbed`
+    is now set on input decisions (not just output).
+  - New `InputGuardrail._llm_content_safety_judge()` method.
+  - `GuardrailDecision` docstring updated (scrubbed is input + output).
+- `rag/orchestrator.py`:
+  - `stream_answer()` and `answer()` — after the input guardrail passes,
+    `if decision.scrubbed: query = decision.scrubbed` so the PII-scrubbed
+    query is used for classification, rewriting, retrieval, and generation.
+- `tests/test_guardrails.py`:
+  - 12 new `TestInputGuardrail` tests (PII scrub on input, content-safety
+    judge block/safe/error-degrade, injection short-circuits content-safety,
+    both judges error → scrub-only, scrubbed-before-judge, clean-input
+    idempotent, regex-block-skips-scrub).
+  - Updated 2 existing tests (`test_follow_up_with_history_not_blocked`,
+    `test_history_default_is_empty`) to check `call_args_list[0]` (injection
+    judge) instead of `call_args` (now the content-safety judge call).
+- `tests/test_rag_orchestrator.py`:
+  - `_mock_guardrail_suite` — new `input_scrubbed` parameter.
+  - 3 new orchestrator tests (scrubbed query used downstream in
+    `stream_answer` + `answer`, content-safety block short-circuits).
+- `docs/CHAT_ASSISTANT_FEATURES.md` — both ❌ items (PII detection on
+  input, content safety on input) updated to ✅.
+- `docs/F500_ENTERPRISE_ACTION_ITEMS.md` — item 5 updated with partial
+  progress (input PII scrub done; history PII scrub + extended PII types
+  - content-safety eval gate remain).
+- `api/nim_guardrails.py`:
+  - `NIMInputGuardrail._llm_content_safety_judge()` — new override that
+    calls the NIM content-safety model with Ollama fallback (mirrors the
+    existing `_llm_judge` injection-judge override pattern).
+  - `INPUT_CONTENT_SAFETY_PROMPT` imported from `api.guardrails`.
+- `tests/test_api_nim_guardrails.py`:
+  - 3 existing NIM input tests updated for the two-LLM-call behavior
+    (`test_nim_safe_allows`, `test_nim_failure_falls_back_to_ollama_safe`,
+    `test_history_passed_to_nim_prompt`).
+
 ### Changed — ChatWidget is now a floating widget (`position: fixed` + `ChatBubble` trigger)
 
 The `ChatWidget` was an inline root component laid out inside the `.app`

@@ -7,10 +7,18 @@ layer for a local, $0-cost practice project:
 - ``detect_prompt_injection()`` — regex scan for common jailbreak / prompt-
   injection patterns ("ignore previous instructions", "you are now", role
   resets, DAN-style prefixes). Fast, deterministic, zero latency.
-- ``InputGuardrail`` — combines the regex scan with an optional local LLM
-  judge (``llama3.2:3b``) that classifies the input as ``safe`` / ``unsafe``.
-  The LLM judge is a second line of defense; the regex is the first. When
-  Ollama is unavailable the guardrail degrades gracefully to regex-only.
+- ``scrub_pii()`` — applied to the user's input (not just the output) so
+  no raw PII reaches the classifier, rewriter, retriever, or generator.
+  The scrubbed query is returned via ``GuardrailDecision.scrubbed`` and
+  used downstream by the orchestrator.
+- ``InputGuardrail`` — four-tier check: (1) regex injection scan, (2) PII
+  scrub (always), (3) optional local LLM injection judge, (4) optional
+  local LLM content-safety judge. The injection judge classifies prompt-
+  injection / hijack attempts; the content-safety judge classifies general
+  harmful content (hate, violence, self-harm, sexual, illegal) in the
+  user's message itself. Both LLM judges run on the PII-scrubbed message.
+  When Ollama is unavailable the guardrail degrades gracefully to regex +
+  scrub-only (never blocks on LLM failure).
 
 **Output guardrails (build-order item 34):**
 - ``scrub_pii()`` — regex replacement of emails and phone numbers with
@@ -198,6 +206,21 @@ Conversation history:
 User message:
 {message}"""
 
+INPUT_CONTENT_SAFETY_PROMPT: str = """\
+You are a content safety filter for a documentation chatbot. Decide whether \
+the user's message itself contains or requests harmful content (hate speech, \
+violence, self-harm encouragement, sexual content, or illegal activity) — \
+regardless of whether it is a prompt-injection attempt.
+
+A question about security concepts in a defensive/educational context \
+("how to prevent CSRF in FastAPI", "what is SQL injection") is SAFE. \
+Only flag content that expresses, requests, or encourages harm.
+
+Reply with ONLY one word: "safe" or "unsafe".
+
+User message:
+{message}"""
+
 HARMFUL_JUDGE_PROMPT: str = """\
 You are a safety filter for a documentation chatbot. Decide whether the \
 following assistant answer contains harmful content (hate speech, violence, \
@@ -246,7 +269,9 @@ class GuardrailDecision:
 
     ``blocked`` is True when the content is rejected. ``reason`` is a
     short human-readable explanation for logging / the SSE error frame.
-    ``scrubbed`` is the PII-redacted text (output guardrail only).
+    ``scrubbed`` is the PII-redacted text — set by both the input
+    guardrail (the scrubbed user query) and the output guardrail (the
+    scrubbed assistant answer).
     """
 
     blocked: bool = False
@@ -380,11 +405,25 @@ def _extract_label(text: str, valid: frozenset[str]) -> str | None:
 
 
 class InputGuardrail:
-    """Input safety check: prompt-injection regex + optional LLM judge.
+    """Input safety check: prompt-injection regex + PII scrub + optional
+    LLM judges (injection + content safety).
 
-    The regex scan always runs. The LLM judge runs only when ``use_llm``
-    is True (default) and Ollama is reachable; on any error it is skipped
-    so the guardrail degrades to regex-only (never blocks on LLM failure).
+    The check runs in four tiers:
+
+    1. **Regex injection scan** — fast, deterministic, always runs. A hit
+       blocks the message immediately (no further tiers).
+    2. **PII scrub** — regex replacement of emails/phone numbers, always
+       runs. The scrubbed text is returned via ``GuardrailDecision.scrubbed``
+       so the orchestrator can use the redacted query downstream (no raw
+       PII reaches the classifier, rewriter, retriever, or generator).
+    3. **LLM injection judge** — optional (``use_llm``), runs on the
+       scrubbed message. Classifies prompt injection / jailbreak attempts
+       the regex tier misses. On error, degrades to regex-only.
+    4. **LLM content-safety judge** — optional (``use_llm``), runs on the
+       scrubbed message. Classifies general harmful content (hate, violence,
+       self-harm, sexual, illegal) in the user's message itself — distinct
+       from the injection judge which only detects hijack attempts. On
+       error, degrades gracefully (never blocks on LLM failure).
     """
 
     def __init__(
@@ -410,20 +449,43 @@ class InputGuardrail:
         ``history`` is the formatted conversation history so the LLM judge can
         distinguish a legitimate follow-up ("summarize the above") from a
         prompt-injection attempt referencing prior context.
+
+        The ``scrubbed`` field of the returned decision carries the PII-
+        redacted message (even when not blocked) so the orchestrator can
+        use the scrubbed query downstream.
         """
-        # Tier 1: regex.
+        # Tier 1: regex injection scan.
         injected, reason = detect_prompt_injection(message)
         if injected:
             logger.info("Input guardrail blocked (regex): %s", reason)
             return GuardrailDecision(blocked=True, reason=f"prompt injection: {reason}")
 
-        # Tier 2: LLM judge (optional, best-effort).
+        # Tier 2: PII scrub (always, regex-based). The scrubbed text is
+        # what the LLM judges and the downstream pipeline see — no raw
+        # PII reaches the classifier, rewriter, retriever, or generator.
+        scrubbed, redactions = scrub_pii(message)
+        if redactions:
+            logger.info("Input guardrail scrubbed PII: %s", ", ".join(redactions))
+
+        # Tier 3: LLM injection judge (optional, best-effort, on scrubbed).
         if self.use_llm:
-            verdict = self._llm_judge(message, history)
+            verdict = self._llm_judge(scrubbed, history)
             if verdict == "unsafe":
-                logger.info("Input guardrail blocked (LLM judge)")
-                return GuardrailDecision(blocked=True, reason="prompt injection (LLM judge)")
-        return GuardrailDecision(blocked=False)
+                logger.info("Input guardrail blocked (injection LLM judge)")
+                return GuardrailDecision(
+                    blocked=True, reason="prompt injection (LLM judge)", scrubbed=scrubbed,
+                )
+
+        # Tier 4: LLM content-safety judge (optional, best-effort, on scrubbed).
+        if self.use_llm:
+            verdict = self._llm_content_safety_judge(scrubbed)
+            if verdict == "unsafe":
+                logger.info("Input guardrail blocked (content-safety LLM judge)")
+                return GuardrailDecision(
+                    blocked=True, reason="unsafe content (LLM judge)", scrubbed=scrubbed,
+                )
+
+        return GuardrailDecision(blocked=False, scrubbed=scrubbed)
 
     def _llm_judge(self, message: str, history: str = "") -> str | None:
         """Return ``"safe"`` / ``"unsafe"`` / ``None`` (on error or no label)."""
@@ -438,7 +500,28 @@ class InputGuardrail:
             text = response.get("message", {}).get("content", "")
             return _extract_label(text, frozenset({"safe", "unsafe"}))
         except Exception:
-            logger.warning("Input LLM judge failed; regex-only", exc_info=True)
+            logger.warning("Input injection LLM judge failed; regex-only", exc_info=True)
+            return None
+
+    def _llm_content_safety_judge(self, message: str) -> str | None:
+        """Return ``"safe"`` / ``"unsafe"`` / ``None`` (on error or no label).
+
+        Distinct from the injection judge: this classifies general harmful
+        content (hate, violence, self-harm, sexual, illegal) in the user's
+        message itself — not prompt-injection / hijack attempts.
+        """
+        prompt = INPUT_CONTENT_SAFETY_PROMPT.format(message=message)
+        try:
+            response = self.client.chat(
+                model=self.model,
+                messages=[{"role": "user", "content": prompt}],
+                stream=False,
+                options={"num_predict": 8, "temperature": 0.0},
+            )
+            text = response.get("message", {}).get("content", "")
+            return _extract_label(text, frozenset({"safe", "unsafe"}))
+        except Exception:
+            logger.warning("Input content-safety LLM judge failed; skipping", exc_info=True)
             return None
 
     def close(self) -> None:

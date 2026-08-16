@@ -71,8 +71,12 @@ class RAGOrchestrator:
     An optional ``guardrail_suite`` (Step 6) adds three checks:
 
     1. **Input guardrail** — before retrieval, the query is scanned for
-       prompt injection. A blocked query short-circuits to a refusal
-       answer (no retrieval, no generation).
+       prompt injection (regex + LLM judge), PII-scrubbed (emails/phones
+       redacted), and checked for general content safety (LLM judge). A
+       blocked query short-circuits to a refusal answer (no retrieval, no
+       generation). The PII-scrubbed query is used for all downstream
+       steps (classify, rewrite, retrieve, generate) so no raw PII reaches
+       any LLM prompt or the retriever.
     2. **Query classifier** — the query is routed to one of
        ``documentation`` / ``greeting`` / ``off_topic`` / ``compare``.
        ``greeting`` and ``off_topic`` are handled with a canned answer
@@ -178,6 +182,13 @@ class RAGOrchestrator:
                         "FastAPI, Pydantic v2, or SQLModel.",
                     )
                     return
+
+                # Use the PII-scrubbed query for the rest of the flow so no
+                # raw PII reaches the classifier, rewriter, retriever, or
+                # generator. When no PII was found, ``scrubbed`` equals the
+                # original query (scrub_pii is idempotent on clean text).
+                if decision.scrubbed:
+                    query = decision.scrubbed
 
                 classification = self.guardrail_suite.classify(query, history)
                 if gr_span is not None:
@@ -408,6 +419,10 @@ class RAGOrchestrator:
                     if gr_span is not None:
                         self.tracer.end_span(gr_span, metadata={"blocked": True})
                     return refusal, PostProcessResult(answer=refusal), []
+
+                # Use the PII-scrubbed query for the rest of the flow.
+                if decision.scrubbed:
+                    query = decision.scrubbed
 
                 classification = self.guardrail_suite.classify(query, history)
                 if gr_span is not None:

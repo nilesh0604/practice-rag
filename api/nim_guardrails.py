@@ -59,6 +59,7 @@ from api.guardrails import (
     CLASS_OFF_TOPIC,
     HARMFUL_JUDGE_PROMPT,
     INJECTION_JUDGE_PROMPT,
+    INPUT_CONTENT_SAFETY_PROMPT,
     GuardrailSuite,
     InputGuardrail,
     OutputGuardrail,
@@ -289,6 +290,35 @@ class NIMInputGuardrail(InputGuardrail):
         except Exception as exc:  # noqa: BLE001 — NIMGuardrailError / CircuitOpenError
             logger.info("NIM input judge failed — falling back to Ollama: %s", exc)
         return super()._llm_judge(message, history)
+
+    def _llm_content_safety_judge(self, message: str) -> str | None:
+        """NIM content-safety judge with Ollama fallback.
+
+        Mirrors ``_llm_judge``: calls the NIM content-safety model, and
+        on failure / unparseable verdict falls back to the parent Ollama
+        content-safety judge. If Ollama also fails, the parent returns
+        ``None`` and the guardrail degrades gracefully (not blocked).
+        """
+        prompt = INPUT_CONTENT_SAFETY_PROMPT.format(message=message)
+        try:
+            text = self.nim_client.judge(
+                self.nim_model,
+                [{"role": "user", "content": prompt}],
+            )
+            label = _extract_label(text, frozenset({"safe", "unsafe"}))
+            if label is not None:
+                return label
+            logger.info(
+                "NIM content-safety judge returned no label (%r) — "
+                "falling back to Ollama",
+                text[:40],
+            )
+        except Exception as exc:  # noqa: BLE001 — NIMGuardrailError / CircuitOpenError
+            logger.info(
+                "NIM content-safety judge failed — falling back to Ollama: %s",
+                exc,
+            )
+        return super()._llm_content_safety_judge(message)
 
 
 # ── NIM output guardrail (3-tier: PII scrub → NIM → Ollama → scrub-only) ──

@@ -301,6 +301,8 @@ class TestNIMInputGuardrail:
 
         decision = gr.check("How do I use dependency injection in FastAPI?")
         assert decision.blocked is False
+        # NIM answered both judges (injection + content-safety) → Ollama
+        # not consulted.
         gr._client.chat.assert_not_called()
 
     def test_nim_failure_falls_back_to_ollama_unsafe(self):
@@ -321,7 +323,9 @@ class TestNIMInputGuardrail:
 
         decision = gr.check("benign question")
         assert decision.blocked is False
-        gr._client.chat.assert_called_once()
+        # NIM fails → both judges (injection + content-safety) fall back
+        # to Ollama → two Ollama calls.
+        assert gr._client.chat.call_count == 2
 
     def test_nim_unparseable_falls_back_to_ollama(self):
         nim = _nim_client_returning("maybe perhaps")
@@ -374,7 +378,9 @@ class TestNIMInputGuardrail:
         gr._client = _mock_ollama("safe")
 
         gr.check("summarize the above", "prior Q&A")
-        messages = nim.judge.call_args.args[1]
+        # The injection judge (first NIM call) receives history; the
+        # content-safety judge (second call) does not. Check call_args_list[0].
+        messages = nim.judge.call_args_list[0].args[1]
         assert "prior Q&A" in messages[0]["content"]
 
 
