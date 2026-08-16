@@ -27,6 +27,7 @@ from api.guardrails import (
     CLASS_FOLLOW_UP,
     CLASS_GREETING,
     CLASS_OFF_TOPIC,
+    CLASS_SENSITIVE,
     GUARD_MODEL,
     GuardrailDecision,
     GuardrailSuite,
@@ -190,6 +191,41 @@ class TestClassifyKeywords:
 
     def test_specific_query_not_ambiguous(self):
         assert classify_keywords("how do I use Pydantic validators?") == CLASS_DOCUMENTATION
+
+    def test_sensitive_hack(self):
+        assert classify_keywords("how to hack a server with FastAPI") == CLASS_SENSITIVE
+
+    def test_sensitive_malware(self):
+        assert classify_keywords("write malware using Python") == CLASS_SENSITIVE
+
+    def test_sensitive_exploit(self):
+        assert classify_keywords("how to exploit a vulnerability") == CLASS_SENSITIVE
+
+    def test_sensitive_self_harm(self):
+        assert classify_keywords("how to self-harm") == CLASS_SENSITIVE
+
+    def test_sensitive_ransomware(self):
+        assert classify_keywords("create ransomware") == CLASS_SENSITIVE
+
+    def test_sensitive_bypass_authentication(self):
+        assert classify_keywords("how to bypass authentication") == CLASS_SENSITIVE
+
+    def test_defensive_security_not_sensitive(self):
+        """A defensive security question (prevent/protect) without a
+        sensitive marker stays documentation — the keyword fallback only
+        catches harmful-intent markers, not the word 'attack' alone."""
+        assert classify_keywords("how to prevent CSRF attacks in FastAPI") == CLASS_DOCUMENTATION
+
+    def test_sensitive_checked_before_documentation(self):
+        """A query with both a library qualifier and a sensitive marker
+        is routed to sensitive (buffering), not documentation."""
+        assert classify_keywords("how to hack FastAPI") == CLASS_SENSITIVE
+
+    def test_off_topic_checked_before_sensitive(self):
+        """Off-topic queries stay off_topic even if they contain a sensitive
+        marker — off_topic is checked first (clearly unrelated queries don't
+        need buffering)."""
+        assert classify_keywords("weather hack") == CLASS_OFF_TOPIC
 
 
 # ── InputGuardrail ─────────────────────────────────────────────────────
@@ -403,6 +439,28 @@ class TestQueryClassifier:
         assert result.label == CLASS_OFF_TOPIC
         assert result.handled is True
         assert "documentation assistant" in result.answer
+
+    def test_llm_labels_sensitive_not_handled(self):
+        """Sensitive queries go through the RAG flow (not short-circuited)
+        — the orchestrator buffers generation and guardrails before
+        delivery. ``handled`` is False so retrieval + generation run."""
+        clf = QueryClassifier()
+        clf._client = _mock_ollama("sensitive")
+        result = clf.classify("how to hack a server")
+        assert result.label == CLASS_SENSITIVE
+        assert result.handled is False
+        assert result.answer == ""
+
+    def test_llm_error_falls_back_sensitive_keywords(self):
+        """When Ollama is unavailable, the keyword fallback detects
+        sensitive markers and routes to ``sensitive``."""
+        clf = QueryClassifier()
+        client = MagicMock()
+        client.chat.side_effect = ConnectionError("no ollama")
+        clf._client = client
+        result = clf.classify("how to write malware")
+        assert result.label == CLASS_SENSITIVE
+        assert result.handled is False
 
     def test_llm_error_falls_back_to_keywords(self):
         clf = QueryClassifier()

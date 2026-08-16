@@ -5,6 +5,73 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added — Sensitive-topic queries: buffered (non-streaming) generation
+
+Sensitive-topic queries (e.g. "how to hack a server", "write malware",
+"how to bypass authentication") previously streamed the same way as all
+other queries — tokens were delivered incrementally as they were generated,
+and the output guardrail only ran on the full buffer _after_ the last token
+was already sent. If the guardrail then blocked the answer, the harmful
+tokens had already been exposed to the user (SSE is one-way; the
+`guardrail_replacement` event swaps the UI _after_ the fact, but the
+content was already transmitted). The architecture doc requires that
+sensitive-topic queries disable streaming and fully guardrail the response
+before delivery — no partial exposure.
+
+The classifier now labels such queries `sensitive`, and the orchestrator
+buffers the full generation for `sensitive`-labeled queries: the output
+guardrail runs on the complete answer buffer, and only the guardrailed
+result (refusal if blocked, scrubbed answer otherwise) is delivered as a
+single `event: delta`. The user never sees un-guardrailed tokens for
+sensitive-topic queries.
+
+- `api/guardrails.py`:
+  - New `CLASS_SENSITIVE = "sensitive"` label added to `VALID_CLASSES`.
+  - `CLASSIFIER_PROMPT` updated with a `sensitive` label description
+    (queries about hacking, exploits, malware, bypassing security, or any
+    harmful intent — NOT off_topic, since they may have a legitimate
+    defensive/educational answer).
+  - New `_SENSITIVE_MARKERS` frozenset (`hack`/`malware`/`ransomware`/
+    `phishing`/`exploit`/`weapon`/`bomb`/`drug`/`kill`/`murder`/`suicide`/
+    `self-harm`/`illegal`/`steal`/`crack`/`break into`/`bypass security`/
+    `bypass authentication`/`write a virus`/`create malware`).
+  - `classify_keywords` keyword fallback now checks sensitive markers
+    (after off_topic, before the documentation default) so a query like
+    "how to hack a server with FastAPI" routes to `sensitive` (buffered)
+    rather than streaming directly. Over-inclusive by design — buffering
+    only costs a slight UX delay, so false positives are cheap while false
+    negatives risk partial exposure.
+  - `_to_classification` routes `sensitive` through the orchestrator
+    (`handled=False`) — retrieval + generation run, but generation is
+    buffered (not streamed).
+  - Module docstring updated to document the `sensitive` label.
+- `rag/orchestrator.py`:
+  - `stream_answer` — new `sensitive_buffered` branch: when
+    `classify_label == CLASS_SENSITIVE`, the generator output is collected
+    into a full buffer (`"".join(...)`), the output guardrail runs on the
+    complete buffer, and only the guardrailed answer is yielded as a single
+    token. No `guardrail_replacement` is set on the result (nothing was
+    streamed to swap; the single delta IS the final answer). Non-sensitive
+    queries stream normally (unchanged behavior).
+  - Class docstring updated to document the sensitive-buffered path.
+- `tests/test_guardrails.py` — new `CLASS_SENSITIVE` import; 10 new
+  `TestClassifyKeywords` cases (hack/malware/exploit/self-harm/ransomware/
+  bypass-auth + defensive-not-sensitive + library-qualifier-still-sensitive
+  - off-topic-checked-first); 2 new `TestQueryClassifier` cases (LLM labels
+    sensitive not-handled + LLM-error falls back to sensitive keywords).
+- `tests/test_rag_orchestrator.py` — new `TestOrchestratorSensitiveStream`
+  class (12 cases: single-token delivery, RAG flow proceeds, output-blocked
+  yields refusal as single token, no guardrail_replacement on block,
+  output-allowed yields scrubbed answer, no guardrail_replacement on allow,
+  no-guardrail-suite single-token invariant, post-processor receives
+  guardrailed answer, rewriter called, documentation streams normally,
+  answer-method buffers normally).
+- `docs/CHAT_ASSISTANT_FEATURES.md` — sensitive-topic row updated from ❌
+  to 🟡 in both the Streaming UX and Guardrails sections.
+- `docs/F500_ENTERPRISE_ACTION_ITEMS.md` — new item 9 recording the
+  sensitive-topic detector as a keyword/LLM heuristic with no eval gate
+  (enterprise gap vs. a purpose-trained classifier with FPR/FNR SLO).
+
 ### Added — TTFT < 800ms SLO gate (online-serving latency threshold)
 
 TTFT (time-to-first-token) was collected by `MetricsCollector` and exposed

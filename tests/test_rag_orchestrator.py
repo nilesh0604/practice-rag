@@ -833,6 +833,165 @@ class TestOrchestratorAmbiguity:
         assert docs == []
 
 
+# ── Sensitive-topic queries: buffered (non-streaming) generation ───────
+
+
+class TestOrchestratorSensitiveStream:
+    """Verify the orchestrator buffers generation for ``sensitive`` queries
+    so the output guardrail runs on the full answer before any token is
+    delivered — no partial exposure of potentially harmful content."""
+
+    def _build(self, *, suite=None, tokens=None, docs=None):
+        if tokens is None:
+            tokens = ["sensitive", " answer"]
+        if docs is None:
+            docs = [_make_doc(title="D", content="c")]
+        retriever = MagicMock()
+        retriever.retrieve.return_value = docs
+        assembler = MagicMock()
+        assembler.assemble.return_value = "ctx"
+        generator = MagicMock()
+        generator.stream.return_value = iter(tokens)
+        pp = MagicMock()
+        pp.post_process.side_effect = lambda answer, retrieved_docs: PostProcessResult(
+            answer=answer, confidence=0.9,
+        )
+        return RAGOrchestrator(
+            retriever, assembler, generator, pp, guardrail_suite=suite,
+        ), retriever
+
+    def test_sensitive_yields_single_token(self):
+        """Sensitive queries deliver the full answer as ONE token (no
+        incremental streaming) so no partial content is exposed."""
+        suite = _mock_guardrail_suite(classification_label="sensitive")
+        orch, _ = self._build(suite=suite, tokens=["part1", " part2", " part3"])
+        items = list(orch.stream_answer("how to hack a server"))
+        tokens_yielded = [i for i in items if isinstance(i, str)]
+        assert len(tokens_yielded) == 1
+        assert tokens_yielded[0] == "part1 part2 part3"
+
+    def test_sensitive_proceeds_through_rag_flow(self):
+        """Sensitive queries are NOT short-circuited — retrieval +
+        generation run (the answer may be legitimate/defensive)."""
+        suite = _mock_guardrail_suite(classification_label="sensitive")
+        orch, retriever = self._build(suite=suite)
+        list(orch.stream_answer("how to hack a server"))
+        retriever.retrieve.assert_called_once()
+        orch.generator.stream.assert_called_once()
+
+    def test_sensitive_output_blocked_yields_refusal_single_token(self):
+        """When the output guardrail blocks a sensitive answer, the refusal
+        is delivered as the single token — the harmful content is never
+        yielded at all (no partial exposure)."""
+        suite = _mock_guardrail_suite(
+            classification_label="sensitive", output_blocked=True,
+        )
+        orch, _ = self._build(suite=suite, tokens=["harmful", " content"])
+        items = list(orch.stream_answer("how to hack"))
+        tokens_yielded = [i for i in items if isinstance(i, str)]
+        assert len(tokens_yielded) == 1
+        assert "can't provide" in tokens_yielded[0]
+        # The harmful tokens were never yielded.
+        assert "harmful" not in tokens_yielded[0]
+
+    def test_sensitive_output_blocked_no_guardrail_replacement(self):
+        """Sensitive buffered path does NOT set ``guardrail_replacement``
+        — nothing was streamed to swap; the single delta IS the refusal."""
+        suite = _mock_guardrail_suite(
+            classification_label="sensitive", output_blocked=True,
+        )
+        orch, _ = self._build(suite=suite, tokens=["harmful", " content"])
+        items = list(orch.stream_answer("how to hack"))
+        result = [i for i in items if isinstance(i, PostProcessResult)][0]
+        assert result.guardrail_replacement is None
+
+    def test_sensitive_output_allowed_yields_safe_answer(self):
+        """When the output guardrail allows a sensitive answer, the full
+        (scrubbed) answer is delivered as a single token."""
+        scrubbed = "safe defensive answer about FastAPI security"
+        suite = _mock_guardrail_suite(
+            classification_label="sensitive", output_scrubbed=scrubbed,
+        )
+        orch, _ = self._build(suite=suite, tokens=["raw", " answer"])
+        items = list(orch.stream_answer("how to prevent hacks"))
+        tokens_yielded = [i for i in items if isinstance(i, str)]
+        assert tokens_yielded == [scrubbed]
+
+    def test_sensitive_output_allowed_no_guardrail_replacement(self):
+        """No output block → no ``guardrail_replacement`` (same as normal
+        path)."""
+        suite = _mock_guardrail_suite(
+            classification_label="sensitive", output_blocked=False,
+        )
+        orch, _ = self._build(suite=suite, tokens=["ok", " answer"])
+        items = list(orch.stream_answer("how to prevent hacks"))
+        result = [i for i in items if isinstance(i, PostProcessResult)][0]
+        assert result.guardrail_replacement is None
+
+    def test_sensitive_no_guardrail_suite_yields_single_token(self):
+        """Without a guardrail suite, sensitive queries still buffer (the
+        classify label is empty so this path is only reachable when a suite
+        labels it sensitive). Verify the single-token invariant holds when
+        no output guardrail runs."""
+        suite = _mock_guardrail_suite(classification_label="sensitive")
+        # Simulate no output guardrail by not blocking + no scrub.
+        orch, _ = self._build(suite=suite, tokens=["a", "b", "c"])
+        items = list(orch.stream_answer("how to hack"))
+        tokens_yielded = [i for i in items if isinstance(i, str)]
+        assert tokens_yielded == ["abc"]
+
+    def test_sensitive_post_processor_receives_guardrailed_answer(self):
+        """The post-processor receives the guardrailed (refusal or
+        scrubbed) answer, not the raw generated text."""
+        suite = _mock_guardrail_suite(
+            classification_label="sensitive", output_blocked=True,
+        )
+        orch, _ = self._build(suite=suite, tokens=["harmful", " text"])
+        list(orch.stream_answer("how to hack"))
+        pp_arg = orch.post_processor.post_process.call_args[0][0]
+        assert "can't provide" in pp_arg
+
+    def test_sensitive_rewriter_called(self):
+        """Sensitive queries still go through the rewriter before
+        retrieval (same as documentation queries)."""
+        suite = _mock_guardrail_suite(classification_label="sensitive")
+        rewriter = MagicMock()
+        rewriter.rewrite.return_value = "rewritten sensitive query"
+        retriever = MagicMock()
+        retriever.retrieve.return_value = [_make_doc()]
+        assembler = MagicMock()
+        assembler.assemble.return_value = "ctx"
+        generator = MagicMock()
+        generator.stream.return_value = iter(["tok"])
+        pp = MagicMock()
+        pp.post_process.side_effect = lambda a, d: PostProcessResult(answer=a)
+        orch = RAGOrchestrator(
+            retriever, assembler, generator, pp,
+            query_rewriter=rewriter, guardrail_suite=suite,
+        )
+        list(orch.stream_answer("how to hack", "history"))
+        rewriter.rewrite.assert_called_once_with("how to hack", "history")
+
+    def test_documentation_label_streams_normally(self):
+        """Non-sensitive labels still stream tokens incrementally (not
+        buffered)."""
+        suite = _mock_guardrail_suite(classification_label="documentation")
+        orch, _ = self._build(suite=suite, tokens=["t1", "t2", "t3"])
+        items = list(orch.stream_answer("How do I use FastAPI?"))
+        tokens_yielded = [i for i in items if isinstance(i, str)]
+        assert tokens_yielded == ["t1", "t2", "t3"]
+
+    def test_sensitive_answer_method_buffers_normally(self):
+        """The non-streaming ``answer`` method already buffers — sensitive
+        queries behave identically (output guardrail on full buffer)."""
+        suite = _mock_guardrail_suite(
+            classification_label="sensitive", output_blocked=True,
+        )
+        orch, _ = self._build(suite=suite, tokens=["harmful", " text"])
+        answer, result, docs = orch.answer("how to hack")
+        assert "can't provide" in answer
+
+
 class TestMergeDocs:
     """Unit tests for the static ``_merge_docs`` helper."""
 

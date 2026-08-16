@@ -376,6 +376,41 @@ Ambiguity detection + clarification is a known conversational-AI quality lever, 
 
 ---
 
+## 11. Sensitive-topic detector as a keyword/LLM heuristic (no eval gate)
+
+**Files:** `api/guardrails.py` (`CLASS_SENSITIVE`, `_SENSITIVE_MARKERS`, `classify_keywords`, `CLASSIFIER_PROMPT`), `rag/orchestrator.py` (`stream_answer` / `answer` sensitive-buffered branch)
+
+### Enterprise-standard practice
+
+Sensitive-topic detection (routing queries that touch on potentially harmful subject matter to a non-streaming, fully-guardrailed-before-delivery path) is a **safety-critical classifier**. An enterprise would:
+
+- **Use a purpose-trained model** (Llama Guard 3, Azure AI Content Safety, AWS Bedrock Guardrails) for sensitive-topic classification — not a 3B general-purpose chat model + a keyword list.
+- **Eval-gate the detector** with a labeled dataset (sensitive + benign-technical + defensive-security examples) and gate promotion on **FPR ≤ 2%** (over-buffering benign security questions kills UX) and **FNR ≤ 5%** (under-detecting lets harmful content stream partially before the output guardrail catches it).
+- **Track sensitive-routing metrics** — `sensitive_label_count`, `sensitive_buffer_rate`, `sensitive_output_block_rate` — as security-relevant observability (same gap as item 6).
+- **Red-team the detector** — adversarial paraphrases, coded language, multi-turn escalation that avoids the keyword markers (same gap as item 7).
+- **Audit-log** `{query, sensitive_label, output_blocked}` for incident forensics.
+
+### Workaround shipped
+
+A new `CLASS_SENSITIVE` label is detected by (1) an LLM classifier prompt addition and (2) a keyword fallback (`_SENSITIVE_MARKERS` — `hack`/`malware`/`exploit`/`self-harm`/…). The orchestrator buffers generation for `sensitive`-labeled queries so the output guardrail runs on the full answer before delivery. No eval gate, no FPR/FNR SLO, no sensitive-routing metrics, no red-team corpus, no audit log. The keyword list is over-inclusive by design (buffering only costs a slight UX delay), but it is a static list that does not adapt to paraphrases or coded language.
+
+### Reasoning for the workaround
+
+- This is a **local, $0-cost, single-user practice project** (per README + architecture doc deviations D1/D2).
+- The buffered-generation design is the correct architectural shape — the gap is in the _detector quality_, not the _delivery mechanism_. Closing the detector-quality gap (purpose-trained model + eval gate) is the same work as items 1 & 2.
+- The keyword fallback ensures the sensitive path works without Ollama (defense-in-depth with the LLM classifier).
+- The output guardrail (PII scrub + harmful-content judge) still runs as the final safety net even if the sensitive detector misses — the sensitive path is a _second_ layer that prevents partial exposure, not the only layer.
+
+### Future action item
+
+1. **Swap the sensitive detector** to a purpose-trained model (Llama Guard 3 / Azure AI Content Safety) behind a config flag — same as item 1.
+2. **Build a labeled eval set** (sensitive + benign-technical + defensive-security examples) and gate promotion on **FPR ≤ 2%**, **FNR ≤ 5%** — extend `eval/guardrail-dataset.json` with `sensitive`-labeled examples.
+3. **Add sensitive-routing metrics** to `MetricsCollector` (`sensitive_label_count`, `sensitive_buffer_rate`, `sensitive_output_block_rate`) and expose in `GET /api/v1/metrics` — same as item 6.
+4. **Red-team the detector** — adversarial paraphrases, coded language, multi-turn escalation — same corpus as item 7.
+5. **Audit-log** `{query, sensitive_label, output_blocked}` to the trace/metrics for forensics.
+
+---
+
 ## Summary table
 
 | #   | Gap                                     | Workaround                                                     | Severity | Blocks production?                                                 |
@@ -391,5 +426,6 @@ Ambiguity detection + clarification is a known conversational-AI quality lever, 
 | 9   | Decomposer as injection/quality surface | `compare`-label-only decomposition, no eval/audit/SLO          | Medium   | Yes (for F500)                                                     |
 | 10  | Clarifier as injection/quality surface  | `ambiguous`-label short-circuit, no eval/audit/SLO/multi-turn  | Medium   | Yes (for F500)                                                     |
 | 11  | NIM default model catalog drift         | Hard-coded swap to `meta/llama-3.1-8b-instruct` after live 404 | Medium   | No (fallback masked it) — but blocks reliable NIM use until probed |
+| 12  | Sensitive-topic detector heuristic      | Keyword list + 3B LLM classifier, no eval gate/FPR-FNR SLO     | High     | Yes (for F500) — safety-critical classifier                        |
 
 **Current stage justification:** This is a local, $0-cost, single-user practice project (per README + architecture doc deviations D1/D2). The workarounds are acceptable for the practice/learning stage. Items 1, 2, 5, 7, and 8 become **blockers** the moment the app is deployed to a hosted/multi-user environment or the judge/generator moves to a hosted model.

@@ -21,10 +21,13 @@ layer for a local, $0-cost practice project:
 
 **Query classifier/router (build-order item 35):**
 - ``QueryClassifier`` — routes a query to one of ``documentation`` /
-  ``greeting`` / ``off_topic`` / ``compare``. Uses a cheap local LLM
-  classifier (10-token prompt) with a regex/keyword fallback so it works
-  without Ollama. The orchestrator uses the class to short-circuit
-  greetings and off-topic questions before the expensive RAG flow.
+  ``greeting`` / ``off_topic`` / ``compare`` / ``follow_up`` / ``ambiguous``
+  / ``sensitive``. Uses a cheap local LLM classifier (10-token prompt) with
+  a regex/keyword fallback so it works without Ollama. The orchestrator uses
+  the class to short-circuit greetings and off-topic questions before the
+  expensive RAG flow, ask for clarification on ambiguous queries, and buffer
+  (non-streaming) generation for sensitive queries so the output guardrail
+  runs on the full answer before delivery.
 
 All LLM-backed checks share the lazy-client pattern from ``Generator`` /
 ``Embedder`` so unit tests inject mocks and never touch the network.
@@ -122,12 +125,13 @@ CLASS_OFF_TOPIC: str = "off_topic"
 CLASS_COMPARE: str = "compare"
 CLASS_FOLLOW_UP: str = "follow_up"
 CLASS_AMBIGUOUS: str = "ambiguous"
+CLASS_SENSITIVE: str = "sensitive"
 
 VALID_CLASSES: frozenset[str] = frozenset(
-    {CLASS_DOCUMENTATION, CLASS_GREETING, CLASS_OFF_TOPIC, CLASS_COMPARE, CLASS_FOLLOW_UP, CLASS_AMBIGUOUS},
+    {CLASS_DOCUMENTATION, CLASS_GREETING, CLASS_OFF_TOPIC, CLASS_COMPARE, CLASS_FOLLOW_UP, CLASS_AMBIGUOUS, CLASS_SENSITIVE},
 )
-"""The routing classes from the architecture doc plus ``follow_up`` and
-``ambiguous``."""
+"""The routing classes from the architecture doc plus ``follow_up``,
+``ambiguous``, and ``sensitive``."""
 
 # Keyword fallback for the classifier (used when Ollama is unavailable).
 _GREETING_KEYWORDS = frozenset(
@@ -152,6 +156,24 @@ _AMBIGUOUS_MAX_WORDS = 6
 # enough to not be ambiguous regardless of pronoun usage.
 _LIBRARY_QUALIFIERS = frozenset(
     {"fastapi", "pydantic", "sqlmodel", "flask", "sqlalchemy", "starlette"},
+)
+# Sensitive-topic markers (keyword fallback): queries that touch on potentially
+# harmful subject matter (security exploits, violence, self-harm, illegal
+# activity). These are NOT off_topic — they may still be answerable in a
+# defensive/educational context — but the response is buffered and fully
+# guardrailed before delivery so no partially-harmful content is streamed.
+# Over-inclusive by design: buffering only costs a slight UX delay (no
+# streaming), so false positives are cheap while false negatives risk partial
+# exposure of content the output guardrail would later block.
+_SENSITIVE_MARKERS = frozenset(
+    {
+        "hack", "malware", "ransomware", "phishing", "exploit",
+        "weapon", "bomb", "drug", "kill", "murder",
+        "suicide", "self-harm", "self harm",
+        "illegal", "steal", "crack", "break into",
+        "bypass security", "bypass authentication",
+        "write a virus", "create malware",
+    },
 )
 
 # ── LLM judge / classifier prompts ─────────────────────────────────────
@@ -201,6 +223,12 @@ documented libraries
 clarification (e.g. "how do I use validators?" without specifying Pydantic \
 vs FastAPI dependency validators, or a bare pronoun reference like "how do \
 I configure it?" with no prior context that disambiguates "it")
+- "sensitive" — a question that touches on potentially harmful subject matter \
+(security exploits, violence, self-harm, illegal activity) even if framed in \
+a technical context. These are NOT off_topic — they may have a legitimate \
+defensive/educational answer — but the response must be fully guardrailed \
+before delivery. Use this label for queries about how to hack, exploit, \
+create malware, bypass security, or any query with harmful intent.
 
 Conversation history:
 {history}
@@ -306,6 +334,13 @@ def classify_keywords(query: str) -> str:
         return CLASS_COMPARE
     if any(k in lowered for k in _OFF_TOPIC_KEYWORDS):
         return CLASS_OFF_TOPIC
+    # Sensitive: a query that touches on potentially harmful subject matter.
+    # Checked before the documentation default so a query like "how to hack
+    # a server with FastAPI" is routed to sensitive (buffered + guardrailed)
+    # rather than streamed directly. Over-inclusive by design — buffering
+    # only costs a slight UX delay.
+    if any(marker in lowered for marker in _SENSITIVE_MARKERS):
+        return CLASS_SENSITIVE
     # Ambiguity: a short query (1-6 words) that contains a bare pronoun
     # or a shared-concept noun without a library qualifier. Conservative —
     # only fires when the query is too short to carry enough specificity AND
@@ -554,10 +589,13 @@ class QueryClassifier:
             return QueryClassification(label=label, handled=True, answer=_GREETING_ANSWER)
         if label == CLASS_OFF_TOPIC:
             return QueryClassification(label=label, handled=True, answer=_OFF_TOPIC_ANSWER)
-        # documentation + compare + follow_up + ambiguous all go through the
-        # orchestrator. ``ambiguous`` is short-circuited by the query
-        # clarifier (which generates a clarification prompt); the others
-        # proceed through the full RAG flow.
+        # documentation + compare + follow_up + ambiguous + sensitive all go
+        # through the orchestrator. ``ambiguous`` is short-circuited by the
+        # query clarifier (which generates a clarification prompt); the
+        # others proceed through the full RAG flow. ``sensitive`` proceeds
+        # through the RAG flow but with generation **buffered** (not
+        # streamed) so the output guardrail runs on the full answer before
+        # any token is delivered — no partial exposure.
         return QueryClassification(label=label, handled=False)
 
     def close(self) -> None:

@@ -37,7 +37,7 @@ from schemas.documents import RetrievedDoc
 
 # Runtime import is safe: api.guardrails imports nothing from rag (the
 # TYPE_CHECKING guard below is purely defensive for the heavier types).
-from api.guardrails import CLASS_AMBIGUOUS, CLASS_COMPARE
+from api.guardrails import CLASS_AMBIGUOUS, CLASS_COMPARE, CLASS_SENSITIVE
 
 if TYPE_CHECKING:
     # Avoid a runtime circular import: api.guardrails imports nothing from
@@ -104,6 +104,17 @@ class RAGOrchestrator:
     (passthrough clarifier, or the LLM/heuristic found no candidates), a
     generic clarification prompt is used so the user is always asked to
     disambiguate. No retrieval, no generation.
+
+    Queries the classifier labels ``sensitive`` proceed through the full
+    RAG flow (rewrite → retrieve → assemble → generate) but with generation
+    **buffered** instead of streamed. The output guardrail runs on the
+    complete answer buffer before any token is yielded, and only the
+    guardrailed result (refusal if blocked, scrubbed answer otherwise) is
+    delivered as a single token. This prevents partial exposure of content
+    the output guardrail would later block — the user never sees un-
+    guardrailed tokens for sensitive-topic queries. No
+    ``guardrail_replacement`` is set on the result because nothing was
+    streamed to swap (the single delta IS the final answer).
     """
 
     def __init__(
@@ -220,44 +231,86 @@ class RAGOrchestrator:
                 self.tracer.start_span(trace, "generation")
                 if trace is not None else None
             )
-            answer = ""
-            for token in self.generator.stream(rewritten, context, history):
-                answer += token
-                yield token
-            if gen_span is not None:
-                self.tracer.end_span(
-                    gen_span, metadata={"answer_len": len(answer)},
-                )
 
-            # ── Step 6: output guardrail (PII scrub + harmful-content judge) ──
+            # ── Sensitive-topic queries: buffer the full generation, run the
+            # output guardrail on the complete buffer, and only THEN deliver
+            # the (possibly refused) answer as a single token. This prevents
+            # partial exposure of content the output guardrail would later
+            # block — the user never sees un-guardrailed tokens. Non-sensitive
+            # queries stream normally (tokens yielded as they arrive).
             output_blocked = False
-            if self.guardrail_suite is not None:
-                out_span = (
-                    self.tracer.start_span(trace, "guardrail_output")
-                    if trace is not None else None
-                )
-                out_decision = self.guardrail_suite.check_output(answer)
-                if out_decision.blocked:
-                    logger.info("Orchestrator: output blocked — %s", out_decision.reason)
-                    # Replace the streamed answer with a refusal. The already-
-                    # streamed tokens are not un-sent (SSE is one-way), but the
-                    # persisted + post-processed answer is the refusal so the
-                    # session store and history endpoint reflect the block.
-                    # ``guardrail_replacement`` is set on the result so the SSE
-                    # layer can emit a swap event and the frontend can replace
-                    # the visible (already-streamed) message with the refusal.
-                    answer = OUTPUT_REFUSAL
-                    output_blocked = True
-                else:
-                    answer = out_decision.scrubbed or answer
-                if out_span is not None:
+            sensitive_buffered = classify_label == CLASS_SENSITIVE
+            if sensitive_buffered:
+                logger.info("Orchestrator: sensitive query — buffered (non-streaming) generation")
+                answer = "".join(self.generator.stream(rewritten, context, history))
+                if gen_span is not None:
                     self.tracer.end_span(
-                        out_span,
-                        metadata={"blocked": out_decision.blocked, "reason": out_decision.reason},
+                        gen_span, metadata={"answer_len": len(answer), "buffered": True},
                     )
+                # Output guardrail runs on the FULL buffer before any token
+                # is yielded — no partial exposure.
+                if self.guardrail_suite is not None:
+                    out_span = (
+                        self.tracer.start_span(trace, "guardrail_output")
+                        if trace is not None else None
+                    )
+                    out_decision = self.guardrail_suite.check_output(answer)
+                    if out_decision.blocked:
+                        logger.info("Orchestrator: output blocked (sensitive) — %s", out_decision.reason)
+                        answer = OUTPUT_REFUSAL
+                        output_blocked = True
+                    else:
+                        answer = out_decision.scrubbed or answer
+                    if out_span is not None:
+                        self.tracer.end_span(
+                            out_span,
+                            metadata={"blocked": out_decision.blocked, "reason": out_decision.reason},
+                        )
+                # Deliver the guardrailed answer as a single token. No
+                # ``guardrail_replacement`` is set — nothing was streamed to
+                # swap; the single delta IS the final (safe) answer.
+                yield answer
+            else:
+                answer = ""
+                for token in self.generator.stream(rewritten, context, history):
+                    answer += token
+                    yield token
+                if gen_span is not None:
+                    self.tracer.end_span(
+                        gen_span, metadata={"answer_len": len(answer)},
+                    )
+                # ── Step 6: output guardrail (PII scrub + harmful-content judge) ──
+                if self.guardrail_suite is not None:
+                    out_span = (
+                        self.tracer.start_span(trace, "guardrail_output")
+                        if trace is not None else None
+                    )
+                    out_decision = self.guardrail_suite.check_output(answer)
+                    if out_decision.blocked:
+                        logger.info("Orchestrator: output blocked — %s", out_decision.reason)
+                        # Replace the streamed answer with a refusal. The already-
+                        # streamed tokens are not un-sent (SSE is one-way), but the
+                        # persisted + post-processed answer is the refusal so the
+                        # session store and history endpoint reflect the block.
+                        # ``guardrail_replacement`` is set on the result so the SSE
+                        # layer can emit a swap event and the frontend can replace
+                        # the visible (already-streamed) message with the refusal.
+                        answer = OUTPUT_REFUSAL
+                        output_blocked = True
+                    else:
+                        answer = out_decision.scrubbed or answer
+                    if out_span is not None:
+                        self.tracer.end_span(
+                            out_span,
+                            metadata={"blocked": out_decision.blocked, "reason": out_decision.reason},
+                        )
 
             result = self.post_processor.post_process(answer, docs)
-            if output_blocked:
+            # Only the streaming path sets ``guardrail_replacement`` — the
+            # sensitive buffered path never streamed the harmful tokens, so
+            # there is nothing for the frontend to swap (the single delta IS
+            # the final, guardrailed answer).
+            if output_blocked and not sensitive_buffered:
                 result.guardrail_replacement = OUTPUT_REFUSAL
             if trace is not None:
                 result.trace_id = trace.id
