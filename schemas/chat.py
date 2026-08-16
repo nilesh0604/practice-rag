@@ -8,6 +8,8 @@ representation that gets persisted to the session store and returned by
 
 from __future__ import annotations
 
+from datetime import datetime
+
 from pydantic import BaseModel, ConfigDict, Field, HttpUrl, model_validator
 
 
@@ -29,12 +31,36 @@ class ChatRequest(BaseModel):
 
 
 class Citation(BaseModel):
-    """A single source citation rendered as `[Source: title]` -> link."""
+    """A single source citation rendered as `[Source: title]` -> link.
+
+    Beyond the title + link, carries a short ``snippet`` from the supporting
+    chunk, the ``relevanceScore`` (fused retrieval score in [0, 1]), and the
+    source's ``lastModified`` timestamp so the UI can surface source freshness.
+    All three are optional so older persisted citations (title + url only)
+    still deserialize cleanly.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
     title: str = Field(..., description="Document title shown in the citation chip.")
     source_url: HttpUrl = Field(..., description="Clickable source URL.")
+    snippet: str | None = Field(
+        default=None,
+        description="Short excerpt from the supporting chunk shown under the "
+        "title, capped at SNIPPET_MAX_CHARS characters.",
+    )
+    relevanceScore: float | None = Field(
+        default=None,
+        ge=0.0,
+        le=1.0,
+        description="Fused retrieval score (RRF-normalized to [0, 1]) for the "
+        "cited chunk, when available.",
+    )
+    lastModified: datetime | None = Field(
+        default=None,
+        description="Last-modified timestamp of the source document (UTC), "
+        "when available. Lets the UI show source freshness.",
+    )
 
 
 class ChatResponse(BaseModel):

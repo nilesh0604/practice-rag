@@ -196,4 +196,5 @@ class HybridRetriever:
             score=score,
             chunk_index=payload.get("chunk_index"),
             parent_doc_id=payload.get("parent_doc_id"),
+            last_modified=payload.get("last_modified"),
         )

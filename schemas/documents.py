@@ -114,3 +114,9 @@ class RetrievedDoc(BaseModel):
         default=None,
         description="Parent document id, if known.",
     )
+    last_modified: datetime | None = Field(
+        default=None,
+        description="Last-modified timestamp of the source document (UTC), "
+        "if present in the Qdrant payload. Used to populate citation "
+        "``lastModified`` so the UI can show source freshness.",
+    )

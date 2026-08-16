@@ -171,6 +171,46 @@ class TestChatResponse:
             ChatResponse(session_id="s", answer="a", confidence=1.2)
 
 
+class TestCitation:
+    def test_minimal_title_and_url(self):
+        c = Citation(title="A", source_url="https://example.com/a")
+        assert c.title == "A"
+        assert c.snippet is None
+        assert c.relevanceScore is None
+        assert c.lastModified is None
+
+    def test_all_fields(self):
+        ts = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        c = Citation(
+            title="A",
+            source_url="https://example.com/a",
+            snippet="excerpt",
+            relevanceScore=0.8,
+            lastModified=ts,
+        )
+        assert c.snippet == "excerpt"
+        assert c.relevanceScore == pytest.approx(0.8)
+        assert c.lastModified == ts
+
+    def test_relevance_score_bounds(self):
+        with pytest.raises(ValidationError):
+            Citation(title="A", source_url="https://x.com", relevanceScore=1.5)
+
+    def test_serializes_new_fields_to_json(self):
+        ts = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        c = Citation(
+            title="A",
+            source_url="https://example.com/a",
+            snippet="excerpt",
+            relevanceScore=0.5,
+            lastModified=ts,
+        )
+        dumped = c.model_dump(mode="json")
+        assert dumped["snippet"] == "excerpt"
+        assert dumped["relevanceScore"] == 0.5
+        assert dumped["lastModified"].startswith("2026-01-01")
+
+
 # ── FeedbackRequest ─────────────────────────────────────────────────────────
 
 

@@ -6,29 +6,39 @@ scoring uses a mocked embedder returning deterministic vectors.
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from unittest.mock import MagicMock
 
 import pytest
 
 from rag.post_processor import (
     CONFIDENCE_THRESHOLD,
+    SNIPPET_MAX_CHARS,
     PostProcessor,
     PostProcessResult,
     _cosine_similarity,
+    _make_snippet,
     compute_groundedness,
     extract_citations,
 )
 from schemas.documents import RetrievedDoc
 
 
-def _make_doc(title="Doc", content="content", url="https://example.com/d"):
+def _make_doc(
+    title="Doc",
+    content="content",
+    url="https://example.com/d",
+    score=0.9,
+    last_modified=None,
+):
     return RetrievedDoc(
         id="x",
         content=content,
         title=title,
         source_url=url,
         section=None,
-        score=0.9,
+        score=score,
+        last_modified=last_modified,
     )
 
 
@@ -102,6 +112,82 @@ class TestExtractCitations:
         docs = [_make_doc(title="FastAPI Docs", content="x", url="https://fastapi.tiangolo.com")]
         cites = extract_citations(answer, docs)
         assert str(cites[0].source_url) == "https://fastapi.tiangolo.com/"
+
+
+class TestCitationEnrichedFields:
+    """Verify snippet, relevanceScore, and lastModified are populated."""
+
+    def test_snippet_from_content(self):
+        answer = "[Source: FastAPI Docs]"
+        docs = [_make_doc(title="FastAPI Docs", content="Use Depends for DI.")]
+        cites = extract_citations(answer, docs)
+        assert cites[0].snippet == "Use Depends for DI."
+
+    def test_snippet_truncated_to_max(self):
+        long = "word " * (SNIPPET_MAX_CHARS // 2)
+        answer = "[Source: Big Doc]"
+        docs = [_make_doc(title="Big Doc", content=long)]
+        cites = extract_citations(answer, docs)
+        assert cites[0].snippet is not None
+        assert len(cites[0].snippet) <= SNIPPET_MAX_CHARS + 1  # +1 for ellipsis
+        assert cites[0].snippet.endswith("…")
+
+    def test_snippet_collapses_whitespace(self):
+        answer = "[Source: Spaced Doc]"
+        docs = [_make_doc(title="Spaced Doc", content="  hello\n\n  world  ")]
+        cites = extract_citations(answer, docs)
+        assert cites[0].snippet == "hello world"
+
+    def test_relevance_score_populated(self):
+        answer = "[Source: FastAPI Docs]"
+        docs = [_make_doc(title="FastAPI Docs", content="x", score=0.75)]
+        cites = extract_citations(answer, docs)
+        assert cites[0].relevanceScore == pytest.approx(0.75)
+
+    def test_last_modified_populated(self):
+        ts = datetime(2026, 1, 15, tzinfo=timezone.utc)
+        answer = "[Source: FastAPI Docs]"
+        docs = [_make_doc(title="FastAPI Docs", content="x", last_modified=ts)]
+        cites = extract_citations(answer, docs)
+        assert cites[0].lastModified == ts
+
+    def test_last_modified_none_when_absent(self):
+        answer = "[Source: FastAPI Docs]"
+        docs = [_make_doc(title="FastAPI Docs", content="x", last_modified=None)]
+        cites = extract_citations(answer, docs)
+        assert cites[0].lastModified is None
+
+    def test_all_three_fields_together(self):
+        ts = datetime(2026, 3, 1, tzinfo=timezone.utc)
+        answer = "[Source: Rich Doc]"
+        docs = [_make_doc(
+            title="Rich Doc",
+            content="Some supporting text here.",
+            score=0.88,
+            last_modified=ts,
+        )]
+        cites = extract_citations(answer, docs)
+        c = cites[0]
+        assert c.snippet == "Some supporting text here."
+        assert c.relevanceScore == pytest.approx(0.88)
+        assert c.lastModified == ts
+
+
+class TestMakeSnippet:
+    def test_short_content_unchanged(self):
+        assert _make_snippet("hello world") == "hello world"
+
+    def test_long_content_truncated_with_ellipsis(self):
+        text = " ".join(["word"] * 300)
+        result = _make_snippet(text)
+        assert len(result) <= SNIPPET_MAX_CHARS + 1
+        assert result.endswith("…")
+
+    def test_collapses_whitespace(self):
+        assert _make_snippet("  a\n b\t c  ") == "a b c"
+
+    def test_empty_content(self):
+        assert _make_snippet("") == ""
 
 
 class TestCosineSimilarity:

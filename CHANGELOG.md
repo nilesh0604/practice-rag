@@ -5,6 +5,83 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added — Query rewriter latency-skip heuristic
+
+`LLMQueryRewriter` now short-circuits the ~1-3s Ollama round-trip for
+self-contained queries that don't need coreference resolution. A new
+`_needs_rewrite(query, history)` heuristic returns `False` (skip the LLM
+call, return the original query) when:
+
+- `history` is empty/whitespace — no conversation context to resolve
+  against, or
+- the query contains no anaphoric pronouns / phrase markers (matched as
+  whole words, case-insensitive, against a curated list: `it`, `this`,
+  `that`, `they`, `he`, `she`, `the above`, `the former`, etc.).
+
+Only follow-up queries that actually need coreference resolution (history
+present AND an anaphoric marker detected) pay the rewrite cost. The
+heuristic is conservative — false negatives (rewriting when not needed)
+only waste latency; false positives (skipping when rewriting was needed)
+hurt retrieval quality, so the marker list errs toward inclusion.
+
+This partially closes F500 action item #4.4 (budget cap). The p95 latency
+SLO itself is still not measured/asserted.
+
+- `rag/query_rewriter.py` — new `_ANAPHORA_MARKERS` regex +
+  `_needs_rewrite()` function; `LLMQueryRewriter.rewrite()` checks the
+  heuristic before calling Ollama; fixed stale module docstring (was
+  "wired but not used by the default orchestrator" — it IS wired via
+  `api.deps.get_orchestrator()`); updated class docstring.
+- `tests/test_rag_query_rewriter.py` — new `TestNeedsRewriteHeuristic`
+  class (16 tests: no-history skip, whitespace-history skip, no-pronoun
+  skip, pronoun+history rewrite, case-insensitive, word-boundary
+  no-false-positive on `it`/`his`/`she` substrings, self-contained
+  technical query skip, follow-up with pronoun rewrite); 3 new
+  integration tests on `LLMQueryRewriter` (skips LLM call when no
+  history, skips when no pronoun, calls LLM when both present); existing
+  tests updated to pass history + pronoun so the LLM call path is
+  exercised.
+- `docs/CHAT_ASSISTANT_FEATURES.md` — Core Chat coreference line updated
+  to note the latency-skip heuristic.
+- `docs/F500_ENTERPRISE_ACTION_ITEMS.md` — item #4.4 marked
+  [PARTIALLY CLOSED 2026-08-15].
+
+### Added — Enriched citations (snippet, relevanceScore, lastModified)
+
+Citations now carry more than just `title` + `source_url`. The `Citation`
+model, `extract_citations` post-processor, and `CitationChip` React component
+were extended so each citation surfaces:
+
+- **`snippet`** — a short excerpt (≤ 200 chars, word-boundary truncated with
+  ellipsis, whitespace collapsed) from the supporting retrieved chunk, so the
+  user sees context without clicking through.
+- **`relevanceScore`** — the fused RRF retrieval score ([0, 1]) for the cited
+  chunk, rendered as a "N% match" badge in the UI.
+- **`lastModified`** — the source document's last-modified timestamp (UTC),
+  rendered as an "Updated <date>" label so the user can gauge source freshness.
+
+All three fields are optional with defaults, so older persisted citations
+(title + url only) still deserialize and render correctly.
+
+- `schemas/chat.py` — `Citation` model gains `snippet`, `relevanceScore`,
+  `lastModified` (all optional).
+- `schemas/documents.py` — `RetrievedDoc` gains `last_modified` (optional),
+  propagated from the Qdrant payload.
+- `rag/retriever.py` — `_to_retrieved_doc` maps `last_modified` from the
+  Qdrant payload.
+- `rag/post_processor.py` — `extract_citations` populates the three new
+  fields; new `SNIPPET_MAX_CHARS` constant + `_make_snippet` helper.
+- `frontend/src/CitationChip.jsx` — renders snippet, score badge, and
+  last-modified date; falls back gracefully when fields are absent.
+- `frontend/src/styles.css` — citation chip restyled as a compact column
+  layout (title + snippet + meta row).
+- Tests: `tests/test_rag_post_processor.py` (new `TestCitationEnrichedFields`
+  - `TestMakeSnippet` classes), `tests/test_schemas.py` (new `TestCitation`
+    class), `frontend/__tests__/CitationChip.test.jsx` (snippet/score/date
+    render cases).
+- `docs/CHAT_ASSISTANT_FEATURES.md` — Core Chat citation line upgraded from
+  🟡 Partial to ✅ Implemented.
+
 ### Added — Live NIM comparison eval results (Phases 2, 3, 4)
 
 Ran the three eval artifacts against the live Ollama + Qdrant + NIM stack

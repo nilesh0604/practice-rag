@@ -7,20 +7,21 @@
 > codebase**, not the production target.
 >
 > **Status legend**
+>
 > - ✅ **Implemented** — working in this repo (may use a local substitute stack)
 > - 🟡 **Partial** — implemented with simplifications/gaps vs. the listed spec
 > - ❌ **Not implemented** — target-only; not present in this codebase
 
 **Stack actually in use (vs. the listed Azure/AEM stack):**
 
-| Layer        | Listed (production target)        | This repo (practice)              |
-| ------------ | --------------------------------- | --------------------------------- |
-| LLM          | Azure OpenAI (GPT-3.5/4)          | Ollama `llama3.2:3b` (host)       |
-| Embeddings   | `text-embedding-ada-002` (1536d)  | Ollama `nomic-embed-text` (768d)  |
-| Search       | Azure AI Search (BM25+vector+semantic ranker) | Qdrant (dense + sparse + RRF) |
-| Session store| Redis (last 10) + Cosmos DB (90d) | SQLite (single file)              |
-| Cache        | Redis + embedding + semantic cache | In-memory LRU (exact match)     |
-| Portal       | AEM SPA Editor                    | Standalone React + Vite SPA       |
+| Layer         | Listed (production target)                    | This repo (practice)             |
+| ------------- | --------------------------------------------- | -------------------------------- |
+| LLM           | Azure OpenAI (GPT-3.5/4)                      | Ollama `llama3.2:3b` (host)      |
+| Embeddings    | `text-embedding-ada-002` (1536d)              | Ollama `nomic-embed-text` (768d) |
+| Search        | Azure AI Search (BM25+vector+semantic ranker) | Qdrant (dense + sparse + RRF)    |
+| Session store | Redis (last 10) + Cosmos DB (90d)             | SQLite (single file)             |
+| Cache         | Redis + embedding + semantic cache            | In-memory LRU (exact match)      |
+| Portal        | AEM SPA Editor                                | Standalone React + Vite SPA      |
 
 ---
 
@@ -30,9 +31,9 @@
 
 - ✅ Natural-language Q&A over a documentation corpus (FastAPI / Pydantic v2 / SQLModel — _not_ AEM policies/FAQs/org docs).
 - ✅ LLM-generated answers with inline source citations.
-- 🟡 Citations carry **only `title` + `source_url`** — no `snippet`, `relevanceScore`, or `lastModified` fields. See <ref_file file="/Users/Nilesh_Shinde/iSpace/practice-rag/schemas/chat.py" /> (`Citation` model) and <ref_file file="/Users/Nilesh_Shinde/iSpace/practice-rag/rag/post_processor.py" /> (`extract_citations`).
+- ✅ Citations carry `title` + `source_url` + `snippet` (truncated chunk excerpt) + `relevanceScore` (fused RRF score) + `lastModified` (source freshness). See <ref_file file="/Users/Nilesh_Shinde/iSpace/practice-rag/schemas/chat.py" /> (`Citation` model), <ref_file file="/Users/Nilesh_Shinde/iSpace/practice-rag/rag/post_processor.py" /> (`extract_citations`, `_make_snippet`), and <ref_file file="/Users/Nilesh_Shinde/iSpace/practice-rag/frontend/src/CitationChip.jsx" />.
 - ✅ Multi-turn conversation support via `sessionId` + last-10-turns window passed to the generator. See <ref_file file="/Users/Nilesh_Shinde/iSpace/practice-rag/api/conversation.py" /> (`format_history`, `HISTORY_WINDOW=10`).
-- 🟡 Pronoun/coreference resolution (e.g. "that" → "parental leave") is handled by the LLM query rewriter (`LLMQueryRewriter` in <ref_file file="/Users/Nilesh_Shinde/iSpace/practice-rag/rag/query_rewriter.py" />), not a dedicated anaphora resolver.
+- 🟡 Pronoun/coreference resolution (e.g. "that" → "parental leave") is handled by the LLM query rewriter (`LLMQueryRewriter` in <ref_file file="/Users/Nilesh_Shinde/iSpace/practice-rag/rag/query_rewriter.py" />), not a dedicated anaphora resolver. A **latency-skip heuristic** (`_needs_rewrite`) short-circuits the ~1-3s Ollama round-trip for self-contained queries (no anaphoric pronouns, or no conversation history), so only follow-up queries that actually need coreference resolution pay the rewrite cost.
 - ❌ **No Redis** (SQLite instead) and **no Cosmos DB** — full history lives in SQLite with no TTL/90-day retention policy. No 30-min sliding window; the window is a fixed turn count.
 
 ### Query Classification & Routing — 🟡 Partial
@@ -58,18 +59,18 @@
 
 Implemented components (see <ref_file file="/Users/Nilesh_Shinde/iSpace/practice-rag/frontend/src/" />):
 
-| Listed component      | Status | Actual component(s)                                  |
-| --------------------- | ------ | ---------------------------------------------------- |
-| `ChatAssistantWidget` | 🟡     | `ChatWidget` (root, not `position: fixed`)           |
-| `ChatBubble`          | ❌     | No floating trigger button                           |
-| `ChatPanel`           | ❌     | Always-visible panel (no expand/collapse)            |
-| `MessageHistory`      | 🟡     | `MessageList`                                        |
-| `MessageInput`        | 🟡     | `InputBox`                                           |
-| `MessageBubble`       | 🟡     | Rendered inline within `MessageList`                 |
-| `SourceCard`          | 🟡     | `CitationChip` (link chip, not a card with snippet)  |
-| `FeedbackButtons`     | 🟡     | Thumbs up/down rendered inside `MessageList`         |
-| `TypingIndicator`     | 🟡     | Streaming flag / blinking cursor (no separate comp.) |
-| `ErrorBoundary`       | ✅     | `ErrorBoundary`                                      |
+| Listed component      | Status | Actual component(s)                                                |
+| --------------------- | ------ | ------------------------------------------------------------------ |
+| `ChatAssistantWidget` | 🟡     | `ChatWidget` (root, not `position: fixed`)                         |
+| `ChatBubble`          | ❌     | No floating trigger button                                         |
+| `ChatPanel`           | ❌     | Always-visible panel (no expand/collapse)                          |
+| `MessageHistory`      | 🟡     | `MessageList`                                                      |
+| `MessageInput`        | 🟡     | `InputBox`                                                         |
+| `MessageBubble`       | 🟡     | Rendered inline within `MessageList`                               |
+| `SourceCard`          | 🟡     | `CitationChip` (chip with snippet + score + date, not a full card) |
+| `FeedbackButtons`     | 🟡     | Thumbs up/down rendered inside `MessageList`                       |
+| `TypingIndicator`     | 🟡     | Streaming flag / blinking cursor (no separate comp.)               |
+| `ErrorBoundary`       | ✅     | `ErrorBoundary`                                                    |
 
 - 🟡 State is managed via `useState` + `useCallback`, **not `useReducer`** with the listed action types (`TOGGLE_PANEL`, `STREAM_DELTA`, etc.). See <ref_file file="/Users/Nilesh_Shinde/iSpace/practice-rag/frontend/src/ChatWidget.jsx" />.
 - ❌ **Not embedded into AEM portal** — it is a standalone Vite SPA served via `npm run dev` / `npx serve -s dist`. No SPA Editor integration, no page-template `<script>` tag.
@@ -89,12 +90,12 @@ Implemented components (see <ref_file file="/Users/Nilesh_Shinde/iSpace/practice
 
 ## APIs — 🟡 Partial
 
-| Listed endpoint                     | Status | Actual                                                                  |
-| ----------------------------------- | ------ | ----------------------------------------------------------------------- |
-| `POST /api/v1/chat` (streaming + non-streaming) | 🟡 | Streaming SSE only. **No non-streaming JSON mode.** <ref_file file="/Users/Nilesh_Shinde/iSpace/practice-rag/api/routes/chat.py" /> |
-| `POST /api/v1/feedback` (rating, comment, category) | 🟡 | `rating` (up/down) + optional `comment` + optional `trace_id`. **No `category` field.** <ref_file file="/Users/Nilesh_Shinde/iSpace/practice-rag/schemas/feedback.py" /> |
-| `GET /api/v1/history?sessionId=...` | 🟡     | Implemented as `GET /api/v1/history/{session_id}` (path param, not query). <ref_file file="/Users/Nilesh_Shinde/iSpace/practice-rag/api/routes/history.py" /> |
-| `GET /api/v1/health` (versioned, dependency status, version, uptime) | 🟡 | `GET /api/v1/health` (liveness: status/service/version) + `GET /api/v1/health/ready` (Qdrant+Ollama dependency status, 503 when down). **No uptime field.** <ref_file file="/Users/Nilesh_Shinde/iSpace/practice-rag/api/routes/health.py" /> |
+| Listed endpoint                                                      | Status | Actual                                                                                                                                                                                                                                        |
+| -------------------------------------------------------------------- | ------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `POST /api/v1/chat` (streaming + non-streaming)                      | 🟡     | Streaming SSE only. **No non-streaming JSON mode.** <ref_file file="/Users/Nilesh_Shinde/iSpace/practice-rag/api/routes/chat.py" />                                                                                                           |
+| `POST /api/v1/feedback` (rating, comment, category)                  | 🟡     | `rating` (up/down) + optional `comment` + optional `trace_id`. **No `category` field.** <ref_file file="/Users/Nilesh_Shinde/iSpace/practice-rag/schemas/feedback.py" />                                                                      |
+| `GET /api/v1/history?sessionId=...`                                  | 🟡     | Implemented as `GET /api/v1/history/{session_id}` (path param, not query). <ref_file file="/Users/Nilesh_Shinde/iSpace/practice-rag/api/routes/history.py" />                                                                                 |
+| `GET /api/v1/health` (versioned, dependency status, version, uptime) | 🟡     | `GET /api/v1/health` (liveness: status/service/version) + `GET /api/v1/health/ready` (Qdrant+Ollama dependency status, 503 when down). **No uptime field.** <ref_file file="/Users/Nilesh_Shinde/iSpace/practice-rag/api/routes/health.py" /> |
 
 Additional endpoints not in the listed spec but present: `POST /api/v1/ingest`, `GET /api/v1/metrics`.
 
@@ -116,17 +117,17 @@ Additional endpoints not in the listed spec but present: `POST /api/v1/ingest`, 
 
 ## Responsible AI Features — mostly ❌
 
-| Feature                                              | Status | Notes                                                                                       |
-| ---------------------------------------------------- | ------ | ------------------------------------------------------------------------------------------- |
-| Transparency & AI disclosure                         | ❌     | No explicit "AI-generated" disclosure in the UI.                                            |
-| Bias & fairness monitoring                           | ❌     | Not implemented.                                                                            |
-| Human-in-the-Loop (HITL) escalation                  | ❌     | No escalation path to human agents.                                                         |
-| AI governance & audit (full decision-chain audit log) | 🟡    | Langfuse traces (retrieval/generation/guardrail spans) + feedback scores act as a lightweight audit trail, but there is no formal immutable audit log. <ref_file file="/Users/Nilesh_Shinde/iSpace/practice-rag/api/observability.py" /> |
-| Model drift detection                                | ❌     | Not implemented.                                                                            |
-| User consent, control & data rights (GDPR Art. 17 right-to-erasure endpoint) | ❌ | No erasure endpoint. SQLite history has no deletion API.                                    |
-| Golden dataset evaluation (offline metrics pipeline) | ✅     | `eval/golden-dataset.json` (36 Q&A pairs) + `eval/run_eval.py` (Ragas + local LLM judge fallback, threshold gate). <ref_file file="/Users/Nilesh_Shinde/iSpace/practice-rag/eval/run_eval.py" /> |
-| Responsible AI dashboard (Azure Workbook)            | ❌     | Replaced by Langfuse UI + `GET /api/v1/metrics` (TTFT, cache hit rate, request/error counts). |
-| User feedback loop → retrieval-quality iteration     | 🟡     | Feedback is recorded + attached as Langfuse scores. **No automated "weekly prompt + chunking + re-index" workflow.** |
+| Feature                                                                      | Status | Notes                                                                                                                                                                                                                                    |
+| ---------------------------------------------------------------------------- | ------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Transparency & AI disclosure                                                 | ❌     | No explicit "AI-generated" disclosure in the UI.                                                                                                                                                                                         |
+| Bias & fairness monitoring                                                   | ❌     | Not implemented.                                                                                                                                                                                                                         |
+| Human-in-the-Loop (HITL) escalation                                          | ❌     | No escalation path to human agents.                                                                                                                                                                                                      |
+| AI governance & audit (full decision-chain audit log)                        | 🟡     | Langfuse traces (retrieval/generation/guardrail spans) + feedback scores act as a lightweight audit trail, but there is no formal immutable audit log. <ref_file file="/Users/Nilesh_Shinde/iSpace/practice-rag/api/observability.py" /> |
+| Model drift detection                                                        | ❌     | Not implemented.                                                                                                                                                                                                                         |
+| User consent, control & data rights (GDPR Art. 17 right-to-erasure endpoint) | ❌     | No erasure endpoint. SQLite history has no deletion API.                                                                                                                                                                                 |
+| Golden dataset evaluation (offline metrics pipeline)                         | ✅     | `eval/golden-dataset.json` (36 Q&A pairs) + `eval/run_eval.py` (Ragas + local LLM judge fallback, threshold gate). <ref_file file="/Users/Nilesh_Shinde/iSpace/practice-rag/eval/run_eval.py" />                                         |
+| Responsible AI dashboard (Azure Workbook)                                    | ❌     | Replaced by Langfuse UI + `GET /api/v1/metrics` (TTFT, cache hit rate, request/error counts).                                                                                                                                            |
+| User feedback loop → retrieval-quality iteration                             | 🟡     | Feedback is recorded + attached as Langfuse scores. **No automated "weekly prompt + chunking + re-index" workflow.**                                                                                                                     |
 
 ---
 
@@ -147,15 +148,15 @@ Additional endpoints not in the listed spec but present: `POST /api/v1/ingest`, 
 
 ## Summary
 
-| Category                  | ✅ Implemented | 🟡 Partial | ❌ Not implemented |
-| ------------------------- | ------------- | ---------- | ----------------- |
-| Core Chat                 | 3             | 3          | 3                 |
-| React Chat Widget UI      | 1             | 8          | 2                 |
-| Retrieval                 | 2             | 1          | 3                 |
-| APIs                      | 0             | 4          | 0 (within scope)  |
-| Guardrails                | 2             | 2          | 3                 |
-| Responsible AI            | 1             | 2          | 6                 |
-| Performance & Cost        | 1             | 2          | 1                 |
-| RBAC                      | 0             | 0          | 1                 |
+| Category             | ✅ Implemented | 🟡 Partial | ❌ Not implemented |
+| -------------------- | -------------- | ---------- | ------------------ |
+| Core Chat            | 4              | 2          | 3                  |
+| React Chat Widget UI | 1              | 8          | 2                  |
+| Retrieval            | 2              | 1          | 3                  |
+| APIs                 | 0              | 4          | 0 (within scope)   |
+| Guardrails           | 2              | 2          | 3                  |
+| Responsible AI       | 1              | 2          | 6                  |
+| Performance & Cost   | 1              | 2          | 1                  |
+| RBAC                 | 0              | 0          | 1                  |
 
 **Bottom line:** The conversational RAG core (Q&A + citations + multi-turn + streaming + hybrid retrieval + basic guardrails + golden-dataset eval + circuit breaker + LRU cache) is **implemented** using a local substitute stack. The **enterprise/production features** (RBAC/department filtering, Azure services, Redis/Cosmos tiering, semantic cache, HITL escalation, GDPR erasure, model drift, AI disclosure, query decomposition, ambiguity clarification, sensitive-topic stream disabling, guardrail-replacement SSE event) remain **target-only** and are documented as future action items in <ref_file file="/Users/Nilesh_Shinde/iSpace/practice-rag/docs/F500_ENTERPRISE_ACTION_ITEMS.md" />.

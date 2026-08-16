@@ -38,6 +38,11 @@ CONFIDENCE_THRESHOLD: float = 0.65
 """Below this groundedness score the UI shows a low-confidence warning
 (from the architecture doc's Security & Responsible AI section)."""
 
+SNIPPET_MAX_CHARS: int = 200
+"""Maximum length of a citation snippet. The supporting chunk's content is
+truncated to this many characters (on a word boundary when possible) so the
+citation chip stays compact in the UI."""
+
 _CITATION_RE = re.compile(r"\[Source:\s*(.+?)\]")
 """Matches ``[Source: title]`` markers in generated answers (non-greedy title)."""
 
@@ -125,8 +130,29 @@ def extract_citations(
         if url in seen_urls:
             continue
         seen_urls.add(url)
-        citations.append(Citation(title=doc.title, source_url=doc.source_url))
+        citations.append(
+            Citation(
+                title=doc.title,
+                source_url=doc.source_url,
+                snippet=_make_snippet(doc.content),
+                relevanceScore=doc.score,
+                lastModified=doc.last_modified,
+            )
+        )
     return citations
+
+
+def _make_snippet(content: str) -> str:
+    """Truncate chunk content to ``SNIPPET_MAX_CHARS`` on a word boundary.
+
+    Collapses whitespace and appends an ellipsis when truncated so the
+    citation chip shows a clean one-line excerpt.
+    """
+    text = " ".join(content.split())
+    if len(text) <= SNIPPET_MAX_CHARS:
+        return text
+    cut = text[:SNIPPET_MAX_CHARS].rsplit(" ", 1)[0]
+    return f"{cut}…" if cut else f"{text[:SNIPPET_MAX_CHARS]}…"
 
 
 # ── groundedness score ─────────────────────────────────────────────────

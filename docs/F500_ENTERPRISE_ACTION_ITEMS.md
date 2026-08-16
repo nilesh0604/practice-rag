@@ -139,7 +139,7 @@ The rewriter takes `query + history` (both attacker-influenced) and emits the re
 1. **Scrub history** (PII + flagged injection content) before passing to the rewriter.
 2. **Audit-log** `{original_query, rewritten_query, history_hash}` to the trace/metrics for forensics.
 3. Add a **rewrite-quality eval**: retrieval recall@5 with vs. without rewriting on a labeled follow-up dataset.
-4. Add a **latency SLO** (e.g. p95 < 2s) and a budget cap (skip rewrite if the query already contains library keywords — cheap heuristic to avoid the round-trip on unambiguous queries).
+4. Add a **latency SLO** (e.g. p95 < 2s) and a budget cap (skip rewrite if the query already contains library keywords — cheap heuristic to avoid the round-trip on unambiguous queries). **[PARTIALLY CLOSED 2026-08-15]** — A latency-skip heuristic (`_needs_rewrite` in `rag/query_rewriter.py`) now short-circuits the Ollama round-trip for self-contained queries (no anaphoric pronouns, or no conversation history). The p95 latency SLO itself is still not measured/asserted.
 5. **Guard the rewritten query** through the input guardrail regex tier (currently the rewrite happens _after_ the guardrail, so a malicious rewrite could bypass the regex scan).
 
 ---
