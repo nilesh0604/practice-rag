@@ -5,6 +5,21 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added — RAG chat performance action items
+
+Documented current RAG chat assistant latency findings from the Langfuse
+MCP and created a prioritized backlog of performance action items with
+reasoning.
+
+- `docs/RAG_CHAT_PERFORMANCE_ACTION_ITEMS.md` (new): observed p95
+  end-to-end `chat` latency is 7.34 s; `generation` is the dominant
+  contributor (p95 5.45 s); `guardrail_input` adds ~765 ms per call.
+- Lists five prioritized fixes: reduce `chat` SLO to p95 < 3 s,
+  optimize `generation`, reduce input-guardrail latency, enable token/cost
+  tracking in Langfuse, and add quality scores.
+- Notes missing `totalCost` / `totalTokens` telemetry as an immediate
+  observability gap.
+
 ### Added — Department/role content filtering
 
 `ChatRequest` now accepts optional `department` and `role` fields. When set,

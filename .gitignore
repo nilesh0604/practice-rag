@@ -78,6 +78,8 @@ pnpm-debug.log*
 !.env.example
 *.pem
 *.key
+.devin/mcp_config.local.json
+.devin/config.local.json
 
 # --- Docker / Colima ---
 colima-*.yaml
