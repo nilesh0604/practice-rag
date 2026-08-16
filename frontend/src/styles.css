@@ -55,6 +55,13 @@ body {
   margin: 0;
 }
 
+.chat-widget__panel {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+}
+
 /* ── MessageList ──────────────────────────────────────────────── */
 .message-list {
   flex: 1;

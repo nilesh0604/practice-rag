@@ -59,20 +59,20 @@
 
 Implemented components (see <ref_file file="/Users/Nilesh_Shinde/iSpace/practice-rag/frontend/src/" />):
 
-| Listed component      | Status | Actual component(s)                                                |
-| --------------------- | ------ | ------------------------------------------------------------------ |
-| `ChatAssistantWidget` | 🟡     | `ChatWidget` (root, not `position: fixed`)                         |
-| `ChatBubble`          | ❌     | No floating trigger button                                         |
-| `ChatPanel`           | ❌     | Always-visible panel (no expand/collapse)                          |
-| `MessageHistory`      | 🟡     | `MessageList`                                                      |
-| `MessageInput`        | 🟡     | `InputBox`                                                         |
-| `MessageBubble`       | 🟡     | Rendered inline within `MessageList`                               |
-| `SourceCard`          | 🟡     | `CitationChip` (chip with snippet + score + date, not a full card) |
-| `FeedbackButtons`     | 🟡     | Thumbs up/down rendered inside `MessageList`                       |
-| `TypingIndicator`     | 🟡     | Streaming flag / blinking cursor (no separate comp.)               |
-| `ErrorBoundary`       | ✅     | `ErrorBoundary`                                                    |
+| Listed component      | Status | Actual component(s)                                                                                       |
+| --------------------- | ------ | --------------------------------------------------------------------------------------------------------- |
+| `ChatAssistantWidget` | 🟡     | `ChatWidget` (root, not `position: fixed`)                                                                |
+| `ChatBubble`          | ❌     | No floating trigger button                                                                                |
+| `ChatPanel`           | 🟡     | Panel body toggles via `TOGGLE_PANEL` (Collapse/Expand button); not `position: fixed`, no floating bubble |
+| `MessageHistory`      | 🟡     | `MessageList`                                                                                             |
+| `MessageInput`        | 🟡     | `InputBox`                                                                                                |
+| `MessageBubble`       | 🟡     | Rendered inline within `MessageList`                                                                      |
+| `SourceCard`          | 🟡     | `CitationChip` (chip with snippet + score + date, not a full card)                                        |
+| `FeedbackButtons`     | 🟡     | Thumbs up/down rendered inside `MessageList`                                                              |
+| `TypingIndicator`     | 🟡     | Streaming flag / blinking cursor (no separate comp.)                                                      |
+| `ErrorBoundary`       | ✅     | `ErrorBoundary`                                                                                           |
 
-- 🟡 State is managed via `useState` + `useCallback`, **not `useReducer`** with the listed action types (`TOGGLE_PANEL`, `STREAM_DELTA`, etc.). See <ref_file file="/Users/Nilesh_Shinde/iSpace/practice-rag/frontend/src/ChatWidget.jsx" />.
+- ✅ State is managed via a single `useReducer` (`chatReducer`) with the listed action types: `TOGGLE_PANEL`, `ADD_USER_MESSAGE`, `ADD_ASSISTANT_MESSAGE`, `STREAM_DELTA`, `SET_SOURCES`, `SET_METADATA`, `GUARDRAIL_REPLACEMENT`, `STREAM_DONE`, `STREAM_ERROR`, `SET_STREAMING`, `SET_FEEDBACK`, `CLEAR_FEEDBACK`, `NEW_CHAT`. See <ref_file file="/Users/Nilesh_Shinde/iSpace/practice-rag/frontend/src/chatReducer.js" /> (reducer) and <ref_file file="/Users/Nilesh_Shinde/iSpace/practice-rag/frontend/src/ChatWidget.jsx" /> (dispatch wiring). The `TOGGLE_PANEL` action is wired to a header Collapse/Expand button that conditionally renders the panel body (`panelOpen` defaults to `true`, preserving the always-visible behavior); the panel is still not `position: fixed` and there is no floating `ChatBubble` trigger.
 - ❌ **Not embedded into AEM portal** — it is a standalone Vite SPA served via `npm run dev` / `npx serve -s dist`. No SPA Editor integration, no page-template `<script>` tag.
 
 ---

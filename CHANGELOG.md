@@ -5,6 +5,53 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed — ChatWidget state management: `useReducer` with named action types
+
+The React `ChatWidget` previously managed its state with a collection of
+`useState` hooks (`messages`, `sessionId`, `isStreaming`, `feedbackState`)
+updated via `useCallback` handlers calling functional state setters. The
+architecture doc lists a `useReducer`-based state machine with named
+action types (`TOGGLE_PANEL`, `STREAM_DELTA`, etc.) instead. The widget
+now uses a single `useReducer` so every state transition is an explicit,
+named, testable action.
+
+- `frontend/src/chatReducer.js` (new):
+  - `initialState` — `{ messages, sessionId, isStreaming, feedbackState, panelOpen }`.
+  - `chatReducer(state, action)` handling: `TOGGLE_PANEL`,
+    `ADD_USER_MESSAGE`, `ADD_ASSISTANT_MESSAGE`, `STREAM_DELTA`,
+    `SET_SOURCES`, `SET_METADATA`, `GUARDRAIL_REPLACEMENT`,
+    `STREAM_DONE`, `STREAM_ERROR`, `SET_STREAMING`, `SET_FEEDBACK`,
+    `CLEAR_FEEDBACK`, `NEW_CHAT`. Unknown actions return state unchanged.
+    All updates are immutable (no mutation of the previous state).
+  - `NEW_CHAT` resets the conversation but preserves `panelOpen`.
+- `frontend/src/ChatWidget.jsx`:
+  - Replaced the four `useState` calls with one `useReducer(chatReducer, initialState)`.
+  - Each SSE callback / handler now `dispatch`es a named action instead of
+    calling functional setters; behavior is identical (verified by the
+    existing `ChatWidget.test.jsx` suite, all 77 frontend tests pass).
+  - `TOGGLE_PANEL` is wired to a new header Collapse/Expand button
+    (`data-testid="toggle-panel-button"`, `aria-expanded`/`aria-controls`).
+    The panel body (`MessageList` + `InputBox`) is wrapped in a
+    `.chat-widget__panel` container and conditionally rendered based on
+    `panelOpen` (defaults to `true`, so the always-visible behavior is
+    preserved). The widget is still not `position: fixed` and there is no
+    floating `ChatBubble` trigger.
+- `frontend/src/styles.css`: added `.chat-widget__panel` (flex column,
+  `flex: 1`, `min-height: 0`) so the existing layout is preserved when the
+  panel body is wrapped.
+- `frontend/__tests__/chatReducer.test.js` (new): 16 unit tests covering
+  every action type, immutability, the `NEW_CHAT` panel-preservation
+  behavior, and the unknown-action passthrough.
+- `docs/CHAT_ASSISTANT_FEATURES.md`: the React Chat Widget UI state-management
+  item is now ✅ (was 🟡); the `ChatPanel` row is now 🟡 (was ❌) reflecting
+  the new Collapse/Expand toggle (still not `position: fixed` / no floating
+  bubble).
+
+> **F500 enterprise note:** this closes the local state-management gap only.
+> The widget is still a standalone Vite SPA (no AEM SPA Editor integration,
+> no page-template `<script>` embed) — that remains a target-only enterprise
+> feature tracked separately.
+
 ### Added — Sensitive-topic queries: buffered (non-streaming) generation
 
 Sensitive-topic queries (e.g. "how to hack a server", "write malware",
